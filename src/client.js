@@ -79,6 +79,17 @@ window.__ModuleLoader__.load({
     const MTF = ['max_completion_tokens', 'max_tokens']
     const TRANSPORTS = ['sse', 'websocket', 'websocket-cached', 'auto']
     const CACHE = ['none', 'short', 'long']
+    // 参考 pi-provider-manager 的默认请求头（浏览器伪装，降低被上游风控的概率）
+    const DEFAULT_HEADERS = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': 'text/event-stream, text/html, application/json, */*',
+      'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Origin': 'https://chat.openai.com',
+      'Referer': 'https://chat.openai.com/',
+    }
     const btn = (label, onClick, kind) => el('button', { className: 'mcm-btn' + (kind ? ' ' + kind : ''), onClick }, label)
     const field = (label, tip, req, children) => el('div', { className: 'mcm-field' }, el('div', { className: 'mcm-fl' }, label, req ? el('span', { style: { color: 'var(--dsw-alias-state-error-primary)' } }, '*') : null, tip ? el('span', { className: 'mcm-hint', title: tip }, '?') : null), children)
     const tf = (label, tip, value, onSet, mono) => field(label, tip, false, el('input', { className: 'mcm-in' + (mono ? ' mono' : ''), value: value == null ? '' : String(value), onChange: (e) => onSet(e.target.value) }))
@@ -639,7 +650,7 @@ window.__ModuleLoader__.load({
         ...cards,
         btn('＋新增提供商 (Provider)', () => {
           const nm = 'provider-' + (Object.keys(providers).length + 1)
-          setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase() + '_API_KEY', displayName: nm, models: [] } }))
+          setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase() + '_API_KEY', displayName: nm, models: [], headers: Object.assign({}, DEFAULT_HEADERS) } }))
           setExp((e) => Object.assign({}, e, { [nm]: true }))
         }, 'primary'),
         el(GlobalTestConfigModal, { win: configWin, setWin: setConfigWin }),
@@ -1023,6 +1034,12 @@ window.__ModuleLoader__.load({
           const findNs = (name) => nss.find((n) => n && n.ns === name)
           const ns = findNs('llm-pi-ai')
           const providers = (ns && ns.value && ns.value.providers) || {}
+          // 为每个供应商合并默认请求头（用户自定义值优先，未配置的补默认）
+          for (const [k, p] of Object.entries(providers)) {
+            if (p && typeof p === 'object') {
+              p.headers = Object.assign({}, DEFAULT_HEADERS, p.headers || {})
+            }
+          }
           setState({ providers })
           setDraft((prev) => prev || clone(providers))
           const cn = findNs('model-channels')
@@ -1081,7 +1098,7 @@ window.__ModuleLoader__.load({
             if (pVal.baseURL && String(pVal.baseURL).trim()) pObj.baseURL = String(pVal.baseURL).trim()
             if (pVal.displayName && String(pVal.displayName).trim()) pObj.displayName = String(pVal.displayName).trim()
             if (pVal.apiKeyEnv && String(pVal.apiKeyEnv).trim()) pObj.apiKeyEnv = String(pVal.apiKeyEnv).trim()
-            if (pVal.headers && typeof pVal.headers === 'object' && Object.keys(pVal.headers).length > 0) pObj.headers = Object.assign({}, pVal.headers)
+            pObj.headers = Object.assign({}, DEFAULT_HEADERS, (pVal.headers && typeof pVal.headers === 'object') ? pVal.headers : {})
             if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
             if (pVal.transport) pObj.transport = pVal.transport
             if (pVal.cacheRetention) pObj.cacheRetention = pVal.cacheRetention
@@ -1103,6 +1120,9 @@ window.__ModuleLoader__.load({
         }) : Promise.resolve()
         Promise.all([p1, p2]).then(() => {
           setNotice('已全部保存（即时生效）')
+          // 同步草稿与状态为刚保存的清洗版本（含默认请求头合并结果）
+          setDraft(clone(cleanProviders))
+          setState((s) => Object.assign({}, s, { providers: cleanProviders }))
           setTimeout(() => setNotice(null), 3000)
           refresh()
         }).catch((e) => setNotice('保存失败: ' + String((e && e.message) || e))).finally(() => setSaving(false))
