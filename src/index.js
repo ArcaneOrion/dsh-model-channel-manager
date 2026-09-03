@@ -233,7 +233,9 @@ export function apply(ctx) {
         list.push({ ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null });
         const cutoff = now - 7 * 24 * 3600 * 1000;
         state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-2000);
-        await persistHealth();
+        try {
+            await persistHealth();
+        } catch (_e) {}
     };
     const persistSpeedResults = async (r) => {
         if (bus === null) return;

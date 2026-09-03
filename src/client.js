@@ -704,10 +704,27 @@ window.__ModuleLoader__.load({
 
       // 累加时间窗口内的真实流水记录
       for (const e of allEvents) {
+        if (!e || !e.provider || !e.model) continue
         let pMap = byProvider.get(e.provider)
         if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
         let a = pMap.get(e.model)
-        if (!a) { a = { provider: e.provider, model: e.model, name: e.model, total: 0, success: 0, fail: 0, ttftSum: 0, latSum: 0, lastTs: 0, lastOk: null, lastCode: null, recentErrors: 0 }; pMap.set(e.model, a) }
+        if (!a) {
+          a = {
+            provider: e.provider,
+            model: e.model,
+            name: e.model,
+            total: 0,
+            success: 0,
+            fail: 0,
+            ttftSum: 0,
+            latSum: 0,
+            lastTs: 0,
+            lastOk: null,
+            lastCode: null,
+            recentErrors: 0
+          }
+          pMap.set(e.model, a)
+        }
         a.total++
         if (e.ok) {
           a.success++
