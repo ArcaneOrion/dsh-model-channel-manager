@@ -317,6 +317,7 @@ window.__ModuleLoader__.load({
 
     function ModelConfigPanel(props) {
       const draft = props._draft; const setDraft = props._setDraft
+      const setNotice = props._setNotice || (() => {})
       const [exp, setExp] = useState({}); const [em, setEm] = useState({}); const [live, setLive] = useState({})
       const [sa, setSa] = useState({})
       const [keyInput, setKeyInput] = useState({})
@@ -343,13 +344,7 @@ window.__ModuleLoader__.load({
         }).catch(() => setTimeout(() => pollTest(nonce, provider, model), 1500))
       }
 
-      const launchTest = (provider, model) => {
-        // 如果当前 draft 还没有点击保存，则向用户友好提示
-        const currentSavedModels = (props._state?.providers?.[provider]?.models || []).map((m) => m.id)
-        if (!currentSavedModels.includes(model)) {
-          setNotice('请先点击右上角「保存全部变更」，保存后方可进行真实链路测试')
-          setTimeout(() => setNotice(null), 4000)
-        }
+      const fireTest = (provider, model) => {
         if (!apiRef) return
         const key = provider + '::' + model
         setTestStates((s) => Object.assign({}, s, { [key]: { status: 'running' } }))
@@ -364,6 +359,45 @@ window.__ModuleLoader__.load({
         }).catch((e) => {
           setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', error: String((e && e.message) || e) } }))
         })
+      }
+
+      const launchTest = (provider, model) => {
+        // 模型尚未保存到配置中 → 友好提示
+        const currentSavedModels = (props._state?.providers?.[provider]?.models || []).map((m) => m.id)
+        if (!currentSavedModels.includes(model)) {
+          setNotice('请先点击右上角「保存全部变更」，保存后方可进行真实链路测试')
+          setTimeout(() => setNotice(null), 4000)
+          return
+        }
+        const pCfg = providers[provider] || {}
+        const ref = typeof pCfg.apiKeyEnv === 'string' && pCfg.apiKeyEnv.trim() ? pCfg.apiKeyEnv.trim() : ''
+        const typed = (keyInput[provider] || '').trim()
+        // 无凭据引用 → 直接测试（例如原生认证渠道）
+        if (!ref) { fireTest(provider, model); return }
+        // 输入框有 Key → 自动写入存储后再测试（与 DSH Models 页同一语义：键入即写入）
+        if (typed) {
+          savedKeys[provider] = typed
+          apiRef.credentials.set({ ref, value: typed }).then((resp) => {
+            const r = resp && resp.result ? resp.result : resp
+            if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'set failed')
+            setLive((l) => Object.assign({}, l, { [provider + '_key']: 'saved' }))
+            fireTest(provider, model)
+          }).catch((e) => {
+            setNotice('凭据写入失败: ' + String((e && e.message) || e))
+            setTimeout(() => setNotice(null), 5000)
+          })
+          return
+        }
+        // 输入框为空 → 询问凭据存储是否已配置
+        apiRef.credentials.describe({ refs: [ref] }).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          const d = r && r.value !== undefined ? r.value : r
+          const c = d && d.credentials && d.credentials[ref]
+          if (c && c.configured) { fireTest(provider, model); return }
+          setTestStates((s) => Object.assign({}, s, { [provider + '::' + model]: { status: 'error', code: 'MISSING_CREDENTIAL', error: '缺少 API Key: 请在「快速写入密钥」输入框中粘贴 Key 并点击「写入存储」，或设置环境变量 ' + ref } }))
+          setNotice('缺少 API Key（' + ref + '）: 请粘贴 Key 到「快速写入密钥」并点击「写入存储」后再测试')
+          setTimeout(() => setNotice(null), 5000)
+        }).catch(() => fireTest(provider, model))
       }
       const updateP = (name, patch) => setDraft((d) => Object.assign({}, d, { [name]: Object.assign({}, d[name], patch) }))
       const updateModel = (name, mi, patch) => setDraft((d) => { const ms = (d[name].models || []).map((mm, i) => i === mi ? Object.assign({}, mm, patch) : mm); return Object.assign({}, d, { [name]: Object.assign({}, d[name], { models: ms }) }) })
@@ -1015,7 +1049,7 @@ window.__ModuleLoader__.load({
           )
         ),
         el('div', { className: 'mcm-body' },
-          tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft }) :
+          tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft, _setNotice: setNotice }) :
           tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})) }) :
           el(HealthPanel, { health, _providers: (draft || (state ? state.providers : {})) })
         )
