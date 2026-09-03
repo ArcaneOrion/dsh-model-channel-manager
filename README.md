@@ -67,6 +67,15 @@ DSH 原生模型渠道管理。两半结构：
 - 提交 = `已保留(勾选的configured) + 新添加(勾选的missing)`，未勾选的从 draft 删除
 - 勾选说明文案：「勾选=保留/添加，取消勾选=清理。已配置项默认勾选，取消勾选会被删除。」
 
+## 供应商 ID 重命名
+
+供应商卡片头部「改名」按钮可重命名 Provider ID（约束：小写字母开头，仅小写字母/数字/连字符）：
+
+- 轮询组候选池中引用该 ID 的 candidate 会自动同步为新 ID
+- `apiKeyEnv` 凭据引用**保持不变**——凭据是 write-only 无法搬移，保持引用名原地不动即可让已存储 Key 继续生效
+- 历史健康流水保留在原 ID 名下（历史存档不受影响）
+- 改名后仍需点击右上「保存全部变更」落盘
+
 **曾踩坑**：`selected` 曾初始化为 `missing`（只含"可加"），而 configured 项 checkbox 显示 `checked:true` 却不在 selected 里——应用时 `kept = models.filter(m => cs.has(m.id))` 把已配置模型全部丢弃 → **已有模型消失**。修复 = selected 初始化为 `configured ∩ 端点`。
 
 ## host 半内部接口

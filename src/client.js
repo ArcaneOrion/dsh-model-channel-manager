@@ -222,6 +222,48 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function RenameProviderModal(props) {
+      const win = props.win; const setWin = props.setWin
+      const [value, setValue] = useState('')
+      const [err, setErr] = useState(null)
+      useEffect(() => { if (win) { setValue(win.value || ''); setErr(null) } }, [win])
+      if (!win) return null
+      const submit = () => {
+        const next = value.trim()
+        if (next === win.from) { setWin(null); return }
+        if (!/^[a-z][a-z0-9-]*$/.test(next)) {
+          setErr('ID 必须以小写字母开头，只能包含小写字母、数字与连字符 (-)')
+          return
+        }
+        const outcome = props.onRename(win.from, next)
+        if (outcome && outcome.error) { setErr(outcome.error); return }
+        setWin(null)
+      }
+      return el('div', { className: 'mcm-mask', onClick: () => setWin(null) },
+        el('div', { className: 'mcm-modal', style: { maxWidth: 460 }, onClick: (e) => e.stopPropagation() },
+          el('div', { className: 'mcm-modal-h' },
+            el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, '重命名供应商 ID · ' + win.from),
+            btn('✕', () => setWin(null))
+          ),
+          el('div', { className: 'mcm-modal-b' },
+            field('新 Provider ID', '作为 settings 键、会话日志引用与轮询组候选的标识', true,
+              el('input', { className: 'mcm-in mono', autoFocus: true, value, onChange: (e) => setValue(e.target.value) })
+            ),
+            err ? el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, err) : null,
+            el('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.6 } },
+              el('div', null, '· 轮询组候选池中的引用会自动同步更新。'),
+              el('div', null, '· apiKeyEnv 凭据引用保持不变，已存储的 Key 继续有效；如需更换引用名请手动编辑该字段。'),
+              el('div', null, '· 历史健康统计保留在原 ID 名下（历史存档不受影响）。')
+            )
+          ),
+          el('div', { className: 'mcm-modal-f' },
+            btn('取消', () => setWin(null)),
+            btn('确认重命名', submit, 'primary')
+          )
+        )
+      )
+    }
+
     function fetchModal(name, p, disc, setDisc, onApply) {
       if (!disc || disc.provider !== name) return null
       let body
@@ -325,7 +367,28 @@ window.__ModuleLoader__.load({
       const [detailWin, setDetailWin] = useState(null)
       const [configWin, setConfigWin] = useState(false)
       const [disc, setDisc] = useState(null)
+      const [renameWin, setRenameWin] = useState(null)
       const providers = draft || {}
+
+      const renameProvider = (from, to) => {
+        if (!providers[from]) return { error: '找不到原 ID（可能未保存，刷新后再试）' }
+        if (providers[to]) return { error: '新 ID 已存在，请换一个' }
+        const order = Object.keys(providers)
+        const next = {}
+        for (const k of order) {
+          next[(k === from) ? to : k] = providers[k]
+        }
+        setDraft(next)
+        setExp((s) => { const n = Object.assign({}, s); if (Object.prototype.hasOwnProperty.call(n, from)) { n[to] = n[from]; delete n[from] } return n })
+        setEm((s) => { const n = Object.assign({}, s); for (const k of Object.keys(n)) { if (k === from || k.indexOf(from + '::') === 0) { n[(k === from ? to : to + '::' + k.slice(from.length + 2))] = n[k]; delete n[k] } } return n })
+        setKeyInput((s) => { const n = Object.assign({}, s); if (Object.prototype.hasOwnProperty.call(n, from)) { n[to] = n[from]; delete n[from] } return n })
+        setLive((s) => { const n = Object.assign({}, s); for (const k of Object.keys(n)) { if (k === from || k.indexOf(from + '_') === 0) { n[(k === from ? to : to + k.slice(from.length))] = n[k] } } return n })
+        delete savedKeys[to]; if (savedKeys[from] !== undefined) { savedKeys[to] = savedKeys[from]; delete savedKeys[from] }
+        if (props._renameProviderInChannels) props._renameProviderInChannels(from, to)
+        setNotice('已重命名 ' + from + ' → ' + to + '（点击「保存全部变更」生效）')
+        setTimeout(() => setNotice(null), 4000)
+        return {}
+      }
 
       const pollTest = (nonce, provider, model) => {
         if (!apiRef) return
@@ -425,6 +488,7 @@ window.__ModuleLoader__.load({
             p.api ? el('span', { className: 'mcm-badge' }, p.api) : null,
             el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' } }, models.length + ' 个模型'),
             el('div', { style: { display: 'flex', gap: 6, marginLeft: 12 }, onClick: (e) => e.stopPropagation() },
+              btn('改名', () => setRenameWin({ from: name, value: name })),
               btn('删', () => { if (confirm('删除 Provider ' + name + '?')) setDraft((d) => { const n = clone(d); delete n[name]; return n }) }, 'danger')
             )
           ),
@@ -578,7 +642,8 @@ window.__ModuleLoader__.load({
           setExp((e) => Object.assign({}, e, { [nm]: true }))
         }, 'primary'),
         el(GlobalTestConfigModal, { win: configWin, setWin: setConfigWin }),
-        el(TestResultDetailModal, { win: detailWin, setWin: setDetailWin })
+        el(TestResultDetailModal, { win: detailWin, setWin: setDetailWin }),
+        el(RenameProviderModal, { win: renameWin, setWin: setRenameWin, onRename: renameProvider })
       )
     }
 
@@ -932,6 +997,13 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState(null)
       const [saving, setSaving] = useState(false)
       const [tab, setTab] = useState('config')
+
+      const renameProviderInChannels = (oldId, newId) => {
+        setChannelsDraft((d) => (d || []).map((g) => {
+          const cands = (g.candidates || []).map((c) => (c && c.provider === oldId) ? Object.assign({}, c, { provider: newId }) : c)
+          return Object.assign({}, g, { candidates: cands })
+        }))
+      }
       const [channels, setChannels] = useState(null)
       const [channelsDraft, setChannelsDraft] = useState(null)
       const [health, setHealth] = useState(null)
@@ -1049,7 +1121,7 @@ window.__ModuleLoader__.load({
           )
         ),
         el('div', { className: 'mcm-body' },
-          tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft, _setNotice: setNotice }) :
+          tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft, _setNotice: setNotice, _renameProviderInChannels: renameProviderInChannels }) :
           tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})) }) :
           el(HealthPanel, { health, _providers: (draft || (state ? state.providers : {})) })
         )
