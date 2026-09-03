@@ -1,7 +1,7 @@
-/** @arcaneorion/dsh-model-channel-manager — client 半（静态 bundle v5）。
- * 照 shipped settings-models 同款模式：inject ["slots","connection"]，
- * apply(ctx) 里 ctx.get("connection").api 捕获 api，组件经闭包使用。
- * 数据通道 = api.settings / api.llm / api.credentials（公共 seam，无 RPC）。
+/** @arcaneorion/dsh-model-channel-manager — client 半（现代化设计版）。
+ * 遵循 DSH 规范：inject ["slots","connection"]，
+ * apply(ctx) 捕获 ctx.get("connection").api，组件经闭包使用。
+ * 数据通道 = api.settings / api.llm / api.credentials（公共 seam，无私有 RPC）。
  */
 window.__ModuleLoader__.load({
   id: '@arcaneorion/dsh-model-channel-manager',
@@ -10,100 +10,65 @@ window.__ModuleLoader__.load({
     let apiRef = null
 
     const CSS = `
-.mcm-root { display:flex; flex-direction:column; height:100%; overflow:hidden; font-size:14px; color:var(--dsw-alias-label-primary); }
-.mcm-tabs { display:flex; gap:0; border-bottom:1px solid var(--dsw-alias-border-l2); flex-shrink:0; padding:0 16px; }
-.mcm-tab { padding:8px 16px; font-size:13px; font-weight:500; color:var(--dsw-alias-label-tertiary); cursor:pointer; border-bottom:2px solid transparent; }
-.mcm-tab:hover { color:var(--dsw-alias-label-secondary); }
-.mcm-tab.active { color:var(--dsw-alias-brand-primary); border-bottom-color:var(--dsw-alias-brand-primary); }
-.mcm-tab-right { margin-left:auto; display:flex; align-items:center; gap:6px; padding:4px 0; }
-.mcm-btn { box-sizing:border-box; height:28px; border:1px solid var(--dsw-alias-border-l2); background:transparent; color:var(--dsw-alias-label-primary); border-radius:14px; padding:0 12px; font-size:12px; cursor:pointer; font:inherit; display:inline-flex; align-items:center; gap:4px; }
-.mcm-btn:hover { background:var(--dsw-alias-interactive-bg-hover); }
-.mcm-btn.primary { background:var(--dsw-alias-button-primary-fill); color:var(--dsw-alias-label-primary-foreground); border:none; }
+.mcm-root { display:flex; flex-direction:column; height:100%; overflow:hidden; font-size:13px; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-base); }
+.mcm-header { display:flex; align-items:center; justify-content:space-between; padding:12px 24px; border-bottom:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); flex-shrink:0; }
+.mcm-nav { display:flex; background:var(--dsw-alias-bg-layer-2); padding:3px; border-radius:10px; border:1px solid var(--dsw-alias-border-l2); gap:2px; }
+.mcm-nav-item { padding:6px 16px; font-size:12px; font-weight:500; color:var(--dsw-alias-label-tertiary); cursor:pointer; border-radius:8px; transition:all 0.15s ease; user-select:none; }
+.mcm-nav-item:hover { color:var(--dsw-alias-label-primary); }
+.mcm-nav-item.active { color:var(--dsw-alias-brand-primary); background:var(--dsw-alias-bg-layer-1); box-shadow:0 1px 3px rgba(0,0,0,0.06); font-weight:600; }
+.mcm-actions { display:flex; align-items:center; gap:8px; }
+.mcm-btn { box-sizing:border-box; height:30px; border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:8px; padding:0 14px; font-size:12px; font-weight:500; cursor:pointer; font:inherit; display:inline-flex; align-items:center; gap:6px; transition:all 0.15s ease; }
+.mcm-btn:hover { background:var(--dsw-alias-interactive-bg-hover); border-color:var(--dsw-alias-border-l3); }
+.mcm-btn.primary { background:var(--dsw-alias-button-primary-fill); color:var(--dsw-alias-label-primary-foreground); border:none; box-shadow:0 1px 2px rgba(0,0,0,0.1); }
 .mcm-btn.primary:hover { background:var(--dsw-alias-button-primary-hover); }
-.mcm-btn.danger { color:var(--dsw-alias-state-error-primary); }
+.mcm-btn.danger { color:var(--dsw-alias-state-error-primary); border-color:transparent; background:transparent; }
 .mcm-btn.danger:hover { background:var(--dsw-alias-interactive-bg-hover-danger); }
-.mcm-body { flex:1; overflow-y:auto; padding:16px 20px 60px; }
-.mcm-notice { font-size:12px; color:var(--dsw-alias-label-tertiary); }
-.mcm-notice.ok { color:var(--dsw-alias-state-success-primary); }
-.mcm-notice.err { color:var(--dsw-alias-state-error-primary); }
-.mcm-card { border:1px solid var(--dsw-alias-border-l2); border-radius:12px; margin-bottom:8px; overflow:hidden; }
-.mcm-card-h { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; }
+.mcm-body { flex:1; overflow-y:auto; padding:20px 24px 60px; }
+.mcm-banner { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-radius:10px; background:var(--dsw-alias-bg-layer-1); border:1px solid var(--dsw-alias-border-l1); margin-bottom:16px; font-size:12px; }
+.mcm-card { border:1px solid var(--dsw-alias-border-l1); border-radius:12px; margin-bottom:12px; background:var(--dsw-alias-bg-layer-1); box-shadow:0 1px 3px rgba(0,0,0,0.02); transition:border-color 0.15s ease; overflow:hidden; }
+.mcm-card:hover { border-color:var(--dsw-alias-border-l2); }
+.mcm-card-h { display:flex; align-items:center; gap:12px; padding:12px 16px; cursor:pointer; user-select:none; }
 .mcm-card-h:hover { background:var(--dsw-alias-interactive-bg-hover); }
-.mcm-card-name { font-size:14px; font-weight:500; }
-.mcm-card-route { font-size:12px; color:var(--dsw-alias-label-tertiary); }
-.mcm-card-tag { border:1px solid var(--dsw-alias-border-l3); color:var(--dsw-alias-label-secondary); border-radius:4px; padding:1px 6px; font-size:11px; }
-.mcm-dot { display:none; }
-.mcm-chev { font-size:12px; color:var(--dsw-alias-label-dimmed); }
-.mcm-card-act { margin-left:auto; display:flex; gap:4px; }
-.mcm-editor { background:var(--dsw-alias-bg-module-platform); border-top:1px solid var(--dsw-alias-border-l2); padding:14px 16px; display:flex; flex-direction:column; gap:14px; }
-.mcm-field { display:flex; flex-direction:column; gap:4px; }
-.mcm-fl { display:flex; align-items:center; gap:4px; font-size:12px; font-weight:500; color:var(--dsw-alias-label-secondary); line-height:18px; }
-.mcm-req { color:var(--dsw-alias-state-error-primary); }
-.mcm-hint { color:var(--dsw-alias-label-dimmed); cursor:help; font-size:11px; border:1px solid var(--dsw-alias-border-l3); border-radius:50%; width:14px; height:14px; display:inline-flex; align-items:center; justify-content:center; }
-.mcm-in { box-sizing:border-box; width:100%; border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:8px; height:32px; padding:0 10px; font:inherit; font-size:14px; }
+.mcm-card-title { font-size:14px; font-weight:600; display:flex; align-items:center; gap:8px; }
+.mcm-badge { font-size:11px; font-weight:500; padding:2px 8px; border-radius:6px; border:1px solid var(--dsw-alias-border-l2); color:var(--dsw-alias-label-secondary); background:var(--dsw-alias-bg-layer-2); font-family:var(--ds-font-family-code); }
+.mcm-badge.brand { color:var(--dsw-alias-brand-primary); border-color:var(--dsw-alias-brand-primary); background:rgba(var(--dsw-rgb-brand-primary, 59, 130, 246), 0.08); }
+.mcm-badge.success { color:var(--dsw-alias-state-success-primary); border-color:var(--dsw-alias-state-success-primary); background:rgba(16, 185, 129, 0.08); }
+.mcm-badge.error { color:var(--dsw-alias-state-error-primary); border-color:var(--dsw-alias-state-error-primary); background:rgba(239, 68, 68, 0.08); }
+.mcm-editor { background:var(--dsw-alias-bg-layer-2); border-top:1px solid var(--dsw-alias-border-l1); padding:16px 20px; display:flex; flex-direction:column; gap:16px; }
+.mcm-field { display:flex; flex-direction:column; gap:6px; }
+.mcm-fl { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:var(--dsw-alias-label-secondary); }
+.mcm-hint { color:var(--dsw-alias-label-dimmed); cursor:help; font-size:11px; border:1px solid var(--dsw-alias-border-l2); border-radius:50%; width:15px; height:15px; display:inline-flex; align-items:center; justify-content:center; }
+.mcm-in { box-sizing:border-box; width:100%; border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:8px; height:34px; padding:0 12px; font:inherit; font-size:13px; transition:border-color 0.15s ease; }
 .mcm-in:focus { border-color:var(--dsw-alias-brand-primary); outline:none; }
 .mcm-in.mono { font-family:var(--ds-font-family-code); font-size:12px; }
-.mcm-row { display:flex; flex-wrap:wrap; gap:10px; }
-.mcm-row > .mcm-field { flex:1; min-width:160px; }
-.mcm-adv { border-top:1px dashed var(--dsw-alias-border-l3); padding-top:10px; }
-.mcm-adv-sum { cursor:pointer; font-size:13px; font-weight:500; color:var(--dsw-alias-label-secondary); display:flex; align-items:center; gap:6px; }
-.mcm-adv-sum:hover { color:var(--dsw-alias-label-primary); }
-.mcm-adv-b { padding-top:10px; display:flex; flex-direction:column; gap:12px; }
-.mcm-mcard { border:1px solid var(--dsw-alias-border-l2); border-radius:8px; margin-bottom:6px; overflow:hidden; }
-.mcm-mcard-h { display:flex; align-items:center; gap:8px; padding:8px 12px; cursor:pointer; }
-.mcm-mcard-h:hover { background:var(--dsw-alias-interactive-bg-hover); }
-.mcm-mcard-id { font-family:var(--ds-font-family-code); font-size:12px; font-weight:500; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.mcm-mtag { font-size:11px; padding:1px 6px; border-radius:4px; border:1px solid var(--dsw-alias-border-l3); color:var(--dsw-alias-label-secondary); }
-.mcm-mtag.reasoning { color:var(--dsw-alias-brand-primary); border-color:var(--dsw-alias-brand-primary); }
-.mcm-mtag.image { color:var(--dsw-alias-state-success-primary); border-color:var(--dsw-alias-state-success-primary); }
-.mcm-mcard-b { padding:10px 12px 12px; border-top:1px solid var(--dsw-alias-border-l2); display:flex; flex-direction:column; gap:10px; }
-.mcm-levels { display:grid; grid-template-columns:repeat(auto-fill,minmax(80px,1fr)); gap:6px; }
-.mcm-level { display:flex; flex-direction:column; gap:2px; }
-.mcm-level label { font-size:11px; color:var(--dsw-alias-label-tertiary); }
-.mcm-level input { border:1px solid var(--dsw-alias-border-l2); border-radius:6px; padding:4px 6px; font:inherit; font-size:12px; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-layer-1); outline:none; }
-.mcm-level input:focus { border-color:var(--dsw-alias-brand-primary); }
-.mcm-compat { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:8px; padding:8px 0; }
-.mcm-compat-f { display:flex; flex-direction:column; gap:2px; }
-.mcm-compat-f label { font-size:11px; color:var(--dsw-alias-label-tertiary); }
-.mcm-kv { border:1px solid var(--dsw-alias-border-l2); border-radius:8px; overflow:hidden; }
-.mcm-kv-row { display:flex; align-items:center; border-bottom:1px solid var(--dsw-alias-border-l2); }
-.mcm-kv-row:last-child { border-bottom:none; }
-.mcm-kv-row input { border:none; border-radius:0; background:transparent; padding:6px 8px; outline:none; font:inherit; font-size:12px; color:var(--dsw-alias-label-primary); }
-.mcm-kv-row .k { width:35%; font-weight:500; background:var(--dsw-alias-bg-module-platform); border-right:1px solid var(--dsw-alias-border-l2); }
-.mcm-kv-row .v { flex:1; font-family:var(--ds-font-family-code); font-size:11px; }
-.mcm-kv-row .x { padding:0 8px; color:var(--dsw-alias-label-dimmed); cursor:pointer; }
-.mcm-kv-row .x:hover { color:var(--dsw-alias-state-error-primary); }
-.mcm-check { display:inline-flex; align-items:center; gap:4px; font-size:13px; color:var(--dsw-alias-label-secondary); margin-right:10px; }
-.mcm-check input { accent-color:var(--dsw-alias-brand-primary); }
-.mcm-mask { position:fixed; inset:0; background:rgba(0,0,0,.3); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; z-index:200; }
-.mcm-modal { background:var(--dsw-alias-bg-base); border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,.2); width:90%; max-width:520px; max-height:80vh; display:flex; flex-direction:column; border:1px solid var(--dsw-alias-border-l2); }
-.mcm-modal-h { padding:14px 18px; border-bottom:1px solid var(--dsw-alias-border-l2); display:flex; align-items:center; gap:8px; }
-.mcm-modal-h h2 { font-size:15px; font-weight:500; flex:1; margin:0; }
-.mcm-modal-b { padding:16px 18px; overflow-y:auto; flex:1; }
-.mcm-modal-f { padding:10px 18px; border-top:1px solid var(--dsw-alias-border-l2); display:flex; justify-content:flex-end; gap:8px; }
-.mcm-fs { display:flex; align-items:center; gap:5px; flex-wrap:wrap; padding:8px 10px; background:var(--dsw-alias-bg-module-platform); border-radius:8px; margin-bottom:10px; font-size:12px; }
-.mcm-fs-i { display:inline-flex; align-items:center; gap:3px; padding:2px 9px; border-radius:12px; font-weight:500; font-size:11px; }
-.mcm-fs-i.total { border:1px solid var(--dsw-alias-border-l2); color:var(--dsw-alias-label-primary); }
-.mcm-fs-i.ok { color:var(--dsw-alias-state-success-primary); }
-.mcm-fs-i.add { color:var(--dsw-alias-brand-primary); }
-.mcm-fs-i.clean { color:var(--dsw-alias-state-error-primary); }
-.mcm-fl-list { max-height:280px; overflow-y:auto; border:1px solid var(--dsw-alias-border-l2); border-radius:8px; }
-.mcm-fl-item { display:flex; align-items:center; gap:8px; padding:7px 10px; border-bottom:1px solid var(--dsw-alias-border-l2); cursor:pointer; }
-.mcm-fl-item:last-child { border-bottom:none; }
-.mcm-fl-item:hover { background:var(--dsw-alias-interactive-bg-hover); }
-.mcm-fl-item input { accent-color:var(--dsw-alias-brand-primary); flex-shrink:0; }
-.mcm-fl-item label { flex:1; font-family:var(--ds-font-family-code); font-size:12px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.mcm-fl-tag { font-size:10px; padding:1px 5px; border-radius:10px; font-weight:500; }
-.mcm-fl-tag.add { color:var(--dsw-alias-brand-primary); }
-.mcm-fl-tag.ok { color:var(--dsw-alias-state-success-primary); }
-.mcm-fl-tag.stale { color:var(--dsw-alias-state-error-primary); }
-.mcm-spin { width:20px; height:20px; border:2px solid var(--dsw-alias-border-l2); border-top-color:var(--dsw-alias-brand-primary); border-radius:50%; animation:mcm-spin .8s linear infinite; margin:16px auto; }
+.mcm-row { display:flex; flex-wrap:wrap; gap:12px; }
+.mcm-row > .mcm-field { flex:1; min-width:180px; }
+.mcm-subcard { border:1px solid var(--dsw-alias-border-l2); border-radius:10px; margin-bottom:8px; background:var(--dsw-alias-bg-layer-1); overflow:hidden; }
+.mcm-subcard-h { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; }
+.mcm-subcard-h:hover { background:var(--dsw-alias-interactive-bg-hover); }
+.mcm-subcard-b { padding:14px 16px; border-top:1px solid var(--dsw-alias-border-l1); display:flex; flex-direction:column; gap:12px; background:var(--dsw-alias-bg-layer-2); }
+.mcm-metrics-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:20px; }
+.mcm-metric-card { background:var(--dsw-alias-bg-layer-1); border:1px solid var(--dsw-alias-border-l1); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; gap:4px; box-shadow:0 1px 3px rgba(0,0,0,0.02); }
+.mcm-metric-label { font-size:12px; color:var(--dsw-alias-label-tertiary); font-weight:500; }
+.mcm-metric-value { font-size:24px; font-weight:700; color:var(--dsw-alias-label-primary); font-family:var(--ds-font-family-code); }
+.mcm-meter { height:6px; border-radius:3px; background:var(--dsw-alias-bg-layer-2); overflow:hidden; margin-top:6px; display:flex; }
+.mcm-meter-fill { height:100%; border-radius:3px; background:var(--dsw-alias-state-success-primary); }
+.mcm-meter-fill.warn { background:var(--dsw-alias-state-warn-primary); }
+.mcm-meter-fill.danger { background:var(--dsw-alias-state-error-primary); }
+.mcm-health-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:12px; }
+.mcm-health-card { background:var(--dsw-alias-bg-layer-1); border:1px solid var(--dsw-alias-border-l1); border-radius:12px; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+.mcm-health-card-h { display:flex; align-items:center; justify-content:space-between; }
+.mcm-status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.mcm-status-dot.ok { background:var(--dsw-alias-state-success-primary); box-shadow:0 0 0 3px rgba(16, 185, 129, 0.15); }
+.mcm-status-dot.err { background:var(--dsw-alias-state-error-primary); box-shadow:0 0 0 3px rgba(239, 68, 68, 0.15); }
+.mcm-mask { position:fixed; inset:0; background:rgba(0,0,0,.4); backdrop-filter:blur(3px); display:flex; align-items:center; justify-content:center; z-index:999; }
+.mcm-modal { background:var(--dsw-alias-bg-base); border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.25); width:92%; max-width:540px; max-height:85vh; display:flex; flex-direction:column; border:1px solid var(--dsw-alias-border-l2); overflow:hidden; }
+.mcm-modal-h { padding:14px 20px; border-bottom:1px solid var(--dsw-alias-border-l1); display:flex; align-items:center; justify-content:space-between; background:var(--dsw-alias-bg-layer-1); }
+.mcm-modal-b { padding:18px 20px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:12px; }
+.mcm-modal-f { padding:12px 20px; border-top:1px solid var(--dsw-alias-border-l1); display:flex; justify-content:flex-end; gap:8px; background:var(--dsw-alias-bg-layer-1); }
+.mcm-empty { color:var(--dsw-alias-label-tertiary); padding:32px 16px; text-align:center; font-size:13px; }
+.mcm-spin { width:18px; height:18px; border:2px solid var(--dsw-alias-border-l2); border-top-color:var(--dsw-alias-brand-primary); border-radius:50%; animation:mcm-spin .8s linear infinite; display:inline-block; }
 @keyframes mcm-spin { to { transform:rotate(360deg); } }
-.mcm-live { display:inline-flex; align-items:center; gap:4px; font-size:12px; font-weight:500; padding:2px 8px; border-radius:12px; }
-.mcm-live.ok { color:var(--dsw-alias-state-success-primary); }
-.mcm-live.bad { color:var(--dsw-alias-state-error-primary); }
-.mcm-live.testing { color:var(--dsw-alias-label-tertiary); }
-.mcm-empty { color:var(--dsw-alias-label-tertiary); padding:16px; text-align:center; font-size:13px; }
 `
 
     const clone = (v) => JSON.parse(JSON.stringify(v))
@@ -114,76 +79,70 @@ window.__ModuleLoader__.load({
     const TRANSPORTS = ['sse', 'websocket', 'websocket-cached', 'auto']
     const CACHE = ['none', 'short', 'long']
     const btn = (label, onClick, kind) => el('button', { className: 'mcm-btn' + (kind ? ' ' + kind : ''), onClick }, label)
-    const field = (label, tip, req, children) => el('div', { className: 'mcm-field' }, el('div', { className: 'mcm-fl' }, label, req ? el('span', { className: 'mcm-req' }, '*') : null, tip ? el('span', { className: 'mcm-hint', title: tip }, '?') : null), children)
+    const field = (label, tip, req, children) => el('div', { className: 'mcm-field' }, el('div', { className: 'mcm-fl' }, label, req ? el('span', { style: { color: 'var(--dsw-alias-state-error-primary)' } }, '*') : null, tip ? el('span', { className: 'mcm-hint', title: tip }, '?') : null), children)
     const tf = (label, tip, value, onSet, mono) => field(label, tip, false, el('input', { className: 'mcm-in' + (mono ? ' mono' : ''), value: value == null ? '' : String(value), onChange: (e) => onSet(e.target.value) }))
     const nf = (label, tip, value, onSet) => tf(label, tip, value, (v) => onSet(Number(v) || 0))
     const sel = (label, tip, value, options, onSet) => field(label, tip, false, el('select', { className: 'mcm-in', value, onChange: (e) => onSet(e.target.value) }, ...options.map((o) => Array.isArray(o) ? el('option', { key: o[0], value: o[0] }, o[1]) : el('option', { key: o, value: o }, o))))
 
-    function levelsEditor(efforts, onSet) {
-      const cur = efforts && typeof efforts === 'object' ? efforts : {}
-      return el('div', { className: 'mcm-levels' }, LEVELS.map((lv) => {
-        const wire = cur[lv]
-        return el('div', { key: lv, className: 'mcm-level' }, el('label', { title: lv === 'off' ? 'null=关闭推理' : '发到API的实际值' }, lv), el('input', { value: wire == null ? '' : String(wire), placeholder: lv === 'off' ? '(null)' : 'wire', onChange: (e) => { const v = e.target.value; const n = Object.assign({}, cur); if (v === '' && lv !== 'off') { delete n[lv] } else if (v === '') { n[lv] = null } else { n[lv] = v }; onSet(n) } }))
-      }))
-    }
-
     function kvEditor(kvs, onSet) {
       const entries = Object.entries(kvs || {})
-      return el('div', null, el('div', { className: 'mcm-kv' }, entries.length > 0 ? entries.map(([k, v], i) => el('div', { key: i, className: 'mcm-kv-row' }, el('input', { className: 'k', value: k, onChange: (e) => { const n = Object.assign({}, kvs); delete n[k]; n[e.target.value] = v; onSet(n) } }), el('input', { className: 'v', value: v, onChange: (e) => { const n = Object.assign({}, kvs); n[k] = e.target.value; onSet(n) } }), el('span', { className: 'x', onClick: () => { const n = Object.assign({}, kvs); delete n[k]; onSet(n) } }, '\u2715'))) : el('div', { className: 'mcm-empty', style: { padding: 8 } }, '无header')), btn('＋添加', () => onSet(Object.assign({}, kvs, { '': '' })), 'danger'))
+      return el('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+        entries.length > 0 ? entries.map(([k, v], i) => el('div', { key: i, style: { display: 'flex', gap: 6, alignItems: 'center' } },
+          el('input', { className: 'mcm-in mono', style: { width: '35%' }, placeholder: 'Header Key', value: k, onChange: (e) => { const n = Object.assign({}, kvs); delete n[k]; n[e.target.value] = v; onSet(n) } }),
+          el('input', { className: 'mcm-in mono', style: { flex: 1 }, placeholder: 'Value', value: v, onChange: (e) => { const n = Object.assign({}, kvs); n[k] = e.target.value; onSet(n) } }),
+          btn('✕', () => { const n = Object.assign({}, kvs); delete n[k]; onSet(n) }, 'danger')
+        )) : el('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', padding: '4px 0' } }, '暂无自定义请求头'),
+        btn('＋添加 Header', () => onSet(Object.assign({}, kvs, { '': '' })))
+      )
     }
 
     function compatEditor(compat, onSet) {
       const c = compat || {}
       const setB = (k, v) => onSet(Object.assign({}, c, { [k]: v }))
       const setS = (k, v) => onSet(Object.assign({}, c, { [k]: v }))
-      const bF = (k, d) => el('div', { className: 'mcm-compat-f' }, el('label', { title: d }, k), el('label', { className: 'mcm-check' }, el('input', { type: 'checkbox', checked: !!c[k], onChange: (e) => setB(k, e.target.checked) }), c[k] ? '✓' : '✗'))
-      const sF = (k, opts, d) => el('div', { className: 'mcm-compat-f' }, el('label', { title: d }, k), el('select', { className: 'mcm-in', style: { height: 28, fontSize: 12 }, value: c[k] || '', onChange: (e) => setS(k, e.target.value) }, el('option', { value: '' }, '—'), ...opts.map((o) => el('option', { key: o, value: o }, o))))
-      return el('div', { className: 'mcm-compat' }, sF('thinkingFormat', TF, '推理调度线格式'), sF('maxTokensField', MTF, '输出上限字段名'), bF('supportsReasoningEffort', '支持reasoning_effort'), bF('supportsDeveloperRole', '支持developer role'), bF('supportsStore', '支持store'), bF('supportsUsageInStreaming', '流式含usage'), bF('supportsLongCacheRetention', '支持长缓存'), bF('supportsEagerToolInputStreaming', '工具输入流式'), bF('supportsTemperature', '支持temperature'), bF('forceAdaptiveThinking', '强制自适应思考'), bF('allowEmptySignature', '允许空签名'), bF('supportsStrictMode', 'strict模式'), bF('supportsStrictTools', 'strict tools'), bF('supportsCacheControlOnTools', '工具缓存控制'), bF('requiresToolResultName', '结果带name'), bF('requiresAssistantAfterToolResult', '结果后紧跟assistant'), bF('requiresThinkingAsText', '思考以文本发送'), bF('requiresReasoningContentOnAssistantMessages', 'assistant带reasoning_content'), sF('cacheControlFormat', ['anthropic'], '缓存控制格式'))
+      const bF = (k, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+        el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: d }, k),
+        el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', height: 28, fontSize: 12 } },
+          el('input', { type: 'checkbox', checked: !!c[k], onChange: (e) => setB(k, e.target.checked) }),
+          c[k] ? '✓ 开' : '关'
+        )
+      )
+      const sF = (k, opts, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+        el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: d }, k),
+        el('select', { className: 'mcm-in', style: { height: 28, fontSize: 12 }, value: c[k] || '', onChange: (e) => setS(k, e.target.value) },
+          el('option', { value: '' }, '— 默认 —'),
+          ...opts.map((o) => el('option', { key: o, value: o }, o))
+        )
+      )
+      return el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10, padding: '8px 0' } },
+        sF('thinkingFormat', TF, '推理调度格式'),
+        sF('maxTokensField', MTF, '最大输出 token 字段名'),
+        bF('supportsReasoningEffort', '支持 reasoning_effort 字段'),
+        bF('supportsDeveloperRole', '支持 developer role (OpenAI 新格式)'),
+        bF('supportsStore', '支持 store 参数'),
+        bF('supportsUsageInStreaming', '流式分片中包含 usage'),
+        bF('supportsLongCacheRetention', '支持长周期 Prompt 缓存'),
+        bF('supportsEagerToolInputStreaming', '工具调用流式输入'),
+        bF('supportsTemperature', '支持自定义 temperature'),
+        bF('forceAdaptiveThinking', '强制自适应思考'),
+        bF('allowEmptySignature', '允许空签名'),
+        bF('supportsStrictMode', '支持 strict 模式'),
+        bF('supportsStrictTools', '支持 strict tools'),
+        bF('supportsCacheControlOnTools', '支持对工具参数增加缓存控制'),
+        bF('requiresToolResultName', '工具返回需携带 name'),
+        bF('requiresAssistantAfterToolResult', '工具返回后紧跟 assistant 角色'),
+        bF('requiresThinkingAsText', '思考过程作为纯文本消息传递'),
+        bF('requiresReasoningContentOnAssistantMessages', 'assistant 消息需携带 reasoning_content'),
+        sF('cacheControlFormat', ['anthropic'], '缓存控制协议规范')
+      )
     }
 
-    function modelCard(m, mi, updateModel, removeModel, em, setEm, launchTest, testState) {
-      const setInput = (patch) => updateModel(mi, patch)
-      const input = m.input || ['text']
-      const tog = (mod) => { const s = new Set(input); if (s.has(mod)) { s.delete(mod) } else { s.add(mod) }; setInput({ input: [...s] }) }
-      const tags = []
-      const ts = testState
-      const tsTag = ts ? (ts.status === 'running' ? el('span', { className: 'mcm-live testing' }, '⏳') : ts.status === 'ok' ? el('span', { className: 'mcm-live ok', title: 'TTFT ' + (ts.ttftMs != null ? (ts.ttftMs / 1000).toFixed(2) + 's' : '—') + ' · 总 ' + (ts.latencyMs != null ? (ts.latencyMs / 1000).toFixed(2) + 's' : '—') + (ts.text ? ' · ' + ts.text.slice(0, 40) : '') }, '✓') : el('span', { className: 'mcm-live bad', title: (ts.error || ts.code || '失败') }, '✗')) : null
-      if (input.includes('image')) { tags.push(el('span', { key: 'i', className: 'mcm-mtag image' }, 'image')) } else { tags.push(el('span', { key: 't', className: 'mcm-mtag' }, 'text')) }
-      const eff = m.reasoningEfforts || {}
-      if (Object.keys(eff).some((k) => k !== 'off' && eff[k] != null)) { tags.push(el('span', { key: 'r', className: 'mcm-mtag reasoning' }, 'reasoning')) }
-      const isOpen = !!em[mi]
-      return el('div', { className: 'mcm-mcard', key: mi }, el('div', { className: 'mcm-mcard-h', onClick: () => setEm((e) => Object.assign({}, e, { [mi]: !e[mi] })) }, el('span', { className: 'mcm-chev' }, isOpen ? '▼' : '▶'), el('span', { className: 'mcm-mcard-id' }, m.id || '(unnamed)'), ...tags, tsTag, btn('⚡测试', (e) => { e.stopPropagation(); if (launchTest) launchTest(m.id) }, 'primary'), btn('✕', (e) => { e.stopPropagation(); removeModel(mi) }, 'danger')),
-        isOpen ? el('div', { className: 'mcm-mcard-b' }, el('div', { className: 'mcm-row' }, field('id', '模型唯一标识', true, el('input', { className: 'mcm-in mono', value: m.id || '', onChange: (e) => setInput({ id: e.target.value }) })), field('name', '显示名称(不影响API)', false, el('input', { className: 'mcm-in', value: m.name || '', onChange: (e) => setInput({ name: e.target.value }) }))), el('div', { className: 'mcm-row' }, nf('contextWindow', '上下文窗口token数', m.contextWindow || 0, (v) => setInput({ contextWindow: v })), nf('maxTokens', '最大输出token', m.maxTokens || 0, (v) => setInput({ maxTokens: v }))), field('input', 'text=纯文本,image=图片', false, el('div', null, el('label', { className: 'mcm-check' }, el('input', { type: 'checkbox', checked: input.includes('text'), onChange: () => tog('text') }), 'text'), el('label', { className: 'mcm-check' }, el('input', { type: 'checkbox', checked: input.includes('image'), onChange: () => tog('image') }), 'image'))), field('reasoningEfforts', '各级wire值映射(off=null表示关闭)', false, levelsEditor(eff, (v) => setInput({ reasoningEfforts: v }))), el('div', { className: 'mcm-adv' }, el('div', { className: 'mcm-adv-sum', onClick: (e) => { e.stopPropagation(); setEm((s) => Object.assign({}, s, { ['cx_' + mi]: !s['cx_' + mi] })) } }, el('span', null, em['cx_' + mi] ? '▼' : '▶'), 'compat占位修改(模型级)'), em['cx_' + mi] ? el('div', { className: 'mcm-adv-b' }, compatEditor(m.compat, (v) => setInput({ compat: v }))) : null)) : null)
-    }
-
-    function fetchModal(name, p, disc, setDisc, onApply) {
-      if (!disc || disc.provider !== name) return null
-      let body
-      if (disc.loading) { body = el('div', { style: { display: 'flex', justifyContent: 'center', padding: 24 } }, el('div', { className: 'mcm-spin' }))
-      } else if (disc.error) { body = el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', padding: 14, textAlign: 'center', fontSize: 12 } }, '拉取失败: ' + disc.error, el('br'), btn('重试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }))
-      } else { const d = disc; const all = [...d.missing.map((id) => ({ id, tag: 'add', txt: '+ 可添加' })), ...d.configured.map((id) => ({ id, tag: 'ok', txt: '✓ 已配' })), ...d.stale.map((id) => ({ id, tag: 'stale', txt: '! 可清' }))]
-        const toggle = (item) => { const s = new Set(d.selected); if (s.has(item.id)) { s.delete(item.id) } else { s.add(item.id) }; setDisc(Object.assign({}, d, { selected: s })) }
-        body = el('div', null, el('div', { className: 'mcm-fs' }, el('span', { className: 'mcm-fs-i total' }, '端点 ' + d.available.length), el('span', { className: 'mcm-fs-i ok' }, '✓已配 ' + d.configured.length), el('span', { className: 'mcm-fs-i add' }, '+可加 ' + d.missing.length), el('span', { className: 'mcm-fs-i clean' }, '!可清 ' + d.stale.length)), el('div', { className: 'mcm-notice' }, '勾选=保留/添加，取消勾选=清理。已配置项默认勾选，取消勾选会被删除。'), el('div', { className: 'mcm-fl-list' }, all.length === 0 ? el('div', { className: 'mcm-empty' }, '端点无模型') : all.map((item) => { const checked = d.selected.has(item.id); return el('div', { key: item.id, className: 'mcm-fl-item', onClick: () => toggle(item) }, el('input', { type: 'checkbox', checked, onChange: (e) => { e.stopPropagation(); toggle(item) } }), el('label', null, item.id), el('span', { className: 'mcm-fl-tag ' + item.tag }, item.txt)) })))
-      }
-      const cc = disc && disc.selected ? disc.selected.size : 0
-      const mh = el('div', { className: 'mcm-modal-h' }, el('h2', null, '拉取上游可用模型 · ' + name), btn('✕', () => setDisc(null)))
-      const mb = el('div', { className: 'mcm-modal-b' }, body)
-      const mf = el('div', { className: 'mcm-modal-f' }, btn('取消', () => setDisc(null)), btn('应用 (' + cc + ')', () => { if (disc.selected) { onApply([...disc.selected]); setDisc(null) } }, 'primary'))
-      return el('div', { className: 'mcm-mask', onClick: () => setDisc(null) }, el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() }, mh, mb, mf))
-    }
-
-    function doFetch(name, p, setDisc) {
-      if (!apiRef) { setDisc({ provider: name, error: 'api unavailable' }); return }
-      apiRef.llm.discoverModels({ settingsNs: 'llm-pi-ai', provider: name, baseURL: p.baseURL || undefined }).then((resp) => {
-        const r = resp && resp.result ? resp.result : resp
-        if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'discover failed')
-        const result = r && r.value !== undefined ? r.value : r
-        const models = (result && result.models) || []
-        const av = models.map((m) => m.id).filter(Boolean)
-        const cf = new Set((p.models || []).map((m) => m.id))
-        // pi 同款语义：已配置默认勾选(保留)，可添加默认不勾，可清理默认不勾；应用=勾选的保留/添加，未勾选的删除
-        setDisc({ provider: name, available: av, configured: [...cf].filter((id) => av.includes(id)), missing: av.filter((id) => !cf.has(id)), stale: [...cf].filter((id) => !av.includes(id)), selected: new Set([...cf].filter((id) => av.includes(id))) })
-      }).catch((e) => setDisc({ provider: name, error: String((e && e.message) || e) }))
+    function levelsEditor(efforts, onSet) {
+      const cur = efforts && typeof efforts === 'object' ? efforts : {}
+      return el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(85px, 1fr))', gap: 6 } }, LEVELS.map((lv) => {
+        const wire = cur[lv]
+        return el('div', { key: lv, style: { display: 'flex', flexDirection: 'column', gap: 2 } }, el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, lv), el('input', { className: 'mcm-in mono', style: { height: 28, fontSize: 12, padding: '0 6px' }, value: wire == null ? '' : String(wire), placeholder: lv === 'off' ? '(null)' : 'wire', onChange: (e) => { const v = e.target.value; const n = Object.assign({}, cur); if (v === '' && lv !== 'off') { delete n[lv] } else if (v === '') { n[lv] = null } else { n[lv] = v }; onSet(n) } }))
+      }))
     }
 
     function ModelTestModal(props) {
@@ -208,144 +167,608 @@ window.__ModuleLoader__.load({
         setRunning(true); setWin((w) => Object.assign({}, w, { nonce, result: null }))
         apiRef.settings.update({ ns: 'model-channel-health', patch: { testRequest: { nonce, provider: win.provider, model: win.model, prompt: win.prompt || '你好', maxTokens: win.maxTokens || 256 } } }).then(() => { poll(nonce) }).catch((e) => { setWin((w) => Object.assign({}, w, { result: { status: 'error', error: String((e && e.message) || e) } })); setRunning(false) })
       }
-      const w = win
-      const res = w.result
-      const statusLine = running || (res && res.status === 'running') ? el('span', { className: 'mcm-live testing' }, '请求中…模拟DSH真实链路') : res && res.status === 'ok' ? el('span', { className: 'mcm-live ok' }, '✓成功 · TTFT ' + (res.ttftMs != null ? (res.ttftMs / 1000).toFixed(2) + 's' : '—') + ' · 总延迟 ' + (res.latencyMs != null ? (res.latencyMs / 1000).toFixed(2) + 's' : '—')) : res && res.status === 'error' ? el('span', { className: 'mcm-live bad' }, '✗失败: ' + (res.error || res.code || 'unknown')) : null
-      const body = el('div', { className: 'mcm-modal-b' }, el('div', { className: 'mcm-fs' }, el('span', { className: 'mcm-fs-i total' }, '模型测试'), el('span', { className: 'mcm-fs-i ok' }, w.provider), el('span', { className: 'mcm-fs-i add' }, w.model)), field('问题', '发送到上游的真实用户消息（存本地）', false, el('textarea', { className: 'mcm-in', style: { height: 70, padding: 8, resize: 'vertical' }, value: w.prompt || '', onChange: (e) => { localStorage.setItem('mcm_test_prompt', e.target.value); setWin((x) => Object.assign({}, x, { prompt: e.target.value })) } })), field('maxTokens', '最大输出token', false, el('input', { type: 'number', className: 'mcm-in', value: w.maxTokens || 256, onChange: (e) => setWin((x) => Object.assign({}, x, { maxTokens: Number(e.target.value) || 256 })) })), el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, btn(running ? '请求中…' : '🚀 发送测试', run, 'primary'), statusLine), res && res.status === 'ok' && res.text ? el('div', { className: 'mcm-mcard-b', style: { marginTop: 8 } }, el('div', { className: 'mcm-fl' }, '回复'), el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 180, overflow: 'auto', color: 'var(--dsw-alias-label-primary)' } }, res.text)) : null)
-      return el('div', { className: 'mcm-mask', onClick: () => setWin(null) }, el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() }, el('div', { className: 'mcm-modal-h' }, el('h2', null, '模型测试 · ' + w.model), btn('✕', () => setWin(null))), body, el('div', { className: 'mcm-modal-f' }, btn('关闭', () => setWin(null)))))
+      const w = win; const res = w.result
+      const body = el('div', { className: 'mcm-modal-b' },
+        el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } }, el('span', { className: 'mcm-badge brand' }, w.provider), el('span', { className: 'mcm-badge' }, w.model)),
+        field('测试 Prompt', '发送到上游端点的真实用户请求', false, el('textarea', { className: 'mcm-in', style: { height: 75, padding: 8, resize: 'vertical' }, value: w.prompt || '', onChange: (e) => { localStorage.setItem('mcm_test_prompt', e.target.value); setWin((x) => Object.assign({}, x, { prompt: e.target.value })) } })),
+        field('Max Tokens', '最大输出长度', false, el('input', { type: 'number', className: 'mcm-in', value: w.maxTokens || 256, onChange: (e) => setWin((x) => Object.assign({}, x, { maxTokens: Number(e.target.value) || 256 })) })),
+        el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, btn(running ? '测试中…' : '🚀 发送测试', run, 'primary'), running ? el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, el('div', { className: 'mcm-spin' }), '请求真实链路上游…') : null),
+        res && res.status === 'ok' ? el('div', { style: { background: 'var(--dsw-alias-bg-layer-2)', padding: 12, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', display: 'flex', flexDirection: 'column', gap: 6 } },
+          el('div', { style: { display: 'flex', gap: 12, fontSize: 12, color: 'var(--dsw-alias-state-success-primary)', fontWeight: 600 } }, el('span', null, '✓ 成功'), el('span', null, 'TTFT: ' + (res.ttftMs != null ? (res.ttftMs / 1000).toFixed(2) + 's' : '—')), el('span', null, '总延迟: ' + (res.latencyMs != null ? (res.latencyMs / 1000).toFixed(2) + 's' : '—'))),
+          res.reasoning ? el('div', null, el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '思考过程'), el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 120, overflow: 'auto', color: 'var(--dsw-alias-label-secondary)', margin: '4px 0 8px' } }, res.reasoning)) : null,
+          res.text ? el('div', null, el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '正文回复'), el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 160, overflow: 'auto', color: 'var(--dsw-alias-label-primary)', margin: '4px 0 0' } }, res.text)) : null
+        ) : null,
+        res && res.status === 'error' ? el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, padding: 10, background: 'rgba(239, 68, 68, 0.08)', borderRadius: 8 } }, '✗ 测试失败: ' + (res.error || res.code || 'unknown')) : null
+      )
+      return el('div', { className: 'mcm-mask', onClick: () => setWin(null) }, el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() },
+        el('div', { className: 'mcm-modal-h' }, el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, '单模型测试'), btn('✕', () => setWin(null))),
+        body,
+        el('div', { className: 'mcm-modal-f' }, btn('关闭', () => setWin(null)))
+      ))
+    }
+
+    function fetchModal(name, p, disc, setDisc, onApply) {
+      if (!disc || disc.provider !== name) return null
+      let body
+      if (disc.loading) {
+        body = el('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: 32 } },
+          el('div', { className: 'mcm-spin', style: { width: 24, height: 24 } }),
+          el('span', { style: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)' } }, '正在连接上游端点拉取模型列表…')
+        )
+      } else if (disc.error) {
+        body = el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', padding: 16, textAlign: 'center', fontSize: 13 } },
+          el('div', { style: { marginBottom: 12 } }, '拉取失败: ' + disc.error),
+          btn('重新尝试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }, 'primary')
+        )
+      } else {
+        const d = disc
+        const all = [
+          ...d.missing.map((id) => ({ id, tag: 'add', txt: '+ 可添加' })),
+          ...d.configured.map((id) => ({ id, tag: 'ok', txt: '✓ 已配置' })),
+          ...d.stale.map((id) => ({ id, tag: 'stale', txt: '! 端点已下线' }))
+        ]
+        const toggle = (item) => {
+          const s = new Set(d.selected)
+          if (s.has(item.id)) { s.delete(item.id) } else { s.add(item.id) }
+          setDisc(Object.assign({}, d, { selected: s }))
+        }
+        body = el('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+          el('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', background: 'var(--dsw-alias-bg-layer-2)', padding: '8px 12px', borderRadius: 8 } },
+            el('span', { className: 'mcm-badge' }, '端点模型总数: ' + d.available.length),
+            el('span', { className: 'mcm-badge success' }, '✓ 已匹配: ' + d.configured.length),
+            el('span', { className: 'mcm-badge brand' }, '+ 可新增: ' + d.missing.length),
+            d.stale.length > 0 ? el('span', { className: 'mcm-badge error' }, '! 端点无此模型: ' + d.stale.length) : null
+          ),
+          el('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '说明：勾选 = 保留或添加；取消勾选 = 删除。已配置项默认勾选。'),
+          el('div', { style: { maxHeight: 300, overflowY: 'auto', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-1)' } },
+            all.length === 0 ? el('div', { className: 'mcm-empty' }, '端点未返回任何可用模型') :
+            all.map((item) => {
+              const checked = d.selected.has(item.id)
+              return el('div', {
+                key: item.id,
+                style: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderBottom: '1px solid var(--dsw-alias-border-l1)', cursor: 'pointer', background: checked ? 'rgba(var(--dsw-rgb-brand-primary, 59, 130, 246), 0.04)' : 'transparent' },
+                onClick: () => toggle(item)
+              },
+                el('input', { type: 'checkbox', checked, onChange: (e) => { e.stopPropagation(); toggle(item) } }),
+                el('label', { style: { flex: 1, fontFamily: 'var(--ds-font-family-code)', fontSize: 12, cursor: 'pointer' } }, item.id),
+                el('span', { className: 'mcm-badge ' + (item.tag === 'ok' ? 'success' : item.tag === 'add' ? 'brand' : 'error') }, item.txt)
+              )
+            })
+          )
+        )
+      }
+      const cc = disc && disc.selected ? disc.selected.size : 0
+      return el('div', { className: 'mcm-mask', onClick: () => setDisc(null) },
+        el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() },
+          el('div', { className: 'mcm-modal-h' },
+            el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, '拉取上游端点模型 · ' + (p.displayName || name)),
+            btn('✕', () => setDisc(null))
+          ),
+          el('div', { className: 'mcm-modal-b' }, body),
+          el('div', { className: 'mcm-modal-f' },
+            btn('取消', () => setDisc(null)),
+            btn('应用选中模型 (' + cc + ')', () => { if (disc.selected) { onApply([...disc.selected]); setDisc(null) } }, 'primary')
+          )
+        )
+      )
+    }
+
+    function doFetch(name, p, setDisc) {
+      if (!apiRef) { setDisc({ provider: name, error: 'api unavailable' }); return }
+      apiRef.llm.discoverModels({ settingsNs: 'llm-pi-ai', provider: name, baseURL: p.baseURL || undefined }).then((resp) => {
+        const r = resp && resp.result ? resp.result : resp
+        if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'discover failed')
+        const result = r && r.value !== undefined ? r.value : r
+        const models = (result && result.models) || []
+        const av = models.map((m) => m.id).filter(Boolean)
+        const cf = new Set((p.models || []).map((m) => m.id))
+        setDisc({
+          provider: name,
+          available: av,
+          configured: [...cf].filter((id) => av.includes(id)),
+          missing: av.filter((id) => !cf.has(id)),
+          stale: [...cf].filter((id) => !av.includes(id)),
+          selected: new Set([...cf].filter((id) => av.includes(id)))
+        })
+      }).catch((e) => setDisc({ provider: name, error: String((e && e.message) || e) }))
     }
 
     function ModelConfigPanel(props) {
       const draft = props._draft; const setDraft = props._setDraft
-      const [exp, setExp] = useState({}); const [em, setEm] = useState({}); const [sa, setSa] = useState({}); const [disc, setDisc] = useState(null); const [live, setLive] = useState({}); const [keyInput, setKeyInput] = useState({})
-      const providers = draft || {}; const credStatus = props._state && props._state.credentials ? props._state.credentials : {}
+      const [exp, setExp] = useState({}); const [em, setEm] = useState({}); const [live, setLive] = useState({})
+      const [sa, setSa] = useState({})
+      const [keyInput, setKeyInput] = useState({})
       const [testWin, setTestWin] = useState(null); const [testStates, setTestStates] = useState({})
-      const launchTest = (provider, model) => { setTestStates((s) => Object.assign({}, s, { [provider + '::' + model]: { status: 'running' } })); setTestWin({ provider, model, prompt: localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己', maxTokens: 256, nonce: null, result: null, polling: false }) }
+      const [disc, setDisc] = useState(null)
+      const providers = draft || {}
+
+      const launchTest = (provider, model) => {
+        setTestStates((s) => Object.assign({}, s, { [provider + '::' + model]: { status: 'running' } }))
+        setTestWin({ provider, model, prompt: localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己', maxTokens: 256, nonce: null, result: null, polling: false })
+      }
       const updateP = (name, patch) => setDraft((d) => Object.assign({}, d, { [name]: Object.assign({}, d[name], patch) }))
       const updateModel = (name, mi, patch) => setDraft((d) => { const ms = (d[name].models || []).map((mm, i) => i === mi ? Object.assign({}, mm, patch) : mm); return Object.assign({}, d, { [name]: Object.assign({}, d[name], { models: ms }) }) })
       const removeModel = (name, mi) => setDraft((d) => { const ms = (d[name].models || []).filter((_, i) => i !== mi); return Object.assign({}, d, { [name]: Object.assign({}, d[name], { models: ms }) }) })
-      const saveKey = (name) => { const ref = (providers[name] || {}).apiKeyEnv || ''; const val = (keyInput[name] || '').trim(); if (!ref || !val || !apiRef) return; apiRef.credentials.set({ key: ref, value: val }).then((resp) => { const r = resp && resp.result ? resp.result : resp; if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'set failed'); setKeyInput((k) => Object.assign({}, k, { [name]: '' })); setLive((l) => Object.assign({}, l, { [name + '_key']: 'saved' })) }).catch((e) => setLive((l) => Object.assign({}, l, { [name + '_key']: 'error:' + String((e && e.message) || e) }))) }
+      const saveKey = (name) => {
+        const ref = (providers[name] || {}).apiKeyEnv || ''
+        const val = (keyInput[name] || '').trim()
+        if (!ref || !val || !apiRef) return
+        apiRef.credentials.set({ key: ref, value: val }).then(() => {
+          setKeyInput((k) => Object.assign({}, k, { [name]: '' }))
+          setLive((l) => Object.assign({}, l, { [name + '_key']: 'saved' }))
+        }).catch((e) => setLive((l) => Object.assign({}, l, { [name + '_key']: 'err' })))
+      }
+
       const cards = Object.entries(providers).map(([name, p]) => {
-        const isOpen = !!exp[name]; const credOk = credStatus[name] && credStatus[name].configured; const models = p.models || []
-        const doDiscover = () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }
-        const testConn = () => { setLive((l) => Object.assign({}, l, { [name]: { status: 'testing' } })); doFetch(name, p, (d) => { setLive((l) => Object.assign({}, l, { [name]: d.error ? { status: 'bad', error: d.error } : { status: 'ok', count: d.available.length } })) }) }
-        // pi 同款：勾选的保留/添加，未勾选的删除；已配置保留原顺序
-        const applyDiscovery = (ids) => { const cs = new Set(ids); const kept = models.filter((m) => cs.has(m.id)); const ex = new Set(kept.map((m) => m.id)); const news = [...cs].filter((id) => !ex.has(id)).map((id) => ({ id, name: id, contextWindow: 0, maxTokens: 0, input: ['text'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' } })); updateP(name, { models: kept.concat(news) }) }
-        const adv = sa[name]; const lv = live[name]
-        const mc = models.map((m, mi) => modelCard(m, mi, (mi2, patch) => updateModel(name, mi2, patch), (mi2) => removeModel(name, mi2), em, setEm, (modelId) => launchTest(name, modelId), testStates[name + '::' + m.id]))
-        return el('div', { className: 'mcm-card', key: name }, el('div', { className: 'mcm-card-h', onClick: () => setExp((e) => Object.assign({}, e, { [name]: !e[name] })) }, el('span', { className: 'mcm-chev' }, isOpen ? '▼' : '▶'), el('span', { className: 'mcm-dot' }), el('span', { className: 'mcm-card-name' }, name), p.api ? el('span', { className: 'mcm-card-tag' }, p.api) : null, el('span', { className: 'mcm-card-route' }, models.length + ' 模型'), el('div', { className: 'mcm-card-act' }, btn('删', (e) => { e.stopPropagation(); if (confirm('删除provider ' + name + '?')) setDraft((d) => { const n = clone(d); delete n[name]; return n }) }, 'danger'))),
-          isOpen ? el('div', { className: 'mcm-editor' }, tf('displayName', '提供商显示名称', p.displayName || '', (v) => updateP(name, { displayName: v })), el('div', { className: 'mcm-row' }, sel('api', '当前仅支持3个协议', p.api || 'openai-completions', APIS, (v) => updateP(name, { api: v })), tf('baseURL', 'API端点地址含/v1', p.baseURL || '', (v) => updateP(name, { baseURL: v }), true)), tf('apiKeyEnv', '环境变量名(凭据引用)不明文存密钥', p.apiKeyEnv || '', (v) => updateP(name, { apiKeyEnv: v }), true),
-            el('div', { className: 'mcm-field' }, el('div', { className: 'mcm-fl' }, '直接输入 API Key', el('span', { className: 'mcm-hint', title: '直接粘贴key值存入DSH凭据存储不进浏览器日志' }, '?')), el('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } }, el('input', { type: 'password', className: 'mcm-in mono', style: { flex: 1 }, placeholder: '粘贴 API Key (sk-xxx)', value: (keyInput[name] || ''), onChange: (e) => setKeyInput((k) => Object.assign({}, k, { [name]: e.target.value })) }), btn('保存密钥', () => saveKey(name)), live[name + '_key'] === 'saved' ? el('span', { className: 'mcm-live ok' }, '✓已保存') : null, live[name + '_key'] && live[name + '_key'].startsWith('error') ? el('span', { className: 'mcm-live bad' }, '✗' + live[name + '_key']) : null)),
-            el('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } }, btn('🔌探测端点', testConn), lv && lv.status === 'testing' ? el('span', { className: 'mcm-live testing' }, '探测中…') : null, lv && lv.status === 'ok' ? el('span', { className: 'mcm-live ok' }, '✓端点可达·' + lv.count + '模型') : null, lv && lv.status === 'bad' ? el('span', { className: 'mcm-live bad' }, '✗' + lv.error) : null),
-            el('div', { className: 'mcm-adv' }, el('div', { className: 'mcm-adv-sum', onClick: () => setSa((s) => Object.assign({}, s, { [name]: !s[name] })) }, el('span', null, adv ? '▼' : '▶'), '高级字段(transport/timeout/image/compat/retry)'), adv ? el('div', { className: 'mcm-adv-b' }, el('div', { className: 'mcm-row' }, nf('defaultContextWindow', '默认上下文窗口', p.defaultContextWindow || 0, (v) => updateP(name, { defaultContextWindow: v })), nf('defaultMaxTokens', '默认最大输出token', p.defaultMaxTokens || 0, (v) => updateP(name, { defaultMaxTokens: v }))), field('defaultInput', '默认输入模态', false, el('input', { className: 'mcm-in', value: (p.defaultInput || []).join(','), onChange: (e) => updateP(name, { defaultInput: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) }) })), field('headers', '自定义HTTP请求头', false, kvEditor(p.headers || {}, (v) => updateP(name, { headers: v }))), sel('reasoning', 'provider级默认思考等级', p.reasoning || '', LEVELS, (v) => updateP(name, { reasoning: v || undefined })), field('thinkingBudgets', '各级token预算', false, el('div', { className: 'mcm-row' }, nf('minimal', null, (p.thinkingBudgets || {}).minimal || 0, (v) => updateP(name, { thinkingBudgets: Object.assign({}, p.thinkingBudgets, { minimal: v }) })), nf('low', null, (p.thinkingBudgets || {}).low || 0, (v) => updateP(name, { thinkingBudgets: Object.assign({}, p.thinkingBudgets, { low: v }) })), nf('medium', null, (p.thinkingBudgets || {}).medium || 0, (v) => updateP(name, { thinkingBudgets: Object.assign({}, p.thinkingBudgets, { medium: v }) })), nf('high', null, (p.thinkingBudgets || {}).high || 0, (v) => updateP(name, { thinkingBudgets: Object.assign({}, p.thinkingBudgets, { high: v }) })))), el('div', { className: 'mcm-row' }, sel('transport', '传输方式', p.transport || 'auto', TRANSPORTS, (v) => updateP(name, { transport: v })), sel('cacheRetention', '缓存保留', p.cacheRetention || 'none', CACHE, (v) => updateP(name, { cacheRetention: v }))), el('div', { className: 'mcm-row' }, nf('timeoutMs', '请求超时ms', p.timeoutMs || 0, (v) => updateP(name, { timeoutMs: v })), nf('streamIdleTimeoutMs', '流空闲超时ms', p.streamIdleTimeoutMs || 0, (v) => updateP(name, { streamIdleTimeoutMs: v })), nf('websocketConnectTimeoutMs', 'ws连接超时ms', p.websocketConnectTimeoutMs || 0, (v) => updateP(name, { websocketConnectTimeoutMs: v }))), el('div', { className: 'mcm-row' }, nf('maxRequestImageBytes', '图片最大字节', p.maxRequestImageBytes || 0, (v) => updateP(name, { maxRequestImageBytes: v })), nf('requestImagePixelBudget', '像素预算', p.requestImagePixelBudget || 0, (v) => updateP(name, { requestImagePixelBudget: v })), nf('requestImageMaxBytes', '单张图片最大字节', p.requestImageMaxBytes || 0, (v) => updateP(name, { requestImageMaxBytes: v }))), field('retryPolicy', 'mode=normal按codes重试,mode=always总是重试', false, el('div', null, sel('mode', '重试模式', (p.retryPolicy || {}).mode || 'normal', ['normal', 'always'], (v) => updateP(name, { retryPolicy: Object.assign({}, p.retryPolicy, { mode: v }) })), nf('maxRetries', '最大重试次默认5', (p.retryPolicy || {}).maxRetries || 5, (v) => updateP(name, { retryPolicy: Object.assign({}, p.retryPolicy, { maxRetries: v }) })), nf('initialDelayMs', '初始延迟ms默认500', ((p.retryPolicy || {}).backoff || {}).initialDelayMs || 500, (v) => updateP(name, { retryPolicy: Object.assign({}, p.retryPolicy, { backoff: Object.assign({}, (p.retryPolicy || {}).backoff, { initialDelayMs: v }) }) })), nf('maxDelayMs', '最大延迟ms默认10000', ((p.retryPolicy || {}).backoff || {}).maxDelayMs || 10000, (v) => updateP(name, { retryPolicy: Object.assign({}, p.retryPolicy, { backoff: Object.assign({}, (p.retryPolicy || {}).backoff, { maxDelayMs: v }) }) })))), el('div', { style: { marginTop: 4 } }, el('div', { className: 'mcm-adv-sum', onClick: () => setSa((s) => Object.assign({}, s, { ['cx_' + name]: !s['cx_' + name] })) }, el('span', null, sa['cx_' + name] ? '▼' : '▶'), 'compat(provider级)'), sa['cx_' + name] ? el('div', { className: 'mcm-adv-b' }, compatEditor(p.compat, (v) => updateP(name, { compat: v }))) : null)) : null),
-            el('div', null, el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0 8px' } }, el('span', { style: { fontSize: 13, fontWeight: 500 } }, '模型(' + models.length + ')'), el('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6 } }, btn('＋添加', () => updateP(name, { models: models.concat([{ id: '', name: '', contextWindow: 0, maxTokens: 0, input: ['text'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' } }]) })), btn('🔍拉取上游', doDiscover, 'primary'))), models.length === 0 ? el('div', { className: 'mcm-empty' }, '无模型') : mc),
-            fetchModal(name, p, disc, setDisc, applyDiscovery)) : null)
+        const isOpen = !!exp[name]
+        const models = p.models || []
+        return el('div', { className: 'mcm-card', key: name },
+          el('div', { className: 'mcm-card-h', onClick: () => setExp((e) => Object.assign({}, e, { [name]: !e[name] })) },
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
+            el('div', { className: 'mcm-card-title' }, el('span', null, p.displayName || name), el('span', { className: 'mcm-badge brand' }, name)),
+            p.api ? el('span', { className: 'mcm-badge' }, p.api) : null,
+            el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' } }, models.length + ' 个模型'),
+            el('div', { style: { display: 'flex', gap: 6, marginLeft: 12 }, onClick: (e) => e.stopPropagation() },
+              btn('删', () => { if (confirm('删除 Provider ' + name + '?')) setDraft((d) => { const n = clone(d); delete n[name]; return n }) }, 'danger')
+            )
+          ),
+          isOpen ? el('div', { className: 'mcm-editor' },
+            el('div', { className: 'mcm-row' },
+              tf('显示名称', '管理面板中的可读名称', p.displayName || '', (v) => updateP(name, { displayName: v })),
+              sel('协议架构 (API)', '当前支持的请求格式', p.api || 'openai-completions', APIS, (v) => updateP(name, { api: v }))
+            ),
+            el('div', { className: 'mcm-row' },
+              tf('Base URL', 'API 端点基础地址', p.baseURL || '', (v) => updateP(name, { baseURL: v }), true),
+              tf('API Key 环境变量名', '凭据存储引用名', p.apiKeyEnv || '', (v) => updateP(name, { apiKeyEnv: v }), true)
+            ),
+            field('快速写入密钥', '将 API Key 安全存入 DSH 凭据存储', false,
+              el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                el('input', { type: 'password', className: 'mcm-in mono', style: { flex: 1 }, placeholder: '输入并覆盖 API Key (sk-...)', value: keyInput[name] || '', onChange: (e) => setKeyInput((k) => Object.assign({}, k, { [name]: e.target.value })) }),
+                btn('写入存储', () => saveKey(name)),
+                live[name + '_key'] === 'saved' ? el('span', { style: { color: 'var(--dsw-alias-state-success-primary)', fontSize: 12 } }, '✓ 已保存') : null
+              )
+            ),
+            el('div', { style: { borderTop: '1px dashed var(--dsw-alias-border-l2)', paddingTop: 10 } },
+              el('div', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-secondary)', display: 'flex', alignItems: 'center', gap: 6 }, onClick: () => setSa((s) => Object.assign({}, s, { [name]: !s[name] })) },
+                el('span', null, sa[name] ? '▼' : '▶'), '供应商高级选项 (Headers, 传输, 超时, 图片预算, 重试策略, Compat)'
+              ),
+              sa[name] ? el('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, marginTop: 10 } },
+                el('div', { className: 'mcm-row' },
+                  nf('默认 Context Window', '未单独配置模型时的默认窗口', p.defaultContextWindow || 0, (v) => updateP(name, { defaultContextWindow: v })),
+                  nf('默认 Max Tokens', '未单独配置模型时的最大输出', p.defaultMaxTokens || 0, (v) => updateP(name, { defaultMaxTokens: v }))
+                ),
+                field('自定义 HTTP Headers', '向上游端点发送的请求头', false, kvEditor(p.headers || {}, (v) => updateP(name, { headers: v }))),
+                el('div', { className: 'mcm-row' },
+                  sel('默认思考强度 (Reasoning)', '供应商默认', p.reasoning || '', LEVELS, (v) => updateP(name, { reasoning: v || undefined })),
+                  sel('传输通道 (Transport)', '协议传输形式', p.transport || 'auto', TRANSPORTS, (v) => updateP(name, { transport: v })),
+                  sel('Prompt 缓存保留', 'KV Cache 策略', p.cacheRetention || 'none', CACHE, (v) => updateP(name, { cacheRetention: v }))
+                ),
+                el('div', { className: 'mcm-row' },
+                  nf('请求超时 (ms)', '首响应超时时间', p.timeoutMs || 0, (v) => updateP(name, { timeoutMs: v })),
+                  nf('流空闲超时 (ms)', 'chunk 之间最大停顿', p.streamIdleTimeoutMs || 0, (v) => updateP(name, { streamIdleTimeoutMs: v })),
+                  nf('WebSocket 超时 (ms)', '连接建立等待', p.websocketConnectTimeoutMs || 0, (v) => updateP(name, { websocketConnectTimeoutMs: v }))
+                ),
+                el('div', { className: 'mcm-row' },
+                  nf('图片总像素上限', 'requestImagePixelBudget', p.requestImagePixelBudget || 0, (v) => updateP(name, { requestImagePixelBudget: v })),
+                  nf('单张图片字节上限', 'requestImageMaxBytes', p.requestImageMaxBytes || 0, (v) => updateP(name, { requestImageMaxBytes: v }))
+                ),
+                field('供应商级 Compat 兼容选项', '端点级 API 行为修正', false, compatEditor(p.compat, (v) => updateP(name, { compat: v })))
+              ) : null
+            ),
+            el('div', { style: { marginTop: 8 } },
+              el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 } },
+                el('span', { style: { fontWeight: 600, fontSize: 13 } }, '模型列表 (' + models.length + ')'),
+                el('div', { style: { display: 'flex', gap: 6 } },
+                  btn('🔍 拉取上游模型', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }, 'primary'),
+                  btn('＋添加模型', () => updateP(name, { models: models.concat([{ id: '', name: '', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } }]) }))
+                )
+              ),
+              fetchModal(name, p, disc, setDisc, (ids) => {
+                const cs = new Set(ids)
+                const kept = models.filter((m) => cs.has(m.id))
+                const ex = new Set(kept.map((m) => m.id))
+                const news = [...cs].filter((id) => !ex.has(id)).map((id) => ({
+                  id,
+                  name: id,
+                  contextWindow: 1048576,
+                  maxTokens: 131072,
+                  input: ['text', 'image'],
+                  reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }
+                }))
+                updateP(name, { models: kept.concat(news) })
+              }),
+              models.map((m, mi) => {
+                const isMOpen = !!em[name + '::' + mi]
+                const ts = testStates[name + '::' + m.id]
+                return el('div', { className: 'mcm-subcard', key: mi },
+                  el('div', { className: 'mcm-subcard-h', onClick: () => setEm((e) => Object.assign({}, e, { [name + '::' + mi]: !e[name + '::' + mi] })) },
+                    el('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary)' } }, isMOpen ? '▼' : '▶'),
+                    el('span', { style: { fontFamily: 'var(--ds-font-family-code)', fontWeight: 600, fontSize: 12 } }, m.id || '(未命名)'),
+                    (m.input || []).includes('image') ? el('span', { className: 'mcm-badge success' }, 'vision') : null,
+                    m.reasoningEfforts ? el('span', { className: 'mcm-badge brand' }, 'reasoning') : null,
+                    ts ? (ts.status === 'running' ? el('span', { className: 'mcm-badge' }, '测试中…') : ts.status === 'ok' ? el('span', { className: 'mcm-badge success' }, '✓ 可用') : el('span', { className: 'mcm-badge error' }, '✗ 异常')) : null,
+                    el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
+                      btn('⚡测试', () => launchTest(name, m.id), 'primary'),
+                      btn('✕', () => removeModel(name, mi), 'danger')
+                    )
+                  ),
+                  isMOpen ? el('div', { className: 'mcm-subcard-b' },
+                    el('div', { className: 'mcm-row' },
+                      tf('模型 ID', '唯一模型标识', m.id || '', (v) => updateModel(name, mi, { id: v }), true),
+                      tf('显示别名', 'UI 呈现名称', m.name || '', (v) => updateModel(name, mi, { name: v }))
+                    ),
+                    el('div', { className: 'mcm-row' },
+                      nf('Context Window', '上下文窗口长度', m.contextWindow || 0, (v) => updateModel(name, mi, { contextWindow: v })),
+                      nf('Max Tokens', '最大生成长度', m.maxTokens || 0, (v) => updateModel(name, mi, { maxTokens: v }))
+                    ),
+                    field('支持的模态 (Input)', 'text=纯文本, image=图片', false,
+                      el('div', { style: { display: 'flex', gap: 16, alignItems: 'center', height: 32 } },
+                        el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
+                          el('input', { type: 'checkbox', checked: (m.input || ['text']).includes('text'), onChange: (e) => {
+                            const cur = new Set(m.input || ['text'])
+                            if (e.target.checked) cur.add('text'); else cur.delete('text')
+                            updateModel(name, mi, { input: [...cur] })
+                          } }),
+                          el('span', null, 'text (文本)')
+                        ),
+                        el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
+                          el('input', { type: 'checkbox', checked: (m.input || []).includes('image'), onChange: (e) => {
+                            const cur = new Set(m.input || ['text'])
+                            if (e.target.checked) cur.add('image'); else cur.delete('image')
+                            updateModel(name, mi, { input: [...cur] })
+                          } }),
+                          el('span', null, 'image (图片/视觉)')
+                        )
+                      )
+                    ),
+                    field('思考强度映射 (Reasoning Efforts)', '各档发往上游的值映射 (high, xhigh, max 等)', false, levelsEditor(m.reasoningEfforts, (v) => updateModel(name, mi, { reasoningEfforts: v }))),
+                    el('div', { style: { borderTop: '1px dashed var(--dsw-alias-border-l2)', paddingTop: 8 } },
+                      el('div', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--dsw-alias-label-secondary)', display: 'flex', alignItems: 'center', gap: 6 }, onClick: (e) => { e.stopPropagation(); setEm((s) => Object.assign({}, s, { ['cx_' + name + '_' + mi]: !s['cx_' + name + '_' + mi] })) } },
+                        el('span', null, em['cx_' + name + '_' + mi] ? '▼' : '▶'), '模型级 Compat 兼容性覆写'
+                      ),
+                      em['cx_' + name + '_' + mi] ? el('div', { style: { marginTop: 8 } }, compatEditor(m.compat, (v) => updateModel(name, mi, { compat: v }))) : null
+                    )
+                  ) : null
+                )
+              })
+            )
+          ) : null
+        )
       })
 
-      const addBtn = btn('＋新增provider', () => { const nm = 'new-provider-' + (Object.keys(providers).length + 1); setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase().replace(/-/g, '_') + '_API_KEY', displayName: nm, models: [] } })); setExp((e) => Object.assign({}, e, { [nm]: true })) }, 'primary')
-      return el('div', null, ...cards, addBtn, testWin ? el(ModelTestModal, { win: testWin, setWin: setTestWin, providers, onResult: (e) => { const key = testWin.provider + '::' + testWin.model; setTestStates((s) => Object.assign({}, s, { [key]: e })); } }) : null)
+      return el('div', null,
+        ...cards,
+        btn('＋新增提供商 (Provider)', () => {
+          const nm = 'provider-' + (Object.keys(providers).length + 1)
+          setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase() + '_API_KEY', displayName: nm, models: [] } }))
+          setExp((e) => Object.assign({}, e, { [nm]: true }))
+        }, 'primary'),
+        testWin ? el(ModelTestModal, { win: testWin, setWin: setTestWin, onResult: (e) => { const key = testWin.provider + '::' + testWin.model; setTestStates((s) => Object.assign({}, s, { [key]: e })) } }) : null
+      )
     }
+
     function candidatePicker(providers, cand, onSet) {
       const providerCfg = providers[cand.provider] || {}
       const modelOptions = (providerCfg.models || []).map((m) => m.id).filter(Boolean)
       const provNames = Object.keys(providers || {})
-      return el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } }, el('select', { className: 'mcm-in', style: { flex: 1, minWidth: 160 }, value: cand.provider || '', onChange: (e) => onSet(Object.assign({}, cand, { provider: e.target.value, model: '' })) }, el('option', { value: '' }, '— provider —'), ...provNames.map((p) => el('option', { key: p, value: p }, p))), el('select', { className: 'mcm-in', style: { flex: 1, minWidth: 160 }, value: cand.model || '', onChange: (e) => onSet(Object.assign({}, cand, { model: e.target.value })) }, el('option', { value: '' }, '— model —'), ...modelOptions.map((m) => el('option', { key: m, value: m }, m))))
+      return el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flex: 1 } },
+        el('select', { className: 'mcm-in', style: { flex: 1 }, value: cand.provider || '', onChange: (e) => onSet(Object.assign({}, cand, { provider: e.target.value, model: '' })) },
+          el('option', { value: '' }, '— 选择 Provider —'),
+          ...provNames.map((p) => el('option', { key: p, value: p }, p))
+        ),
+        el('select', { className: 'mcm-in', style: { flex: 1 }, value: cand.model || '', onChange: (e) => onSet(Object.assign({}, cand, { model: e.target.value })) },
+          el('option', { value: '' }, '— 选择模型 —'),
+          ...modelOptions.map((m) => el('option', { key: m, value: m }, m))
+        )
+      )
     }
 
     function RoundrobinPanel(props) {
       const groups = props.channelsDraft || []
       const providers = props._providers || {}
-      const [saveState, setSaveState] = useState(null); const [speedState, setSpeedState] = useState({}); const [expanded, setExpanded] = useState({})
-      const addGroup = () => props.setChannelsDraft((d) => (d || []).concat([{ id: 'group-' + ((d || []).length + 1), virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 200000, maxTokens: 16384 }, candidates: [], strategy: 'sticky', timeoutMs: 30000, cooldownMs: 60000, maxRetriesPerCandidate: 2, speedTest: { enabled: false, sortKey: 'ttft', prompt: '欧拉函数的意义？', maxTokens: 2048, timeoutMs: 60000, concurrency: 3, minIntervalMs: 60000, retries: 2 } }]))
+      const [speedState, setSpeedState] = useState({})
+      const [expanded, setExpanded] = useState({})
+
+      const addGroup = () => props.setChannelsDraft((d) => (d || []).concat([{
+        id: 'group-' + ((d || []).length + 1),
+        virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 200000, maxTokens: 16384 },
+        candidates: [],
+        strategy: 'sticky',
+        timeoutMs: 30000,
+        cooldownMs: 60000,
+        maxRetriesPerCandidate: 2,
+        speedTest: { enabled: false, sortKey: 'ttft', prompt: '欧拉函数的意义？', maxTokens: 2048, timeoutMs: 60000, concurrency: 3, minIntervalMs: 60000, retries: 2 }
+      }]))
+
       const patchGroup = (i, patch) => props.setChannelsDraft((d) => d.map((g, gi) => gi === i ? Object.assign({}, g, patch) : g))
       const patchGroupPath = (i, path, value) => props.setChannelsDraft((d) => d.map((g, gi) => {
         if (gi !== i) return g
         const cur = Object.assign({}, g)
         let ref = cur
-        for (let k = 0; k < path.length - 1; k++) { ref[path[k]] = Object.assign({}, ref[path[k]]) ; ref = ref[path[k]] }
+        for (let k = 0; k < path.length - 1; k++) { ref[path[k]] = Object.assign({}, ref[path[k]]); ref = ref[path[k]] }
         ref[path[path.length - 1]] = value
         return cur
       }))
-      const save = () => { if (!apiRef) return; setSaveState('saving'); apiRef.settings.update({ ns: 'model-channels', patch: { groups } }).then((resp) => { const r = resp && resp.result ? resp.result : resp; if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'update failed'); setSaveState('ok'); setTimeout(() => setSaveState(null), 2000); props.refreshChannels() }).catch((e) => { setSaveState('err:' + String((e && e.message) || e)) }) }
-      const speedtest = (gid) => { if (!apiRef) return; const nonce = Date.now() % 1000000000; setSpeedState((s) => Object.assign({}, s, { [gid]: 'running' })); apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then(() => { setSpeedState((s) => Object.assign({}, s, { [gid]: 'sent' })); setTimeout(() => setSpeedState((s) => Object.assign({}, s, { [gid]: null })), 3000) }).catch((e) => setSpeedState((s) => Object.assign({}, s, { [gid]: 'err:' + String((e && e.message) || e) }))) }
-      if (!props.channelsDraft) return el('div', { className: 'mcm-empty' }, '加载中…')
-      if (groups.length === 0) return el('div', null, el('div', { className: 'mcm-empty' }, '尚无轮询组'), btn('＋新增轮询组', addGroup, 'primary'))
-      return el('div', null, groups.map((g, i) => {
-        const isOpen = !!expanded[i]
-        const st = speedState[g.id]
-        const vm = g.virtualModel || {}
-        const stCfg = g.speedTest || {}
-        return el('div', { className: 'mcm-card', key: g.id + '-' + i }, el('div', { className: 'mcm-card-h', onClick: () => setExpanded((e) => Object.assign({}, e, { [i]: !e[i] })) }, el('span', { className: 'mcm-chev' }, isOpen ? '▼' : '▶'), el('span', { className: 'mcm-card-name' }, vm.name || g.id), el('span', { className: 'mcm-card-tag' }, g.id), el('span', { className: 'mcm-card-route' }, (g.candidates || []).length + ' 候选 · ' + (g.strategy || 'sticky')), el('div', { className: 'mcm-card-act' }, btn('⚡测速', (e) => { e.stopPropagation(); speedtest(g.id) }, 'primary'), st === 'running' ? el('span', { className: 'mcm-live testing' }, '测速中…') : null, st === 'sent' ? el('span', { className: 'mcm-live ok' }, '已触发') : null, st && String(st).startsWith('err') ? el('span', { className: 'mcm-live bad' }, st) : null, btn('删', (e) => { e.stopPropagation(); if (confirm('删除轮询组 ' + g.id + '?')) props.setChannelsDraft((d) => d.filter((_, gi) => gi !== i)) }, 'danger'))),
-          isOpen ? el('div', { className: 'mcm-editor' }, el('div', { className: 'mcm-row' }, tf('组ID', '小写字母数字连字符', g.id, (v) => patchGroup(i, { id: v }), true), tf('虚拟模型名', '选择该组后会显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))), el('div', { className: 'mcm-row' }, nf('contextWindow', '虚拟模型上下文窗口', vm.contextWindow || 0, (v) => patchGroupPath(i, ['virtualModel', 'contextWindow'], v)), nf('maxTokens', '虚拟模型最大输出', vm.maxTokens || 0, (v) => patchGroupPath(i, ['virtualModel', 'maxTokens'], v))), field('候选池', '故障转移顺序：首候选失败切下一个', false, el('div', null, (g.candidates || []).map((c, ci) => el('div', { key: ci, style: { display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 } }, candidatePicker(providers, c, (nc) => patchGroupPath(i, ['candidates', ci], nc)), btn('✕', (e) => { e.stopPropagation(); patchGroup(i, { candidates: (g.candidates || []).filter((_, gi) => gi !== ci) }) }, 'danger'))), btn('＋候选', () => patchGroup(i, { candidates: (g.candidates || []).concat([{ provider: '', model: '' }]) })))),
-            el('div', { className: 'mcm-row' }, sel('strategy', 'sticky=成功后黏住 / round-robin=轮流 / primary=回首选', g.strategy || 'sticky', [['sticky', 'sticky'], ['round-robin', 'round-robin'], ['primary', 'primary']], (v) => patchGroup(i, { strategy: v })), nf('timeoutMs', '单候选首响应超时(ms)', g.timeoutMs || 30000, (v) => patchGroup(i, { timeoutMs: v }))), el('div', { className: 'mcm-row' }, nf('cooldownMs', '失败后冷却(ms)', g.cooldownMs || 60000, (v) => patchGroup(i, { cooldownMs: v })), nf('maxRetriesPerCandidate', '单候选原地重试次数', g.maxRetriesPerCandidate || 0, (v) => patchGroup(i, { maxRetriesPerCandidate: v }))),
-            el('div', { className: 'mcm-adv' }, el('div', { className: 'mcm-adv-sum', onClick: () => setExpanded((e) => Object.assign({}, e, { st_: i + '_' + !e['st_' + i] })) }, el('span', null, expanded['st_' + i] ? '▼' : '▶'), '测速排序'), expanded['st_' + i] ? el('div', { className: 'mcm-adv-b' }, el('div', { className: 'mcm-row' }, el('label', { className: 'mcm-check' }, el('input', { type: 'checkbox', checked: stCfg.enabled !== false, onChange: (e) => patchGroupPath(i, ['speedTest', 'enabled'], e.target.checked) }), stCfg.enabled !== false ? '✓' : '✗'), sel('sortKey', '排序键', stCfg.sortKey || 'ttft', [['ttft', 'ttft'], ['latency', 'latency'], ['hybrid', 'hybrid'], ['smart', 'smart']], (v) => patchGroupPath(i, ['speedTest', 'sortKey'], v))), field('prompt', '测速prompt', false, el('input', { className: 'mcm-in', value: stCfg.prompt || '', onChange: (e) => patchGroupPath(i, ['speedTest', 'prompt'], e.target.value) })), el('div', { className: 'mcm-row' }, nf('timeoutMs', '单次测速超时(ms)', stCfg.timeoutMs || 60000, (v) => patchGroupPath(i, ['speedTest', 'timeoutMs'], v)), nf('concurrency', '并行数', stCfg.concurrency || 3, (v) => patchGroupPath(i, ['speedTest', 'concurrency'], v)), nf('retries', '失败重试次数', stCfg.retries || 2, (v) => patchGroupPath(i, ['speedTest', 'retries'], v)))) : null),
-            el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 } }, btn('保存轮询配置', save, 'primary'), saveState === 'saving' ? el('span', { className: 'mcm-live testing' }, '保存中…') : saveState === 'ok' ? el('span', { className: 'mcm-live ok' }, '✓已保存(即时生效)') : saveState && String(saveState).startsWith('err') ? el('span', { className: 'mcm-live bad' }, '✗' + saveState) : null)) : null)
-      })).concat(el('div', { style: { marginTop: 8 } }, btn('＋新增轮询组', addGroup, 'primary')))
+
+      const speedtest = (gid) => {
+        if (!apiRef) return
+        const nonce = Date.now() % 1000000000
+        setSpeedState((s) => Object.assign({}, s, { [gid]: 'running' }))
+        apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then(() => {
+          setSpeedState((s) => Object.assign({}, s, { [gid]: 'sent' }))
+          setTimeout(() => setSpeedState((s) => Object.assign({}, s, { [gid]: null })), 3000)
+        }).catch(() => setSpeedState((s) => Object.assign({}, s, { [gid]: 'err' })))
+      }
+
+      if (groups.length === 0) return el('div', { className: 'mcm-empty' }, '暂无轮询组，点击下方按钮创建', el('div', { style: { marginTop: 12 } }, btn('＋新增轮询组', addGroup, 'primary')))
+
+      return el('div', null,
+        groups.map((g, i) => {
+          const isOpen = !!expanded[i]
+          const vm = g.virtualModel || {}
+          const stCfg = g.speedTest || {}
+          const st = speedState[g.id]
+          return el('div', { className: 'mcm-card', key: g.id + '-' + i },
+            el('div', { className: 'mcm-card-h', onClick: () => setExpanded((e) => Object.assign({}, e, { [i]: !e[i] })) },
+              el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
+              el('div', { className: 'mcm-card-title' }, el('span', null, vm.name || g.id), el('span', { className: 'mcm-badge brand' }, 'roundrobin/' + g.id)),
+              el('span', { className: 'mcm-badge' }, (g.candidates || []).length + ' 候选'),
+              el('span', { className: 'mcm-badge' }, g.strategy || 'sticky'),
+              el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
+                btn('⚡测速排序', () => speedtest(g.id), 'primary'),
+                st === 'running' ? el('span', { className: 'mcm-badge brand' }, '测速中…') : st === 'sent' ? el('span', { className: 'mcm-badge success' }, '已触发') : null,
+                btn('删', () => { if (confirm('删除轮询组 ' + g.id + '?')) props.setChannelsDraft((d) => d.filter((_, gi) => gi !== i)) }, 'danger')
+              )
+            ),
+            isOpen ? el('div', { className: 'mcm-editor' },
+              el('div', { className: 'mcm-row' },
+                tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id, (v) => patchGroup(i, { id: v }), true),
+                tf('虚拟模型呈现名', '对话侧栏显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))
+              ),
+              field('候选渠道池 (按序故障转移)', '首选失败后自动原地重试或切入下一候选', false,
+                el('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                  (g.candidates || []).map((c, ci) => el('div', { key: ci, style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                    el('span', { className: 'mcm-badge' }, '#' + (ci + 1)),
+                    candidatePicker(providers, c, (nc) => patchGroupPath(i, ['candidates', ci], nc)),
+                    btn('✕', () => patchGroup(i, { candidates: (g.candidates || []).filter((_, gi) => gi !== ci) }), 'danger')
+                  )),
+                  el('div', { style: { marginTop: 4 } }, btn('＋添加候选', () => patchGroup(i, { candidates: (g.candidates || []).concat([{ provider: '', model: '' }]) })))
+                )
+              ),
+              el('div', { className: 'mcm-row' },
+                sel('路由策略', '切换规则', g.strategy || 'sticky', [['sticky', 'Sticky (成功即锁定)'], ['round-robin', 'Round-Robin (轮询均分)'], ['primary', 'Primary (优先首选)']], (v) => patchGroup(i, { strategy: v })),
+                nf('超时时间 (ms)', '单候选首响应超时', g.timeoutMs || 30000, (v) => patchGroup(i, { timeoutMs: v })),
+                nf('冷却时间 (ms)', '故障后冷却时间', g.cooldownMs || 60000, (v) => patchGroup(i, { cooldownMs: v })),
+                nf('单候选重试次数', '冷却前原地退避重试', g.maxRetriesPerCandidate || 0, (v) => patchGroup(i, { maxRetriesPerCandidate: v }))
+              ),
+              el('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 12 } },
+                el('span', { style: { fontWeight: 600, fontSize: 12, display: 'block', marginBottom: 8 } }, '⚡ 动态测速排序设置'),
+                el('div', { className: 'mcm-row' },
+                  field('开启自动测速', '请求前测速并按指标自动重排候选', false,
+                    el('label', { style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', height: 34 } },
+                      el('input', { type: 'checkbox', checked: stCfg.enabled !== false, onChange: (e) => patchGroupPath(i, ['speedTest', 'enabled'], e.target.checked) }),
+                      el('span', null, stCfg.enabled !== false ? '已启用' : '已禁用')
+                    )
+                  ),
+                  sel('排序基准', '排序算法', stCfg.sortKey || 'ttft', [['ttft', 'TTFT 首字延迟优先'], ['latency', 'Total Latency 总延迟优先'], ['hybrid', 'Hybrid 加权混合'], ['smart', 'Smart 智能可靠性平滑']], (v) => patchGroupPath(i, ['speedTest', 'sortKey'], v)),
+                  nf('并发测速数', '同时测速线程', stCfg.concurrency || 3, (v) => patchGroupPath(i, ['speedTest', 'concurrency'], v))
+                )
+              )
+            ) : null
+          )
+        }),
+        btn('＋新增轮询组', addGroup, 'primary')
+      )
     }
 
     function HealthPanel(props) {
       const health = props.health
-      if (!health) return el('div', { className: 'mcm-empty' }, '健康命名空间尚未注册——请重启 DSH 使 host 端轮询引擎生效')
-      const groups = Object.keys(health.records || {})
-      const lastUpdate = health.lastUpdate
-      const header = el('div', { className: 'mcm-notice', style: { marginBottom: 8 } }, '数据来自 host 引擎的 7 天滚动记录' + (lastUpdate ? ' · 更新于 ' + lastUpdate : ''))
-      if (groups.length === 0) return el('div', null, header, el('div', { className: 'mcm-empty' }, '暂无健康数据——使用过轮询组后自动采集(7天滚动)'))
-      return el('div', null, header, groups.map((gid) => {
-        const recs = health.records[gid] || []
-        const speeds = health.speedResults[gid] || []
-        const by = new Map()
-        for (const e of recs) {
-          const key = e.provider + '::' + e.model
-          let a = by.get(key)
-          if (!a) { a = { provider: e.provider, model: e.model, total: 0, success: 0, ttftSum: 0, latSum: 0, lastTs: 0, lastOk: null }; by.set(key, a) }
-          a.total++; if (e.ok) a.success++
-          if (e.ttftMs != null) a.ttftSum += e.ttftMs
-          if (e.latencyMs != null) a.latSum += e.latencyMs
-          if ((e.ts || 0) > a.lastTs) { a.lastTs = e.ts || 0; a.lastOk = e.ok }
+      const providers = props._providers || {}
+      if (!health) return el('div', { className: 'mcm-empty' }, '健康统计数据准备中…')
+
+      const recsMap = health.records || {}
+      const allEvents = Object.values(recsMap).flat()
+
+      // 按 provider 分组
+      const byProvider = new Map()
+
+      // 先把用户配置好的所有 providers 和 models 填入字典（确保所有模型都有展示位，即使调用为0）
+      for (const [pName, pCfg] of Object.entries(providers)) {
+        let pMap = byProvider.get(pName)
+        if (!pMap) { pMap = new Map(); byProvider.set(pName, pMap) }
+        for (const m of (pCfg.models || [])) {
+          if (m && m.id) {
+            pMap.set(m.id, {
+              provider: pName,
+              model: m.id,
+              name: m.name || m.id,
+              total: 0,
+              success: 0,
+              fail: 0,
+              ttftSum: 0,
+              latSum: 0,
+              lastTs: 0,
+              lastOk: null,
+              lastCode: null
+            })
+          }
         }
-        const rows = [...by.values()].map((a) => ({ ...a, rate: a.total > 0 ? (a.success / a.total * 100).toFixed(0) + '%' : '—', avgTtft: a.success > 0 ? (a.ttftSum / a.success / 1000).toFixed(2) + 's' : '—', avgLat: a.success > 0 ? (a.latSum / a.success / 1000).toFixed(2) + 's' : '—' }))
-        const statCells = (r) => [el('span', { className: 'mcm-fl' }, '成功率 ' + r.rate + ' (' + r.success + '/' + r.total + ')'), el('span', { className: 'mcm-fl' }, 'TTFT均值 ' + r.avgTtft), el('span', { className: 'mcm-fl' }, '延迟均值 ' + r.avgLat)]
-        const rowCards = rows.map((r) => el('div', { key: r.provider + '::' + r.model, className: 'mcm-mcard' }, el('div', { className: 'mcm-mcard-h' }, el('span', { className: 'mcm-mcard-id' }, r.provider + ' / ' + r.model), el('span', { className: 'mcm-mtag ' + (r.lastOk ? 'reasoning' : 'stale') }, r.lastOk ? '✓最近成功' : '✗最近失败')), el('div', { className: 'mcm-mcard-b' }, el('div', { className: 'mcm-row' }, ...statCells(r)))))
-        const speedRow = speeds.map((s) => ({ key: s.provider + '::' + s.model, ok: s.ok, ttft: s.ttft != null ? (s.ttft / 1000).toFixed(2) + 's' : '—', lat: s.latency != null ? (s.latency / 1000).toFixed(2) + 's' : '—', failure: s.failure || null, at: s.at }))
-        const speedItems = speedRow.map((s) => el('div', { key: s.key, className: 'mcm-fl-item' }, el('label', null, s.key), el('span', { className: 'mcm-fl-tag ' + (s.ok ? 'ok' : 'stale') }, s.ok ? '✓' : '✗'), el('span', { className: 'mcm-fl-tag' }, 'TTFT ' + s.ttft), el('span', { className: 'mcm-fl-tag' }, '总 ' + s.lat)))
-        return el('div', { className: 'mcm-card', key: gid }, el('div', { className: 'mcm-card-h' }, el('span', { className: 'mcm-card-name' }, gid), el('span', { className: 'mcm-card-route' }, recs.length + ' 条记录')), el('div', { className: 'mcm-mcard-b' }, el('div', { className: 'mcm-fl' }, '候选健康(7天)'), el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(360px,1fr))', gap: 8 } }, rowCards), speedRow.length > 0 ? el('div', { className: 'mcm-fl', style: { marginTop: 10 } }, '最近测速') : null, speedRow.length > 0 ? el('div', { className: 'mcm-fl-list' }, speedItems) : null))
-      }))
+      }
+
+      // 累加所有真实流水记录
+      for (const e of allEvents) {
+        let pMap = byProvider.get(e.provider)
+        if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
+        let a = pMap.get(e.model)
+        if (!a) { a = { provider: e.provider, model: e.model, name: e.model, total: 0, success: 0, fail: 0, ttftSum: 0, latSum: 0, lastTs: 0, lastOk: null, lastCode: null }; pMap.set(e.model, a) }
+        a.total++
+        if (e.ok) {
+          a.success++
+          if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs
+          if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs
+        } else {
+          a.fail++
+          if (e.code) a.lastCode = e.code
+        }
+        if ((e.ts || 0) > a.lastTs) { a.lastTs = e.ts || 0; a.lastOk = e.ok }
+      }
+
+      const totalRequests = allEvents.length
+      const totalSuccess = allEvents.filter((x) => x.ok).length
+      const globalRate = totalRequests > 0 ? ((totalSuccess / totalRequests) * 100).toFixed(1) + '%' : '100%'
+      const validTtfts = allEvents.filter((x) => x.ok && x.ttftMs != null).map((x) => x.ttftMs)
+      const avgGlobalTtft = validTtfts.length > 0 ? (validTtfts.reduce((a, b) => a + b, 0) / validTtfts.length / 1000).toFixed(2) + 's' : '—'
+
+      const providerGroups = [...byProvider.entries()].map(([provName, modelMap]) => {
+        const models = [...modelMap.values()].map((m) => {
+          const rate = m.total > 0 ? m.success / m.total : 1
+          return {
+            ...m,
+            ratePercent: m.total > 0 ? (rate * 100).toFixed(0) + '%' : '未调用',
+            rateValue: rate,
+            avgTtft: m.success > 0 && m.ttftSum > 0 ? (m.ttftSum / m.success / 1000).toFixed(2) + 's' : '—',
+            avgLat: m.success > 0 && m.latSum > 0 ? (m.latSum / m.success / 1000).toFixed(2) + 's' : '—',
+            lastTimeStr: m.lastTs > 0 ? new Date(m.lastTs).toLocaleTimeString() : '无调用记录'
+          }
+        })
+        // 排序：有调用的排前面，调用量多、成功率高的靠前
+        models.sort((a, b) => (b.total - a.total) || (b.rateValue - a.rateValue))
+        const pTotal = models.reduce((acc, m) => acc + m.total, 0)
+        const pSuccess = models.reduce((acc, m) => acc + m.success, 0)
+        const pRate = pTotal > 0 ? ((pSuccess / pTotal) * 100).toFixed(0) + '%' : '—'
+        return { provider: provName, models, total: pTotal, success: pSuccess, rate: pRate }
+      })
+
+      // 排序 Provider
+      providerGroups.sort((a, b) => b.total - a.total)
+
+      return el('div', null,
+        el('div', { className: 'mcm-metrics-grid' },
+          el('div', { className: 'mcm-metric-card' },
+            el('span', { className: 'mcm-metric-label' }, '7 天全局请求数'),
+            el('span', { className: 'mcm-metric-value' }, totalRequests),
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '真实上游模型交互汇总')
+          ),
+          el('div', { className: 'mcm-metric-card' },
+            el('span', { className: 'mcm-metric-label' }, '整体请求成功率'),
+            el('span', { className: 'mcm-metric-value', style: { color: totalSuccess === totalRequests ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-label-primary)' } }, globalRate),
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, totalSuccess + ' 成功 / ' + (totalRequests - totalSuccess) + ' 异常')
+          ),
+          el('div', { className: 'mcm-metric-card' },
+            el('span', { className: 'mcm-metric-label' }, '平均首字响应 (TTFT)'),
+            el('span', { className: 'mcm-metric-value' }, avgGlobalTtft),
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '流式响应首 Token 耗时')
+          )
+        ),
+        providerGroups.length === 0 ? el('div', { className: 'mcm-empty' }, '暂无已配置供应商或调用记录') :
+        providerGroups.map((pg) => el('div', { className: 'mcm-card', key: pg.provider, style: { marginBottom: 16 } },
+          el('div', { style: { padding: '12px 16px', background: 'var(--dsw-alias-bg-layer-2)', borderBottom: '1px solid var(--dsw-alias-border-l1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+              el('span', { className: 'mcm-badge brand', style: { fontSize: 12, padding: '3px 10px' } }, pg.provider),
+              el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, pg.models.length + ' 个模型')
+            ),
+            el('div', { style: { display: 'flex', gap: 12, fontSize: 12 } },
+              el('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, '总调用: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, pg.total)),
+              el('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, '可用率: ', el('strong', { style: { color: 'var(--dsw-alias-state-success-primary)' } }, pg.rate))
+            )
+          ),
+          el('div', { style: { padding: 12 }, className: 'mcm-health-grid' },
+            pg.models.map((m) => el('div', { className: 'mcm-health-card', key: pg.provider + '::' + m.model, style: { background: 'var(--dsw-alias-bg-layer-1)' } },
+              el('div', { className: 'mcm-health-card-h' },
+                el('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                  el('span', { className: 'mcm-status-dot ' + (m.total === 0 ? 'idle' : m.lastOk ? 'ok' : 'err'), style: m.total === 0 ? { background: 'var(--dsw-alias-label-tertiary)' } : {}, title: m.total === 0 ? '尚未发起调用' : m.lastOk ? '最近调用成功' : '最近调用失败: ' + (m.lastCode || 'error') }),
+                  el('span', { style: { fontWeight: 600, fontSize: 13, fontFamily: 'var(--ds-font-family-code)' } }, m.model)
+                ),
+                el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, m.lastTimeStr)
+              ),
+              el('div', null,
+                el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dsw-alias-label-secondary)', marginBottom: 3 } },
+                  el('span', null, '成功率: ', el('strong', { style: { color: m.total === 0 ? 'var(--dsw-alias-label-tertiary)' : m.rateValue >= 0.8 ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' } }, m.ratePercent)),
+                  el('span', null, m.total === 0 ? '0 请求' : el('span', null, el('span', { style: { color: 'var(--dsw-alias-state-success-primary)' } }, '✓' + m.success), ' / ', el('span', { style: { color: m.fail > 0 ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-tertiary)' } }, '✗' + m.fail)))
+                ),
+                el('div', { className: 'mcm-meter' },
+                  el('div', { className: 'mcm-meter-fill ' + (m.total === 0 ? 'idle' : m.rateValue >= 0.9 ? '' : m.rateValue >= 0.7 ? 'warn' : 'danger'), style: { width: m.total === 0 ? '0%' : (m.rateValue * 100) + '%', background: m.total === 0 ? 'var(--dsw-alias-border-l2)' : undefined } })
+                )
+              ),
+              el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 8 } },
+                el('span', null, 'TTFT首字: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgTtft)),
+                el('span', null, '总耗时: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgLat))
+              )
+            ))
+          )
+        ))
+      )
     }
 
     function ModelConfigView() {
-      const [state, setState] = useState(null); const [draft, setDraft] = useState(null); const [notice, setNotice] = useState(null); const [saving, setSaving] = useState(false); const [tab, setTab] = useState('config')
-      const [channels, setChannels] = useState(null); const [channelsDraft, setChannelsDraft] = useState(null); const [health, setHealth] = useState(null)
+      const [state, setState] = useState(null)
+      const [draft, setDraft] = useState(null)
+      const [notice, setNotice] = useState(null)
+      const [saving, setSaving] = useState(false)
+      const [tab, setTab] = useState('config')
+      const [channels, setChannels] = useState(null)
+      const [channelsDraft, setChannelsDraft] = useState(null)
+      const [health, setHealth] = useState(null)
+
       const unwrap = (resp) => {
         const r = resp && resp.result ? resp.result : resp
         if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'request failed')
         return r && r.value !== undefined ? r.value : r
       }
-      const [refreshing, setRefreshing] = useState(false); const [lastRefresh, setLastRefresh] = useState(null)
+
       const refresh = () => {
-        if (!apiRef) { setNotice('api unavailable'); return }
-        setRefreshing(true)
+        if (!apiRef) return
         apiRef.settings.describe({}).then((resp) => {
           const d = unwrap(resp)
           const nss = (d && d.namespaces) || []
           const findNs = (name) => nss.find((n) => n && n.ns === name)
           const ns = findNs('llm-pi-ai')
           const providers = (ns && ns.value && ns.value.providers) || {}
-          setState({ providers, revision: ns && ns.revision })
+          setState({ providers })
           setDraft((prev) => prev || clone(providers))
           const cn = findNs('model-channels')
           const ch = (cn && cn.value && cn.value.groups) || []
           setChannels(ch)
           setChannelsDraft((prev) => prev || clone(ch))
           const hn = findNs('model-channel-health')
-          setHealth(hn ? { records: (hn.value && hn.value.records) || {}, speedResults: (hn.value && hn.value.speedResults) || {}, runtime: (hn.value && hn.value.runtime) || {}, lastUpdate: new Date().toLocaleTimeString() } : null)
-          setLastRefresh(new Date())
-          setNotice('已刷新 ' + new Date().toLocaleTimeString())
-        }).catch((e) => setNotice('加载失败:' + String((e && e.message) || e))).finally(() => setRefreshing(false))
+          setHealth(hn ? { records: (hn.value && hn.value.records) || {}, speedResults: (hn.value && hn.value.speedResults) || {}, runtime: (hn.value && hn.value.runtime) || {} } : null)
+        }).catch((e) => setNotice('加载失败: ' + String(e)))
       }
+
       useEffect(() => { refresh() }, [])
-      const save = () => { if (!apiRef || !draft) return; setSaving(true); setNotice(null); apiRef.settings.update({ ns: 'llm-pi-ai', patch: { providers: draft } }).then((resp) => { const r = resp && resp.result ? resp.result : resp; if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'update failed'); setNotice('已保存（即时生效）') }).catch((e) => setNotice('保存失败:' + String((e && e.message) || e))).finally(() => setSaving(false)) }
-      const panels = { config: el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft }), roundrobin: el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, health, _providers: state ? state.providers : {}, refreshChannels: () => { apiRef.settings.describe({}).then((resp) => { const d = unwrap(resp); const cn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channels'); const ch = (cn && cn.value && cn.value.groups) || []; setChannels(ch); setChannelsDraft((prev) => prev || clone(ch)) }).catch(() => { }) } }), health: el(HealthPanel, { health, channels, channelsDraft }) }
-      return el('div', { className: 'mcm-root' }, el('div', { className: 'mcm-tabs' }, el('div', { className: 'mcm-tab' + (tab === 'config' ? ' active' : ''), onClick: () => setTab('config') }, '模型配置'), el('div', { className: 'mcm-tab' + (tab === 'roundrobin' ? ' active' : ''), onClick: () => setTab('roundrobin') }, '轮询渠道'), el('div', { className: 'mcm-tab' + (tab === 'health' ? ' active' : ''), onClick: () => setTab('health') }, '健康统计'), el('div', { className: 'mcm-tab-right' }, el('span', { className: 'mcm-notice ' + (notice && notice.includes('已保存') ? 'ok' : notice ? 'err' : '') }, notice || ''), btn(refreshing ? '刷新中…' : '刷新', refresh), btn(saving ? '保存中…' : '保存', save, 'primary'))), el('div', { className: 'mcm-body' }, panels[tab]))
+
+      const save = () => {
+        if (!apiRef) return
+        setSaving(true)
+        setNotice(null)
+        const p1 = draft ? apiRef.settings.update({ ns: 'llm-pi-ai', patch: { providers: draft } }) : Promise.resolve()
+        const p2 = channelsDraft ? apiRef.settings.update({ ns: 'model-channels', patch: { groups: channelsDraft } }) : Promise.resolve()
+        Promise.all([p1, p2]).then(() => {
+          setNotice('已全部保存（即时生效）')
+          setTimeout(() => setNotice(null), 3000)
+          refresh()
+        }).catch((e) => setNotice('保存失败: ' + String(e))).finally(() => setSaving(false))
+      }
+
+      return el('div', { className: 'mcm-root' },
+        el('div', { className: 'mcm-header' },
+          el('div', { className: 'mcm-nav' },
+            el('div', { className: 'mcm-nav-item' + (tab === 'config' ? ' active' : ''), onClick: () => setTab('config') }, '提供商与模型'),
+            el('div', { className: 'mcm-nav-item' + (tab === 'roundrobin' ? ' active' : ''), onClick: () => setTab('roundrobin') }, '故障转移轮询组'),
+            el('div', { className: 'mcm-nav-item' + (tab === 'health' ? ' active' : ''), onClick: () => setTab('health') }, '全局健康统计')
+          ),
+          el('div', { className: 'mcm-actions' },
+            notice ? el('span', { style: { fontSize: 12, color: notice.includes('失败') ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)' } }, notice) : null,
+            btn('刷新', refresh),
+            btn(saving ? '保存中…' : '保存全部变更', save, 'primary')
+          )
+        ),
+        el('div', { className: 'mcm-body' },
+          tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft }) :
+          tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: state ? state.providers : {} }) :
+          el(HealthPanel, { health, _providers: state ? state.providers : {} })
+        )
+      )
     }
 
     function apply(ctx) {
@@ -362,7 +785,8 @@ window.__ModuleLoader__.load({
       if (!slots) return
       slots.inject('conversation.view', () => slots.register(
         { name: 'conversation.view', id: 'models', order: 25, label: '模型配置' },
-        (p) => el(ModelConfigView, p)))
+        (p) => el(ModelConfigView, p)
+      ))
     }
 
     return { name: 'model-channel-manager', inject: ['slots', 'connection'], apply }

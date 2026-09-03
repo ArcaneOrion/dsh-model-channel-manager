@@ -97,9 +97,11 @@ export function apply(ctx) {
     function pullSpeedResults() { return state.speedResults; }
     // ---------- 健康聚合 ----------
     function healthAggregate(gid) {
-        const list = pullRecords()[gid] || [];
+        const recordsMap = pullRecords();
+        // 如果提供了 gid 且在配置里是轮询组，先查该组候选对应的真实 provider::model 记录
+        const allEvents = Object.values(recordsMap).flat();
         const by = new Map();
-        for (const e of list) {
+        for (const e of allEvents) {
             const key = e.provider + '::' + e.model;
             let agg = by.get(key);
             if (agg === undefined) {
@@ -226,10 +228,11 @@ export function apply(ctx) {
     const persistRecords = () => persistHealth();
     const recordHealth = async (gid, cand, entry) => {
         const now = Date.now();
-        const list = state.records[gid] || (state.records[gid] = []);
+        const key = gid || 'global';
+        const list = state.records[key] || (state.records[key] = []);
         list.push({ ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null });
         const cutoff = now - 7 * 24 * 3600 * 1000;
-        state.records[gid] = list.filter((e) => e.ts >= cutoff).slice(-2000);
+        state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-2000);
         await persistHealth();
     };
     const persistSpeedResults = async (r) => {
@@ -530,6 +533,7 @@ export function apply(ctx) {
         const start = Date.now();
         let ttft = null;
         let text = '';
+        let reasoning = '';
         const closeInner = async () => { try {
             const c = inner.return ? inner.return() : null;
             if (c && c.then)
@@ -547,16 +551,17 @@ export function apply(ctx) {
                     throw { code: 'STREAM_CLOSED', message: 'model test stream ended early' };
                 if (ttft === null && isContentChunk(chunk)) {
                     ttft = Date.now() - start;
-                    if (chunk.type === 'text-delta' && typeof chunk.text === 'string')
-                        text += chunk.text;
                 }
-                else if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+                if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
                     text += chunk.text;
+                }
+                else if (chunk && chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+                    reasoning += chunk.text;
                 }
                 if (isTerminalChunk(chunk)) {
                     const reason = chunk.reason || {};
                     if (isSuccessReason(reason))
-                        return { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, text: text.slice(0, 2000) };
+                        return { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, text: text.slice(0, 2000), reasoning: reasoning.slice(0, 2000) };
                     throw { code: (reason.failure && reason.failure.code) || 'STREAM_ERROR', message: (reason.failure && reason.failure.message) || 'model test failed' };
                 }
             }
@@ -639,6 +644,56 @@ export function apply(ctx) {
         });
         boot();
     });
+    // ---------- 全局 LLM 请求健康拦截 (涵盖所有非虚拟路由的真实渠道模型调用) ----------
+    ctx.on('llm/stream', async function* (options, next) {
+        // 如果 options.provider 是虚拟轮询路由（以 roundrobin/ 开头），则跳过被动采集（避免双计）
+        if (options && typeof options.provider === 'string' && options.provider.startsWith(ROUTE_PREFIX)) {
+            for await (const chunk of next()) {
+                yield chunk;
+            }
+            return;
+        }
+        const startTs = Date.now();
+        let ttft = null;
+        let lastError = null;
+        let isSuccess = false;
+        try {
+            for await (const chunk of next()) {
+                if (ttft === null && isContentChunk(chunk)) {
+                    ttft = Date.now() - startTs;
+                }
+                if (isTerminalChunk(chunk)) {
+                    const reason = chunk.reason || {};
+                    if (isSuccessReason(reason)) {
+                        isSuccess = true;
+                    } else {
+                        lastError = (reason.failure && (reason.failure.code || reason.failure.message)) || 'ERROR';
+                    }
+                }
+                yield chunk;
+            }
+            if (options && options.provider && options.model) {
+                const latency = Date.now() - startTs;
+                const p = options.provider;
+                recordHealth(p, { provider: p, model: options.model }, {
+                    ok: isSuccess,
+                    ttftMs: isSuccess ? ttft : null,
+                    latencyMs: isSuccess ? latency : null,
+                    code: isSuccess ? null : (lastError || 'UNKNOWN_TERMINAL'),
+                }).catch(() => {});
+            }
+        } catch (err) {
+            if (options && options.provider && options.model) {
+                const p = options.provider;
+                recordHealth(p, { provider: p, model: options.model }, {
+                    ok: false,
+                    code: (err && err.code) || (err && err.message) || 'EXCEPTION',
+                }).catch(() => {});
+            }
+            throw err;
+        }
+    });
+
     // ---------- 启动 ----------
     async function boot() {
         // 动态原型迁移：工作区 .channel-manager/config.json -> settings 命名空间（一次性）
