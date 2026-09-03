@@ -664,15 +664,21 @@ window.__ModuleLoader__.load({
     function HealthPanel(props) {
       const health = props.health
       const providers = props._providers || {}
+      const [windowMode, setWindowMode] = useState('30m') // '30m' | '24h' | '7d'
+
       if (!health) return el('div', { className: 'mcm-empty' }, '健康统计数据准备中…')
 
+      const now = Date.now()
+      const windowCutoff = windowMode === '30m' ? now - 30 * 60 * 1000 : windowMode === '24h' ? now - 24 * 3600 * 1000 : 0
       const recsMap = health.records || {}
-      const allEvents = Object.values(recsMap).flat()
+      const rawEvents = Object.values(recsMap).flat()
+      // 时间窗口过滤
+      const allEvents = rawEvents.filter((e) => (e.ts || 0) >= windowCutoff)
 
       // 按 provider 分组
       const byProvider = new Map()
 
-      // 先把用户配置好的所有 providers 和 models 填入字典（确保所有模型都有展示位，即使调用为0）
+      // 先把用户配置好的所有 providers 和 models 填入字典（确保所有模型都有展示位）
       for (const [pName, pCfg] of Object.entries(providers)) {
         let pMap = byProvider.get(pName)
         if (!pMap) { pMap = new Map(); byProvider.set(pName, pMap) }
@@ -689,18 +695,19 @@ window.__ModuleLoader__.load({
               latSum: 0,
               lastTs: 0,
               lastOk: null,
-              lastCode: null
+              lastCode: null,
+              recentErrors: 0
             })
           }
         }
       }
 
-      // 累加所有真实流水记录
+      // 累加时间窗口内的真实流水记录
       for (const e of allEvents) {
         let pMap = byProvider.get(e.provider)
         if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
         let a = pMap.get(e.model)
-        if (!a) { a = { provider: e.provider, model: e.model, name: e.model, total: 0, success: 0, fail: 0, ttftSum: 0, latSum: 0, lastTs: 0, lastOk: null, lastCode: null }; pMap.set(e.model, a) }
+        if (!a) { a = { provider: e.provider, model: e.model, name: e.model, total: 0, success: 0, fail: 0, ttftSum: 0, latSum: 0, lastTs: 0, lastOk: null, lastCode: null, recentErrors: 0 }; pMap.set(e.model, a) }
         a.total++
         if (e.ok) {
           a.success++
@@ -710,7 +717,10 @@ window.__ModuleLoader__.load({
           a.fail++
           if (e.code) a.lastCode = e.code
         }
-        if ((e.ts || 0) > a.lastTs) { a.lastTs = e.ts || 0; a.lastOk = e.ok }
+        if ((e.ts || 0) > a.lastTs) {
+          a.lastTs = e.ts || 0
+          a.lastOk = e.ok
+        }
       }
 
       const totalRequests = allEvents.length
@@ -722,8 +732,25 @@ window.__ModuleLoader__.load({
       const providerGroups = [...byProvider.entries()].map(([provName, modelMap]) => {
         const models = [...modelMap.values()].map((m) => {
           const rate = m.total > 0 ? m.success / m.total : 1
+          // 可用状态判定：基于当前时间窗口与最近调用
+          let statusText = '空闲 (未调用)'
+          let statusKind = 'idle'
+          if (m.total > 0) {
+            if (m.lastOk && rate >= 0.8) {
+              statusText = '在线可用'
+              statusKind = 'ok'
+            } else if (rate >= 0.5) {
+              statusText = '服务降级 (伴随异常)'
+              statusKind = 'warn'
+            } else {
+              statusText = '不可用 / 服务故障'
+              statusKind = 'err'
+            }
+          }
           return {
             ...m,
+            statusText,
+            statusKind,
             ratePercent: m.total > 0 ? (rate * 100).toFixed(0) + '%' : '未调用',
             rateValue: rate,
             avgTtft: m.success > 0 && m.ttftSum > 0 ? (m.ttftSum / m.success / 1000).toFixed(2) + 's' : '—',
@@ -731,7 +758,6 @@ window.__ModuleLoader__.load({
             lastTimeStr: m.lastTs > 0 ? new Date(m.lastTs).toLocaleTimeString() : '无调用记录'
           }
         })
-        // 排序：有调用的排前面，调用量多、成功率高的靠前
         models.sort((a, b) => (b.total - a.total) || (b.rateValue - a.rateValue))
         const pTotal = models.reduce((acc, m) => acc + m.total, 0)
         const pSuccess = models.reduce((acc, m) => acc + m.success, 0)
@@ -739,25 +765,38 @@ window.__ModuleLoader__.load({
         return { provider: provName, models, total: pTotal, success: pSuccess, rate: pRate }
       })
 
-      // 排序 Provider
       providerGroups.sort((a, b) => b.total - a.total)
 
       return el('div', null,
+        el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 } },
+          el('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            el('span', { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-secondary)' } }, '统计时间窗口:'),
+            el('div', { className: 'mcm-nav', style: { padding: 2 } },
+              el('div', { className: 'mcm-nav-item' + (windowMode === '30m' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('30m') }, '🟢 近 30 分钟 (实时探针)'),
+              el('div', { className: 'mcm-nav-item' + (windowMode === '24h' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('24h') }, '🟡 近 24 小时'),
+              el('div', { className: 'mcm-nav-item' + (windowMode === '7d' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('7d') }, '🔵 近 7 天全量')
+            )
+          ),
+          el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--dsw-alias-state-success-primary)' } },
+            el('span', { className: 'mcm-status-dot ok' }),
+            el('span', null, '前台 5s 自动刷新流')
+          )
+        ),
         el('div', { className: 'mcm-metrics-grid' },
           el('div', { className: 'mcm-metric-card' },
-            el('span', { className: 'mcm-metric-label' }, '7 天全局请求数'),
+            el('span', { className: 'mcm-metric-label' }, windowMode === '30m' ? '近 30 分钟请求' : windowMode === '24h' ? '近 24 小时请求' : '7 天全周期请求'),
             el('span', { className: 'mcm-metric-value' }, totalRequests),
-            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '真实上游模型交互汇总')
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '真实上游交互捕获')
           ),
           el('div', { className: 'mcm-metric-card' },
-            el('span', { className: 'mcm-metric-label' }, '整体请求成功率'),
+            el('span', { className: 'mcm-metric-label' }, '窗口可用率'),
             el('span', { className: 'mcm-metric-value', style: { color: totalSuccess === totalRequests ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-label-primary)' } }, globalRate),
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, totalSuccess + ' 成功 / ' + (totalRequests - totalSuccess) + ' 异常')
           ),
           el('div', { className: 'mcm-metric-card' },
-            el('span', { className: 'mcm-metric-label' }, '平均首字响应 (TTFT)'),
+            el('span', { className: 'mcm-metric-label' }, '平均首 Token 延迟 (TTFT)'),
             el('span', { className: 'mcm-metric-value' }, avgGlobalTtft),
-            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '流式响应首 Token 耗时')
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '首字响应速度均值')
           )
         ),
         providerGroups.length === 0 ? el('div', { className: 'mcm-empty' }, '暂无已配置供应商或调用记录') :
@@ -768,7 +807,7 @@ window.__ModuleLoader__.load({
               el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, pg.models.length + ' 个模型')
             ),
             el('div', { style: { display: 'flex', gap: 12, fontSize: 12 } },
-              el('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, '总调用: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, pg.total)),
+              el('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, '窗口调用: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, pg.total)),
               el('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, '可用率: ', el('strong', { style: { color: 'var(--dsw-alias-state-success-primary)' } }, pg.rate))
             )
           ),
@@ -776,14 +815,19 @@ window.__ModuleLoader__.load({
             pg.models.map((m) => el('div', { className: 'mcm-health-card', key: pg.provider + '::' + m.model, style: { background: 'var(--dsw-alias-bg-layer-1)' } },
               el('div', { className: 'mcm-health-card-h' },
                 el('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-                  el('span', { className: 'mcm-status-dot ' + (m.total === 0 ? 'idle' : m.lastOk ? 'ok' : 'err'), style: m.total === 0 ? { background: 'var(--dsw-alias-label-tertiary)' } : {}, title: m.total === 0 ? '尚未发起调用' : m.lastOk ? '最近调用成功' : '最近调用失败: ' + (m.lastCode || 'error') }),
+                  el('span', {
+                    className: 'mcm-status-dot ' + (m.statusKind === 'idle' ? 'idle' : m.statusKind === 'ok' ? 'ok' : 'err'),
+                    style: m.statusKind === 'idle' ? { background: 'var(--dsw-alias-label-tertiary)' } : m.statusKind === 'warn' ? { background: 'var(--dsw-alias-state-warn-primary)' } : {}
+                  }),
                   el('span', { style: { fontWeight: 600, fontSize: 13, fontFamily: 'var(--ds-font-family-code)' } }, m.model)
                 ),
-                el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, m.lastTimeStr)
+                el('span', {
+                  className: 'mcm-badge ' + (m.statusKind === 'ok' ? 'success' : m.statusKind === 'warn' ? 'brand' : m.statusKind === 'err' ? 'error' : '')
+                }, m.statusText)
               ),
               el('div', null,
                 el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dsw-alias-label-secondary)', marginBottom: 3 } },
-                  el('span', null, '成功率: ', el('strong', { style: { color: m.total === 0 ? 'var(--dsw-alias-label-tertiary)' : m.rateValue >= 0.8 ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' } }, m.ratePercent)),
+                  el('span', null, '可用率: ', el('strong', { style: { color: m.total === 0 ? 'var(--dsw-alias-label-tertiary)' : m.rateValue >= 0.8 ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' } }, m.ratePercent)),
                   el('span', null, m.total === 0 ? '0 请求' : el('span', null, el('span', { style: { color: 'var(--dsw-alias-state-success-primary)' } }, '✓' + m.success), ' / ', el('span', { style: { color: m.fail > 0 ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-tertiary)' } }, '✗' + m.fail)))
                 ),
                 el('div', { className: 'mcm-meter' },
@@ -791,8 +835,8 @@ window.__ModuleLoader__.load({
                 )
               ),
               el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 8 } },
-                el('span', null, 'TTFT首字: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgTtft)),
-                el('span', null, '总耗时: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgLat))
+                el('span', null, 'TTFT: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgTtft)),
+                el('span', null, '最近: ', el('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, m.lastTimeStr))
               )
             ))
           )
@@ -835,7 +879,26 @@ window.__ModuleLoader__.load({
         }).catch((e) => setNotice('加载失败: ' + String(e)))
       }
 
-      useEffect(() => { refresh() }, [])
+      useEffect(() => {
+        refresh()
+        // 前台 5 秒静默自动轮询，保持数据完全实时流动
+        const timer = setInterval(() => {
+          if (apiRef) {
+            apiRef.settings.describe({}).then((resp) => {
+              const d = unwrap(resp)
+              const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
+              if (hn && hn.value) {
+                setHealth({
+                  records: hn.value.records || {},
+                  speedResults: hn.value.speedResults || {},
+                  runtime: hn.value.runtime || {}
+                })
+              }
+            }).catch(() => {})
+          }
+        }, 5000)
+        return () => clearInterval(timer)
+      }, [])
 
       const save = () => {
         if (!apiRef) return
