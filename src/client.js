@@ -383,6 +383,7 @@ window.__ModuleLoader__.load({
       const cards = Object.entries(providers).map(([name, p]) => {
         const isOpen = !!exp[name]
         const models = p.models || []
+        const currentName = p.displayName !== undefined ? p.displayName : name
         return el('div', { className: 'mcm-card', key: name },
           el('div', { className: 'mcm-card-h', onClick: () => setExp((e) => Object.assign({}, e, { [name]: !e[name] })) },
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
@@ -395,7 +396,7 @@ window.__ModuleLoader__.load({
           ),
           isOpen ? el('div', { className: 'mcm-editor' },
             el('div', { className: 'mcm-row' },
-              tf('显示名称', '管理面板中的可读名称', p.displayName || '', (v) => updateP(name, { displayName: v })),
+              tf('显示名称', '管理面板中的可读名称', currentName, (v) => updateP(name, { displayName: v })),
               sel('协议架构 (API)', '当前支持的请求格式', p.api || 'openai-completions', APIS, (v) => updateP(name, { api: v }))
             ),
             el('div', { className: 'mcm-row' },
@@ -548,15 +549,32 @@ window.__ModuleLoader__.load({
     }
 
     function candidatePicker(providers, cand, onSet) {
-      const providerCfg = providers[cand.provider] || {}
-      const modelOptions = (providerCfg.models || []).map((m) => m.id).filter(Boolean)
+      const pName = cand && cand.provider ? cand.provider : ''
+      const mName = cand && cand.model ? cand.model : ''
+      const providerCfg = (providers && providers[pName]) || {}
+      const modelOptions = ((providerCfg && providerCfg.models) || []).map((m) => m.id).filter(Boolean)
       const provNames = Object.keys(providers || {})
       return el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flex: 1 } },
-        el('select', { className: 'mcm-in', style: { flex: 1 }, value: cand.provider || '', onChange: (e) => onSet(Object.assign({}, cand, { provider: e.target.value, model: '' })) },
+        el('select', {
+          className: 'mcm-in',
+          style: { flex: 1 },
+          value: pName,
+          onChange: (e) => {
+            const nextProv = e.target.value
+            const nextCfg = (providers && providers[nextProv]) || {}
+            const nextModels = ((nextCfg && nextCfg.models) || []).map((m) => m.id).filter(Boolean)
+            onSet({ provider: nextProv, model: nextModels[0] || '' })
+          }
+        },
           el('option', { value: '' }, '— 选择 Provider —'),
           ...provNames.map((p) => el('option', { key: p, value: p }, p))
         ),
-        el('select', { className: 'mcm-in', style: { flex: 1 }, value: cand.model || '', onChange: (e) => onSet(Object.assign({}, cand, { model: e.target.value })) },
+        el('select', {
+          className: 'mcm-in',
+          style: { flex: 1 },
+          value: mName,
+          onChange: (e) => onSet({ provider: pName, model: e.target.value })
+        },
           el('option', { value: '' }, '— 选择模型 —'),
           ...modelOptions.map((m) => el('option', { key: m, value: m }, m))
         )
@@ -571,7 +589,7 @@ window.__ModuleLoader__.load({
 
       const addGroup = () => props.setChannelsDraft((d) => (d || []).concat([{
         id: 'group-' + ((d || []).length + 1),
-        virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 200000, maxTokens: 16384 },
+        virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
         candidates: [],
         strategy: 'sticky',
         timeoutMs: 30000,
@@ -608,7 +626,7 @@ window.__ModuleLoader__.load({
           const vm = g.virtualModel || {}
           const stCfg = g.speedTest || {}
           const st = speedState[g.id]
-          return el('div', { className: 'mcm-card', key: g.id + '-' + i },
+          return el('div', { className: 'mcm-card', key: 'rr_card_' + i },
             el('div', { className: 'mcm-card-h', onClick: () => setExpanded((e) => Object.assign({}, e, { [i]: !e[i] })) },
               el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
               el('div', { className: 'mcm-card-title' }, el('span', null, vm.name || g.id), el('span', { className: 'mcm-badge brand' }, 'roundrobin/' + g.id)),
@@ -622,7 +640,7 @@ window.__ModuleLoader__.load({
             ),
             isOpen ? el('div', { className: 'mcm-editor' },
               el('div', { className: 'mcm-row' },
-                tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id, (v) => patchGroup(i, { id: v }), true),
+                tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id || '', (v) => patchGroup(i, { id: v }), true),
                 tf('虚拟模型呈现名', '对话侧栏显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))
               ),
               field('候选渠道池 (按序故障转移)', '首选失败后自动原地重试或切入下一候选', false,
@@ -985,8 +1003,8 @@ window.__ModuleLoader__.load({
         ),
         el('div', { className: 'mcm-body' },
           tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft }) :
-          tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: state ? state.providers : {} }) :
-          el(HealthPanel, { health, _providers: state ? state.providers : {} })
+          tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})) }) :
+          el(HealthPanel, { health, _providers: (draft || (state ? state.providers : {})) })
         )
       )
     }
