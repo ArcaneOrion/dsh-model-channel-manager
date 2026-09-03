@@ -601,9 +601,12 @@ window.__ModuleLoader__.load({
       const patchGroup = (i, patch) => props.setChannelsDraft((d) => d.map((g, gi) => gi === i ? Object.assign({}, g, patch) : g))
       const patchGroupPath = (i, path, value) => props.setChannelsDraft((d) => d.map((g, gi) => {
         if (gi !== i) return g
-        const cur = Object.assign({}, g)
+        const cur = clone(g)
         let ref = cur
-        for (let k = 0; k < path.length - 1; k++) { ref[path[k]] = Object.assign({}, ref[path[k]]); ref = ref[path[k]] }
+        for (let k = 0; k < path.length - 1; k++) {
+          if (!ref[path[k]]) ref[path[k]] = {}
+          ref = ref[path[k]]
+        }
         ref[path[path.length - 1]] = value
         return cur
       }))
@@ -645,12 +648,22 @@ window.__ModuleLoader__.load({
               ),
               field('候选渠道池 (按序故障转移)', '首选失败后自动原地重试或切入下一候选', false,
                 el('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-                  (g.candidates || []).map((c, ci) => el('div', { key: ci, style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                  (g.candidates || []).map((c, ci) => el('div', { key: 'cand_' + ci, style: { display: 'flex', gap: 8, alignItems: 'center' } },
                     el('span', { className: 'mcm-badge' }, '#' + (ci + 1)),
-                    candidatePicker(providers, c, (nc) => patchGroupPath(i, ['candidates', ci], nc)),
-                    btn('✕', () => patchGroup(i, { candidates: (g.candidates || []).filter((_, gi) => gi !== ci) }), 'danger')
+                    candidatePicker(providers, c, (nc) => {
+                      const curCands = (g.candidates || []).slice()
+                      curCands[ci] = nc
+                      patchGroup(i, { candidates: curCands })
+                    }),
+                    btn('✕', () => {
+                      const curCands = (g.candidates || []).filter((_, gi) => gi !== ci)
+                      patchGroup(i, { candidates: curCands })
+                    }, 'danger')
                   )),
-                  el('div', { style: { marginTop: 4 } }, btn('＋添加候选', () => patchGroup(i, { candidates: (g.candidates || []).concat([{ provider: '', model: '' }]) })))
+                  el('div', { style: { marginTop: 4 } }, btn('＋添加候选', () => {
+                    const curCands = (g.candidates || []).concat([{ provider: '', model: '' }])
+                    patchGroup(i, { candidates: curCands })
+                  }))
                 )
               ),
               el('div', { className: 'mcm-row' },
