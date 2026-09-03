@@ -130,6 +130,7 @@ window.__ModuleLoader__.load({
         bF('supportsStrictMode', '支持 strict 模式'),
         bF('supportsStrictTools', '支持 strict tools'),
         bF('supportsCacheControlOnTools', '支持对工具参数增加缓存控制'),
+        bF('sendSessionAffinityHeaders', '发送会话亲和请求头 (x-session-id / x-session-affinity，跨节点稳定路由可显著提升 KV 缓存命中)'),
         bF('requiresToolResultName', '工具返回需携带 name'),
         bF('requiresAssistantAfterToolResult', '工具返回后紧跟 assistant 角色'),
         bF('requiresThinkingAsText', '思考过程作为纯文本消息传递'),
