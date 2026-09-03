@@ -1,0 +1,3 @@
+- insert:
+    - id: model-channel-manager
+      name: '@arcaneorion/dsh-model-channel-manager'
