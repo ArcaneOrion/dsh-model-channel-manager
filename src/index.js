@@ -692,7 +692,7 @@ export function apply(ctx) {
             }
             throw err;
         }
-    });
+    }, { global: true, prepend: true });
 
     // ---------- 启动 ----------
     async function boot() {
