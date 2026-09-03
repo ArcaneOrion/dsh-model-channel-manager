@@ -8,6 +8,7 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     const { createElement: el, useState, useEffect } = require('react')
     let apiRef = null
+    const savedKeys = {}
 
     const CSS = `
 .mcm-root { display:flex; flex-direction:column; height:100%; overflow:hidden; font-size:13px; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-base); }
@@ -198,7 +199,7 @@ window.__ModuleLoader__.load({
       } else if (disc.error) {
         body = el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', padding: 16, textAlign: 'center', fontSize: 13 } },
           el('div', { style: { marginBottom: 12 } }, '拉取失败: ' + disc.error),
-          btn('重新尝试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }, 'primary')
+          btn('重新尝试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, keyInput[name]) }, 'primary')
         )
       } else {
         const d = disc
@@ -253,9 +254,16 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function doFetch(name, p, setDisc) {
+    function doFetch(name, p, setDisc, typedKey) {
       if (!apiRef) { setDisc({ provider: name, error: 'api unavailable' }); return }
-      apiRef.llm.discoverModels({ settingsNs: 'llm-pi-ai', provider: name, baseURL: p.baseURL || undefined }).then((resp) => {
+      const key = (typedKey && typedKey.trim()) ? typedKey.trim() : (savedKeys[name] || undefined)
+      apiRef.llm.discoverModels({
+        settingsNs: 'llm-pi-ai',
+        provider: name,
+        baseURL: p.baseURL || undefined,
+        api: p.api || undefined,
+        apiKey: key
+      }).then((resp) => {
         const r = resp && resp.result ? resp.result : resp
         if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'discover failed')
         const result = r && r.value !== undefined ? r.value : r
@@ -283,6 +291,12 @@ window.__ModuleLoader__.load({
       const providers = draft || {}
 
       const launchTest = (provider, model) => {
+        // 如果当前 draft 还没有点击保存，则自动向用户友好提示
+        const currentSavedModels = (props._state?.providers?.[provider]?.models || []).map((m) => m.id)
+        if (!currentSavedModels.includes(model)) {
+          setNotice('请先点击右上角「保存全部变更」，保存后方可进行真实链路测试')
+          setTimeout(() => setNotice(null), 4000)
+        }
         setTestStates((s) => Object.assign({}, s, { [provider + '::' + model]: { status: 'running' } }))
         setTestWin({ provider, model, prompt: localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己', maxTokens: 256, nonce: null, result: null, polling: false })
       }
@@ -293,10 +307,12 @@ window.__ModuleLoader__.load({
         const ref = (providers[name] || {}).apiKeyEnv || ''
         const val = (keyInput[name] || '').trim()
         if (!ref || !val || !apiRef) return
-        apiRef.credentials.set({ key: ref, value: val }).then(() => {
-          setKeyInput((k) => Object.assign({}, k, { [name]: '' }))
+        savedKeys[name] = val
+        apiRef.credentials.set({ ref, value: val }).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'set failed')
           setLive((l) => Object.assign({}, l, { [name + '_key']: 'saved' }))
-        }).catch((e) => setLive((l) => Object.assign({}, l, { [name + '_key']: 'err' })))
+        }).catch((e) => setLive((l) => Object.assign({}, l, { [name + '_key']: 'err: ' + String((e && e.message) || e) })))
       }
 
       const cards = Object.entries(providers).map(([name, p]) => {
@@ -359,7 +375,7 @@ window.__ModuleLoader__.load({
               el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 } },
                 el('span', { style: { fontWeight: 600, fontSize: 13 } }, '模型列表 (' + models.length + ')'),
                 el('div', { style: { display: 'flex', gap: 6 } },
-                  btn('🔍 拉取上游模型', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc) }, 'primary'),
+                  btn('🔍 拉取上游模型', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, keyInput[name]) }, 'primary'),
                   btn('＋添加模型', () => updateP(name, { models: models.concat([{ id: '', name: '', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } }]) }))
                 )
               ),
@@ -741,13 +757,53 @@ window.__ModuleLoader__.load({
         if (!apiRef) return
         setSaving(true)
         setNotice(null)
-        const p1 = draft ? apiRef.settings.update({ ns: 'llm-pi-ai', patch: { providers: draft } }) : Promise.resolve()
-        const p2 = channelsDraft ? apiRef.settings.update({ ns: 'model-channels', patch: { groups: channelsDraft } }) : Promise.resolve()
+        // 自动清洗 draft 中的非法或空字段，保证完全满足 dsh-llm-pi-ai schema
+        const cleanProviders = {}
+        if (draft) {
+          for (const [pKey, pVal] of Object.entries(draft)) {
+            if (!pKey || !pVal) continue
+            const cleanModels = (pVal.models || []).filter((m) => m && m.id && String(m.id).trim().length > 0).map((m) => {
+              const cleaned = { id: String(m.id).trim() }
+              if (m.name && String(m.name).trim()) cleaned.name = String(m.name).trim()
+              if (Number.isFinite(m.contextWindow) && m.contextWindow > 0) cleaned.contextWindow = m.contextWindow
+              if (Number.isFinite(m.maxTokens) && m.maxTokens > 0) cleaned.maxTokens = m.maxTokens
+              if (Array.isArray(m.input) && m.input.length > 0) cleaned.input = m.input.slice()
+              if (m.reasoningEfforts && typeof m.reasoningEfforts === 'object') cleaned.reasoningEfforts = Object.assign({}, m.reasoningEfforts)
+              if (m.compat && typeof m.compat === 'object' && Object.keys(m.compat).length > 0) cleaned.compat = Object.assign({}, m.compat)
+              return cleaned
+            })
+            const pObj = {
+              api: pVal.api || 'openai-completions',
+              models: cleanModels
+            }
+            if (pVal.baseURL && String(pVal.baseURL).trim()) pObj.baseURL = String(pVal.baseURL).trim()
+            if (pVal.displayName && String(pVal.displayName).trim()) pObj.displayName = String(pVal.displayName).trim()
+            if (pVal.apiKeyEnv && String(pVal.apiKeyEnv).trim()) pObj.apiKeyEnv = String(pVal.apiKeyEnv).trim()
+            if (pVal.headers && typeof pVal.headers === 'object' && Object.keys(pVal.headers).length > 0) pObj.headers = Object.assign({}, pVal.headers)
+            if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
+            if (pVal.transport) pObj.transport = pVal.transport
+            if (pVal.cacheRetention) pObj.cacheRetention = pVal.cacheRetention
+            if (Number.isFinite(pVal.timeoutMs) && pVal.timeoutMs > 0) pObj.timeoutMs = pVal.timeoutMs
+            if (Number.isFinite(pVal.streamIdleTimeoutMs) && pVal.streamIdleTimeoutMs > 0) pObj.streamIdleTimeoutMs = pVal.streamIdleTimeoutMs
+            if (Number.isFinite(pVal.websocketConnectTimeoutMs) && pVal.websocketConnectTimeoutMs > 0) pObj.websocketConnectTimeoutMs = pVal.websocketConnectTimeoutMs
+            cleanProviders[pKey] = pObj
+          }
+        }
+        const p1 = draft ? apiRef.settings.update({ ns: 'llm-pi-ai', patch: { providers: cleanProviders } }).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed')
+          return r
+        }) : Promise.resolve()
+        const p2 = channelsDraft ? apiRef.settings.update({ ns: 'model-channels', patch: { groups: channelsDraft } }).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'model-channels save failed')
+          return r
+        }) : Promise.resolve()
         Promise.all([p1, p2]).then(() => {
           setNotice('已全部保存（即时生效）')
           setTimeout(() => setNotice(null), 3000)
           refresh()
-        }).catch((e) => setNotice('保存失败: ' + String(e))).finally(() => setSaving(false))
+        }).catch((e) => setNotice('保存失败: ' + String((e && e.message) || e))).finally(() => setSaving(false))
       }
 
       return el('div', { className: 'mcm-root' },
