@@ -146,46 +146,80 @@ window.__ModuleLoader__.load({
       }))
     }
 
-    function ModelTestModal(props) {
+    function GlobalTestConfigModal(props) {
       const win = props.win; const setWin = props.setWin
-      const [running, setRunning] = useState(false)
-      const poll = (nonce) => {
-        if (!apiRef) return
-        apiRef.settings.describe({}).then((resp) => {
-          const r = resp && resp.result ? resp.result : resp
-          const d = r && r.value !== undefined ? r.value : r
-          const ns = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
-          const tr = (ns && ns.value && ns.value.testResults) || {}
-          const e = tr[nonce]
-          if (e && e.status === 'ok') { setWin((w) => Object.assign({}, w, { result: e, polling: false })); setRunning(false); props.onResult(e) }
-          else if (e && e.status === 'error') { setWin((w) => Object.assign({}, w, { result: e, polling: false })); setRunning(false); props.onResult(e) }
-          else setTimeout(() => poll(nonce), 1200)
-        }).catch(() => setTimeout(() => poll(nonce), 1500))
+      const [prompt, setPrompt] = useState(localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己')
+      const [maxTokens, setMaxTokens] = useState(Number(localStorage.getItem('mcm_test_max_tokens')) || 256)
+
+      const save = () => {
+        localStorage.setItem('mcm_test_prompt', prompt)
+        localStorage.setItem('mcm_test_max_tokens', String(maxTokens))
+        setWin(false)
       }
-      const run = () => {
-        if (!apiRef || running) return
-        const nonce = Date.now() % 1000000000
-        setRunning(true); setWin((w) => Object.assign({}, w, { nonce, result: null }))
-        apiRef.settings.update({ ns: 'model-channel-health', patch: { testRequest: { nonce, provider: win.provider, model: win.model, prompt: win.prompt || '你好', maxTokens: win.maxTokens || 256 } } }).then(() => { poll(nonce) }).catch((e) => { setWin((w) => Object.assign({}, w, { result: { status: 'error', error: String((e && e.message) || e) } })); setRunning(false) })
-      }
-      const w = win; const res = w.result
-      const body = el('div', { className: 'mcm-modal-b' },
-        el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } }, el('span', { className: 'mcm-badge brand' }, w.provider), el('span', { className: 'mcm-badge' }, w.model)),
-        field('测试 Prompt', '发送到上游端点的真实用户请求', false, el('textarea', { className: 'mcm-in', style: { height: 75, padding: 8, resize: 'vertical' }, value: w.prompt || '', onChange: (e) => { localStorage.setItem('mcm_test_prompt', e.target.value); setWin((x) => Object.assign({}, x, { prompt: e.target.value })) } })),
-        field('Max Tokens', '最大输出长度', false, el('input', { type: 'number', className: 'mcm-in', value: w.maxTokens || 256, onChange: (e) => setWin((x) => Object.assign({}, x, { maxTokens: Number(e.target.value) || 256 })) })),
-        el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } }, btn(running ? '测试中…' : '🚀 发送测试', run, 'primary'), running ? el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, el('div', { className: 'mcm-spin' }), '请求真实链路上游…') : null),
-        res && res.status === 'ok' ? el('div', { style: { background: 'var(--dsw-alias-bg-layer-2)', padding: 12, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', display: 'flex', flexDirection: 'column', gap: 6 } },
-          el('div', { style: { display: 'flex', gap: 12, fontSize: 12, color: 'var(--dsw-alias-state-success-primary)', fontWeight: 600 } }, el('span', null, '✓ 成功'), el('span', null, 'TTFT: ' + (res.ttftMs != null ? (res.ttftMs / 1000).toFixed(2) + 's' : '—')), el('span', null, '总延迟: ' + (res.latencyMs != null ? (res.latencyMs / 1000).toFixed(2) + 's' : '—'))),
-          res.reasoning ? el('div', null, el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '思考过程'), el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 120, overflow: 'auto', color: 'var(--dsw-alias-label-secondary)', margin: '4px 0 8px' } }, res.reasoning)) : null,
-          res.text ? el('div', null, el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '正文回复'), el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 160, overflow: 'auto', color: 'var(--dsw-alias-label-primary)', margin: '4px 0 0' } }, res.text)) : null
-        ) : null,
-        res && res.status === 'error' ? el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, padding: 10, background: 'rgba(239, 68, 68, 0.08)', borderRadius: 8 } }, '✗ 测试失败: ' + (res.error || res.code || 'unknown')) : null
+
+      if (!win) return null
+      return el('div', { className: 'mcm-mask', onClick: () => setWin(false) },
+        el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() },
+          el('div', { className: 'mcm-modal-h' },
+            el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, '⚙️ 全局模型测试参数配置'),
+            btn('✕', () => setWin(false))
+          ),
+          el('div', { className: 'mcm-modal-b' },
+            field('测试 Prompt', '点击单模型测试时直接发送的用户消息', false,
+              el('textarea', { className: 'mcm-in', style: { height: 80, padding: 8, resize: 'vertical' }, value: prompt, onChange: (e) => setPrompt(e.target.value) })
+            ),
+            field('Max Tokens', '单次快速测试的最大 Token 限制', false,
+              el('input', { type: 'number', className: 'mcm-in', value: maxTokens, onChange: (e) => setMaxTokens(Number(e.target.value) || 256) })
+            ),
+            el('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '说明：配置后点击模型行「⚡测试」将静默发起测试，无需每次确认。')
+          ),
+          el('div', { className: 'mcm-modal-f' },
+            btn('取消', () => setWin(false)),
+            btn('保存配置', save, 'primary')
+          )
+        )
       )
-      return el('div', { className: 'mcm-mask', onClick: () => setWin(null) }, el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() },
-        el('div', { className: 'mcm-modal-h' }, el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, '单模型测试'), btn('✕', () => setWin(null))),
-        body,
-        el('div', { className: 'mcm-modal-f' }, btn('关闭', () => setWin(null)))
-      ))
+    }
+
+    function TestResultDetailModal(props) {
+      const win = props.win; const setWin = props.setWin
+      if (!win) return null
+      const res = win.result || {}
+      return el('div', { className: 'mcm-mask', onClick: () => setWin(null) },
+        el('div', { className: 'mcm-modal', onClick: (e) => e.stopPropagation() },
+          el('div', { className: 'mcm-modal-h' },
+            el('h3', { style: { margin: 0, fontSize: 15, fontWeight: 600 } }, (res.status === 'ok' ? '✓ 测试成功 · ' : '✗ 测试异常 · ') + win.model),
+            btn('✕', () => setWin(null))
+          ),
+          el('div', { className: 'mcm-modal-b' },
+            el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+              el('span', { className: 'mcm-badge brand' }, win.provider),
+              el('span', { className: 'mcm-badge' }, win.model),
+              res.status === 'ok' ? el('span', { className: 'mcm-badge success' }, 'HTTP 200 OK') : el('span', { className: 'mcm-badge error' }, res.code || 'ERROR')
+            ),
+            res.status === 'ok' ? el('div', { style: { background: 'var(--dsw-alias-bg-layer-2)', padding: 12, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', display: 'flex', flexDirection: 'column', gap: 6 } },
+              el('div', { style: { display: 'flex', gap: 16, fontSize: 12, color: 'var(--dsw-alias-state-success-primary)', fontWeight: 600 } },
+                el('span', null, 'TTFT 首字响应: ' + (res.ttftMs != null ? (res.ttftMs / 1000).toFixed(2) + 's' : '—')),
+                el('span', null, '总延迟耗时: ' + (res.latencyMs != null ? (res.latencyMs / 1000).toFixed(2) + 's' : '—'))
+              ),
+              res.reasoning ? el('div', { style: { marginTop: 6 } },
+                el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '思考过程 (Reasoning)'),
+                el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 140, overflow: 'auto', color: 'var(--dsw-alias-label-secondary)', margin: '4px 0' } }, res.reasoning)
+              ) : null,
+              res.text ? el('div', { style: { marginTop: 6 } },
+                el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '正文回复 (Text)'),
+                el('pre', { style: { whiteSpace: 'pre-wrap', fontSize: 12, fontFamily: 'var(--ds-font-family-code)', maxHeight: 180, overflow: 'auto', color: 'var(--dsw-alias-label-primary)', margin: '4px 0' } }, res.text)
+              ) : null
+            ) : el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 13, padding: 12, background: 'rgba(239, 68, 68, 0.08)', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 4 } },
+              el('strong', null, '错误代码: ' + (res.code || 'UNKNOWN')),
+              el('div', { style: { fontFamily: 'var(--ds-font-family-code)', fontSize: 12 } }, res.error || '未知网络或认证异常')
+            )
+          ),
+          el('div', { className: 'mcm-modal-f' },
+            btn('关闭', () => setWin(null))
+          )
+        )
+      )
     }
 
     function fetchModal(name, p, disc, setDisc, onApply) {
@@ -286,19 +320,50 @@ window.__ModuleLoader__.load({
       const [exp, setExp] = useState({}); const [em, setEm] = useState({}); const [live, setLive] = useState({})
       const [sa, setSa] = useState({})
       const [keyInput, setKeyInput] = useState({})
-      const [testWin, setTestWin] = useState(null); const [testStates, setTestStates] = useState({})
+      const [testStates, setTestStates] = useState({})
+      const [detailWin, setDetailWin] = useState(null)
+      const [configWin, setConfigWin] = useState(false)
       const [disc, setDisc] = useState(null)
       const providers = draft || {}
 
+      const pollTest = (nonce, provider, model) => {
+        if (!apiRef) return
+        apiRef.settings.describe({}).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          const d = r && r.value !== undefined ? r.value : r
+          const ns = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
+          const tr = (ns && ns.value && ns.value.testResults) || {}
+          const e = tr[nonce]
+          const key = provider + '::' + model
+          if (e && (e.status === 'ok' || e.status === 'error')) {
+            setTestStates((s) => Object.assign({}, s, { [key]: e }))
+          } else {
+            setTimeout(() => pollTest(nonce, provider, model), 1200)
+          }
+        }).catch(() => setTimeout(() => pollTest(nonce, provider, model), 1500))
+      }
+
       const launchTest = (provider, model) => {
-        // 如果当前 draft 还没有点击保存，则自动向用户友好提示
+        // 如果当前 draft 还没有点击保存，则向用户友好提示
         const currentSavedModels = (props._state?.providers?.[provider]?.models || []).map((m) => m.id)
         if (!currentSavedModels.includes(model)) {
           setNotice('请先点击右上角「保存全部变更」，保存后方可进行真实链路测试')
           setTimeout(() => setNotice(null), 4000)
         }
-        setTestStates((s) => Object.assign({}, s, { [provider + '::' + model]: { status: 'running' } }))
-        setTestWin({ provider, model, prompt: localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己', maxTokens: 256, nonce: null, result: null, polling: false })
+        if (!apiRef) return
+        const key = provider + '::' + model
+        setTestStates((s) => Object.assign({}, s, { [key]: { status: 'running' } }))
+        const nonce = Date.now() % 1000000000
+        const prompt = localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己'
+        const maxTokens = Number(localStorage.getItem('mcm_test_max_tokens')) || 256
+        apiRef.settings.update({
+          ns: 'model-channel-health',
+          patch: { testRequest: { nonce, provider, model, prompt, maxTokens } }
+        }).then(() => {
+          pollTest(nonce, provider, model)
+        }).catch((e) => {
+          setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', error: String((e && e.message) || e) } }))
+        })
       }
       const updateP = (name, patch) => setDraft((d) => Object.assign({}, d, { [name]: Object.assign({}, d[name], patch) }))
       const updateModel = (name, mi, patch) => setDraft((d) => { const ms = (d[name].models || []).map((mm, i) => i === mi ? Object.assign({}, mm, patch) : mm); return Object.assign({}, d, { [name]: Object.assign({}, d[name], { models: ms }) }) })
@@ -402,7 +467,21 @@ window.__ModuleLoader__.load({
                     el('span', { style: { fontFamily: 'var(--ds-font-family-code)', fontWeight: 600, fontSize: 12 } }, m.id || '(未命名)'),
                     (m.input || []).includes('image') ? el('span', { className: 'mcm-badge success' }, 'vision') : null,
                     m.reasoningEfforts ? el('span', { className: 'mcm-badge brand' }, 'reasoning') : null,
-                    ts ? (ts.status === 'running' ? el('span', { className: 'mcm-badge' }, '测试中…') : ts.status === 'ok' ? el('span', { className: 'mcm-badge success' }, '✓ 可用') : el('span', { className: 'mcm-badge error' }, '✗ 异常')) : null,
+                    ts ? (
+                      ts.status === 'running' ? el('span', { className: 'mcm-badge brand' }, '测试中…') :
+                      ts.status === 'ok' ? el('span', {
+                        className: 'mcm-badge success',
+                        style: { cursor: 'pointer' },
+                        title: '点击查看成功详情与回复',
+                        onClick: (e) => { e.stopPropagation(); setDetailWin({ provider: name, model: m.id, result: ts }) }
+                      }, '✓ 成功 (详情)') :
+                      el('span', {
+                        className: 'mcm-badge error',
+                        style: { cursor: 'pointer' },
+                        title: '点击查看具体异常错误原因',
+                        onClick: (e) => { e.stopPropagation(); setDetailWin({ provider: name, model: m.id, result: ts }) }
+                      }, '✗ 异常 (详情)')
+                    ) : null,
                     el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
                       btn('⚡测试', () => launchTest(name, m.id), 'primary'),
                       btn('✕', () => removeModel(name, mi), 'danger')
@@ -453,13 +532,18 @@ window.__ModuleLoader__.load({
       })
 
       return el('div', null,
+        el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
+          el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, '已配置 ' + Object.keys(providers).length + ' 个提供商'),
+          btn('⚙️ 配置全局测试参数', () => setConfigWin(true))
+        ),
         ...cards,
         btn('＋新增提供商 (Provider)', () => {
           const nm = 'provider-' + (Object.keys(providers).length + 1)
           setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase() + '_API_KEY', displayName: nm, models: [] } }))
           setExp((e) => Object.assign({}, e, { [nm]: true }))
         }, 'primary'),
-        testWin ? el(ModelTestModal, { win: testWin, setWin: setTestWin, onResult: (e) => { const key = testWin.provider + '::' + testWin.model; setTestStates((s) => Object.assign({}, s, { [key]: e })) } }) : null
+        el(GlobalTestConfigModal, { win: configWin, setWin: setConfigWin }),
+        el(TestResultDetailModal, { win: detailWin, setWin: setDetailWin })
       )
     }
 
