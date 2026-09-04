@@ -92,8 +92,9 @@ window.__ModuleLoader__.load({
       return s
     }
     // 参考 pi-provider-manager 的默认请求头（浏览器伪装，降低被上游风控的概率）
+    // 不注入 User-Agent：pi-ai 的 requestHeaders 会强制用 deepseek-harness 归属 UA 覆盖，
+    // 自定义 UA 是死数据（被过滤），故不写入；其余 7 个伪装头仍生效。
     const DEFAULT_HEADERS = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       'Accept': 'text/event-stream, text/html, application/json, */*',
       'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
       'Accept-Encoding': 'gzip, deflate, br',
@@ -1158,6 +1159,8 @@ window.__ModuleLoader__.load({
             const apiKeyEnvVal = normalizeCredentialRef(pVal.apiKeyEnv || '')
             if (apiKeyEnvVal) pObj.apiKeyEnv = apiKeyEnvVal
             pObj.headers = Object.assign({}, DEFAULT_HEADERS, (pVal.headers && typeof pVal.headers === 'object') ? pVal.headers : {})
+            delete pObj.headers['User-Agent']
+            delete pObj.headers['user-agent']
             if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
             if (pVal.transport) pObj.transport = pVal.transport
             if (pVal.cacheRetention) pObj.cacheRetention = pVal.cacheRetention
