@@ -1096,7 +1096,9 @@ window.__ModuleLoader__.load({
               p.headers = Object.assign({}, DEFAULT_HEADERS, p.headers || {})
             }
           }
-          setState({ providers })
+          // user 层 = 仅用户手工声明的路由（用于真正删除与重排序的 mutate 依据）
+          const userProviders = (ns && ns.user && ns.user.providers) || {}
+          setState({ providers, userProviders })
           setDraft((prev) => prev || clone(providers))
           const cn = findNs('model-channels')
           const ch = (cn && cn.value && cn.value.groups) || []
@@ -1165,11 +1167,24 @@ window.__ModuleLoader__.load({
             cleanProviders[pKey] = pObj
           }
         }
-        const p1 = draft ? apiRef.settings.update({ ns: 'llm-pi-ai', patch: { providers: cleanProviders } }).then((resp) => {
-          const r = resp && resp.result ? resp.result : resp
-          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed')
-          return r
-        }) : Promise.resolve()
+        // llm-pi-ai 用 mutate path-ops 提交：
+        //  - settings.update 是 merge 语义：已存在键保序（无法表达拖拽重排）
+        //  - settings.replace 会整体重建（官方不建议持有脱敏视图时使用）
+        //  - mutate：先 unset 全部旧键（含删除项），再按最终顺序 set → 键序即持久化顺序
+        const p1 = draft ? (() => {
+          const keys = Object.keys(cleanProviders)
+          const storedKeys = Object.keys((state && state.userProviders) || {})
+          const ops = []
+          const allKeys = Array.from(new Set([...storedKeys, ...keys]))
+          for (const k of allKeys) ops.push({ op: 'unset', path: ['providers', k] })
+          for (const k of keys) ops.push({ op: 'set', path: ['providers', k], value: cleanProviders[k] })
+          if (ops.length === 0) return Promise.resolve()
+          return apiRef.settings.mutate({ ns: 'llm-pi-ai', ops }).then((resp) => {
+            const r = resp && resp.result ? resp.result : resp
+            if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed')
+            return r
+          })
+        })() : Promise.resolve()
         const p2 = channelsDraft ? apiRef.settings.update({ ns: 'model-channels', patch: { groups: channelsDraft } }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'model-channels save failed')
@@ -1179,7 +1194,7 @@ window.__ModuleLoader__.load({
           setNotice('已全部保存（即时生效）')
           // 同步草稿与状态为刚保存的清洗版本（含默认请求头合并结果）
           setDraft(clone(cleanProviders))
-          setState((s) => Object.assign({}, s, { providers: cleanProviders }))
+          setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders }))
           setTimeout(() => setNotice(null), 3000)
           refresh()
         }).catch((e) => setNotice('保存失败: ' + String((e && e.message) || e))).finally(() => setSaving(false))
