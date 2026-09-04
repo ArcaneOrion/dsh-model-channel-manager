@@ -79,6 +79,18 @@ window.__ModuleLoader__.load({
     const MTF = ['max_completion_tokens', 'max_tokens']
     const TRANSPORTS = ['sse', 'websocket', 'websocket-cached', 'auto']
     const CACHE = ['none', 'short', 'long']
+    // apiKeyEnv 凭据引用必须是 POSIX 环境变量名（DSH apiproxy zod: /^[A-Za-z_][A-Za-z0-9_]*$/）
+    const isLegalCredentialRef = (v) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)
+    const normalizeCredentialRef = (raw) => {
+      const v = String(raw == null ? '' : raw).trim()
+      if (!v) return ''
+      if (isLegalCredentialRef(v)) return v
+      // 非法的引用（如含连字符 '-22'）：大写化、非法字符转下划线、数字开头补下划线前缀
+      let s = v.toUpperCase().replace(/[^A-Z0-9_]+/g, '_').replace(/^[0-9]+/, (m) => '_' + m).replace(/^_+/, '')
+      if (!s) s = 'API_KEY'
+      if (!isLegalCredentialRef(s)) s = '_' + s
+      return s
+    }
     // 参考 pi-provider-manager 的默认请求头（浏览器伪装，降低被上游风控的概率）
     const DEFAULT_HEADERS = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -650,7 +662,8 @@ window.__ModuleLoader__.load({
         ...cards,
         btn('＋新增提供商 (Provider)', () => {
           const nm = 'provider-' + (Object.keys(providers).length + 1)
-          setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: nm.toUpperCase() + '_API_KEY', displayName: nm, models: [], headers: Object.assign({}, DEFAULT_HEADERS) } }))
+          const keyRef = normalizeCredentialRef(nm + '_api_key')
+          setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: keyRef, displayName: nm, models: [], headers: Object.assign({}, DEFAULT_HEADERS) } }))
           setExp((e) => Object.assign({}, e, { [nm]: true }))
         }, 'primary'),
         el(GlobalTestConfigModal, { win: configWin, setWin: setConfigWin }),
@@ -1097,7 +1110,8 @@ window.__ModuleLoader__.load({
             }
             if (pVal.baseURL && String(pVal.baseURL).trim()) pObj.baseURL = String(pVal.baseURL).trim()
             if (pVal.displayName && String(pVal.displayName).trim()) pObj.displayName = String(pVal.displayName).trim()
-            if (pVal.apiKeyEnv && String(pVal.apiKeyEnv).trim()) pObj.apiKeyEnv = String(pVal.apiKeyEnv).trim()
+            const apiKeyEnvVal = normalizeCredentialRef(pVal.apiKeyEnv || '')
+            if (apiKeyEnvVal) pObj.apiKeyEnv = apiKeyEnvVal
             pObj.headers = Object.assign({}, DEFAULT_HEADERS, (pVal.headers && typeof pVal.headers === 'object') ? pVal.headers : {})
             if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
             if (pVal.transport) pObj.transport = pVal.transport
