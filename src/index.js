@@ -21,7 +21,12 @@ const HEALTH_SCHEMA = z.object({
     lastTestHandledNonce: z.number().default(0),
 }).loose(true);
 export function apply(ctx) {
-    const isContentChunk = (c) => c && (c.type === 'text-delta' || c.type === 'reasoning-delta' || c.type === 'tool-call-delta');
+    const isContentChunk = (c) => {
+        if (!c) return false;
+        if (c.type === 'text-delta' || c.type === 'reasoning-delta') return c.text !== '';
+        if (c.type === 'tool-call-delta') return c.argumentsDelta !== '' || c.name !== undefined;
+        return false;
+    };
     const isTerminalChunk = (c) => c && c.type === 'finish';
     const isSuccessReason = (r) => r && (r.kind === 'stop' || r.kind === 'max-tokens' || r.kind === 'tool-calls');
     const failChunk = (message, code) => ({ type: 'finish', reason: { kind: 'error', failure: { message, code } } });
@@ -39,6 +44,16 @@ export function apply(ctx) {
             runtime.set(id, g);
         }
         return g;
+    };
+    // ---------- 可取消超时（避免 Promise.race 留下孤儿定时器） ----------
+    const timed = (ms, makeError) => {
+        let rejectFn;
+        const promise = new Promise((_, reject) => { rejectFn = reject; });
+        const dispose = ctx.effect(() => {
+            const timer = setTimeout(() => rejectFn(makeError()), ms);
+            return () => clearTimeout(timer);
+        }, 'model-channel timeout guard');
+        return { promise, dispose };
     };
     // ---------- 配置归一化（与动态原型逐行一致） ----------
     function normalizeConfig(raw) {
@@ -58,8 +73,8 @@ export function apply(ctx) {
                     name: typeof vm.name === 'string' && vm.name.length > 0 ? vm.name : id,
                     reasoning: vm.reasoning !== false,
                     input: Array.isArray(vm.input) && vm.input.length > 0 && vm.input.every((x) => x === 'text' || x === 'image') ? vm.input.slice() : ['text'],
-                    contextWindow: Number.isFinite(vm.contextWindow) && vm.contextWindow > 0 ? vm.contextWindow : 200000,
-                    maxTokens: Number.isFinite(vm.maxTokens) && vm.maxTokens > 0 ? vm.maxTokens : 16384,
+                    contextWindow: Number.isSafeInteger(vm.contextWindow) && vm.contextWindow > 0 ? vm.contextWindow : 200000,
+                    maxTokens: Number.isSafeInteger(vm.maxTokens) && vm.maxTokens > 0 ? vm.maxTokens : 16384,
                 },
                 candidates: Array.isArray(rg.candidates)
                     ? rg.candidates.filter((c) => c && typeof c.provider === 'string' && c.provider.length > 0 && typeof c.model === 'string' && c.model.length > 0).map((c) => ({ provider: c.provider, model: c.model }))
@@ -96,9 +111,9 @@ export function apply(ctx) {
     function pullRecords() { return state.records; }
     function pullSpeedResults() { return state.speedResults; }
     // ---------- 健康聚合 ----------
-    function healthAggregate(gid) {
+    function healthAggregate() {
         const recordsMap = pullRecords();
-        // 如果提供了 gid 且在配置里是轮询组，先查该组候选对应的真实 provider::model 记录
+        // 聚合所有真实渠道（provider::model）的请求健康流水；记录由全局 llm/stream 拦截器按 provider 键写入
         const allEvents = Object.values(recordsMap).flat();
         const by = new Map();
         for (const e of allEvents) {
@@ -158,7 +173,7 @@ export function apply(ctx) {
     function orderedCandidates(cfg) {
         const rt = groupRuntime(cfg.id);
         const base = activeCandidates(cfg);
-        const aggList = healthAggregate(cfg.id);
+        const aggList = healthAggregate();
         const speedRows = pullSpeedResults()[cfg.id] || [];
         const entries = base.map((cand) => {
             const key = candKey(cand);
@@ -225,7 +240,24 @@ export function apply(ctx) {
         }
         return out;
     };
-    const persistRecords = () => persistHealth();
+    // ---------- 运行时态恢复（重启后还原冷却与 sticky 指针） ----------
+    function restoreRuntime(saved) {
+        if (!saved || typeof saved !== 'object') return;
+        const now = Date.now();
+        for (const [id, data] of Object.entries(saved)) {
+            if (!data || typeof data !== 'object') continue;
+            const rt = groupRuntime(id);
+            if (Number.isSafeInteger(data.currentIndex)) rt.currentIndex = data.currentIndex;
+            if (Number.isSafeInteger(data.lastSpeedTestAt)) rt.lastSpeedTestAt = data.lastSpeedTestAt;
+            if (Array.isArray(data.cooldowns)) {
+                for (const c of data.cooldowns) {
+                    if (c && typeof c.key === 'string' && Number.isFinite(c.until) && c.until > now) {
+                        rt.cooldowns.set(c.key, c.until);
+                    }
+                }
+            }
+        }
+    }
     const recordHealth = async (gid, cand, entry) => {
         const now = Date.now();
         const key = gid || 'global';
@@ -242,7 +274,7 @@ export function apply(ctx) {
         await bus.settings.update(NS_HEALTH, { speedResults: clone(r), runtime: await persistRuntime() });
     };
     // ---------- 引擎：单候选尝试（与动态原型逐行一致） ----------
-    async function* streamAttempt(cfg, cand, options, attemptStart, outcome) {
+    async function* streamAttempt(cfg, cand, options, attemptStart) {
         if (cand.provider.startsWith(ROUTE_PREFIX))
             throw { code: 'INVALID_CANDIDATE', message: 'candidate provider must not be a virtual route' };
         const llm = ctx.llm;
@@ -264,10 +296,9 @@ export function apply(ctx) {
                 const remaining = Math.max(0, timeoutMs - (Date.now() - (started ? lastAt : attemptStart)));
                 if (remaining <= 0)
                     throw { code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' };
-                const next = await Promise.race([
-                    inner.next(),
-                    ctx.timeout(Math.max(1, Math.min(remaining, 30000))).then(() => { throw { code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' }; }),
-                ]);
+                const guard = timed(Math.max(1, Math.min(remaining, 30000)), () => ({ code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' }));
+                const next = await Promise.race([inner.next(), guard.promise]);
+                guard.dispose();
                 lastAt = Date.now();
                 const chunk = next.value;
                 if (chunk === undefined)
@@ -275,7 +306,6 @@ export function apply(ctx) {
                 if (!started) {
                     if (isContentChunk(chunk)) {
                         started = true;
-                        outcome.ttft = Date.now() - attemptStart;
                         for (const b of buffer)
                             yield b;
                         yield chunk;
@@ -295,7 +325,6 @@ export function apply(ctx) {
                     if (isTerminalChunk(chunk)) {
                         const reason = chunk.reason || {};
                         if (isSuccessReason(reason)) {
-                            outcome.latency = Date.now() - attemptStart;
                             return;
                         }
                         throw { code: (reason.failure && reason.failure.code) || 'STREAM_ERROR', message: (reason.failure && reason.failure.message) || 'candidate stream failed' };
@@ -350,15 +379,13 @@ export function apply(ctx) {
                         return;
                     }
                     const attemptStart = Date.now();
-                    const outcome = { ttft: null, latency: null };
                     try {
-                        const attempt = streamAttempt(cfg, cand, options, attemptStart, outcome);
+                        const attempt = streamAttempt(cfg, cand, options, attemptStart);
                         for await (const chunk of attempt)
                             yield chunk;
                         succeeded = true;
                         candidateOk = true;
                         rt.cooldowns.delete(key);
-                        await recordHealth(cfg.id, cand, { ok: true, ttftMs: outcome.ttft, latencyMs: outcome.latency });
                         const pos = order.findIndex((c) => candKey(c) === key);
                         if (strategy === 'round-robin')
                             rt.currentIndex = (pos + 1) % order.length;
@@ -374,7 +401,6 @@ export function apply(ctx) {
                         const code = (err && err.code) || 'STREAM_ERROR';
                         const message = (err && err.message) || 'candidate failed';
                         lastFail = message;
-                        await recordHealth(cfg.id, cand, { ok: false, code });
                         if (r < (cfg.maxRetriesPerCandidate || 0)) {
                             pushEvent(cfg, 'retry', { candidate: key, attempt: r + 1, reason: message });
                             await ctx.timeout(Math.min(4000, 250 * Math.pow(2, r)));
@@ -420,10 +446,9 @@ export function apply(ctx) {
         catch (_e) { } };
         try {
             while (true) {
-                const next = await Promise.race([
-                    inner.next(),
-                    ctx.timeout(Math.max(1, st.timeoutMs)).then(() => { throw { code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms' }; }),
-                ]);
+                const guard = timed(Math.max(1, st.timeoutMs), () => ({ code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms' }));
+                const next = await Promise.race([inner.next(), guard.promise]);
+                guard.dispose();
                 const chunk = next.value;
                 if (chunk === undefined)
                     throw { code: 'STREAM_CLOSED', message: 'speedtest stream ended early' };
@@ -544,10 +569,9 @@ export function apply(ctx) {
         catch (_e) { } };
         try {
             while (true) {
-                const next = await Promise.race([
-                    inner.next(),
-                    ctx.timeout(60000).then(() => { throw { code: 'TIMEOUT', message: 'model test timed out after 60000ms' }; }),
-                ]);
+                const guard = timed(60000, () => ({ code: 'TIMEOUT', message: 'model test timed out after 60000ms' }));
+                const next = await Promise.race([inner.next(), guard.promise]);
+                guard.dispose();
                 const chunk = next.value;
                 if (chunk === undefined)
                     throw { code: 'STREAM_CLOSED', message: 'model test stream ended early' };
@@ -580,8 +604,11 @@ export function apply(ctx) {
             return;
         settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch(() => { });
         const done = async (r) => {
-            const all = Object.assign({}, pullHealthSnapshot().testResults || {}, { [req.nonce]: Object.assign({}, r, { nonce: req.nonce, provider: req.provider, model: req.model, finishedAt: Date.now() }) });
-            await settings.update(NS_HEALTH, { testResults: all });
+            const prev = pullHealthSnapshot().testResults || {};
+            const all = Object.assign({}, prev, { [req.nonce]: Object.assign({}, r, { nonce: req.nonce, provider: req.provider, model: req.model, finishedAt: Date.now() }) });
+            // 只保留最近 50 条测试结果，避免 testResults 无限增长
+            const pruned = Object.fromEntries(Object.entries(all).sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50));
+            await settings.update(NS_HEALTH, { testResults: pruned });
         };
         const running = Object.assign({}, pullHealthSnapshot().testResults || {}, { [req.nonce]: { status: 'running', nonce: req.nonce, provider: req.provider, model: req.model, startedAt: Date.now() } });
         settings.update(NS_HEALTH, { testResults: running }).catch(() => { });
@@ -624,6 +651,7 @@ export function apply(ctx) {
         state.config = clone(cfgScope.get() || { groups: [] });
         state.records = clone(healthScope.get().records || {});
         state.speedResults = clone(healthScope.get().speedResults || {});
+        restoreRuntime(healthScope.get().runtime || {});
         cfgScope.watch(() => {
             state.config = clone(cfgScope.get() || { groups: [] });
             for (const g of pullConfig().groups)
