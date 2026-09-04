@@ -392,7 +392,22 @@ window.__ModuleLoader__.load({
       const [configWin, setConfigWin] = useState(false)
       const [disc, setDisc] = useState(null)
       const [renameWin, setRenameWin] = useState(null)
+      const [dragIdx, setDragIdx] = useState(null)
+      const [overIdx, setOverIdx] = useState(null)
       const providers = draft || {}
+
+      // 拖动排序：provider 字典保序重建（对象键插入顺序即 YAML/JSON 持久化顺序）
+      const moveProvider = (from, to) => {
+        setDraft((d) => {
+          const entries = Object.entries(d || {})
+          if (from === to || from < 0 || to < 0 || from >= entries.length || to >= entries.length) return d
+          const [item] = entries.splice(from, 1)
+          entries.splice(to, 0, item)
+          const out = {}
+          for (const [k, v] of entries) out[k] = v
+          return out
+        })
+      }
 
       const renameProvider = (from, to) => {
         if (!providers[from]) return { error: '找不到原 ID（可能未保存，刷新后再试）' }
@@ -501,12 +516,40 @@ window.__ModuleLoader__.load({
         }).catch((e) => setLive((l) => Object.assign({}, l, { [name + '_key']: 'err: ' + String((e && e.message) || e) })))
       }
 
-      const cards = Object.entries(providers).map(([name, p]) => {
+      const cards = Object.entries(providers).map(([name, p], idx) => {
         const isOpen = !!exp[name]
         const models = p.models || []
         const currentName = p.displayName !== undefined ? p.displayName : name
-        return el('div', { className: 'mcm-card', key: name },
+        const isDragging = dragIdx === idx
+        const isDropTarget = overIdx === idx && dragIdx !== null && dragIdx !== idx
+        return el('div', {
+          className: 'mcm-card',
+          key: name,
+          style: Object.assign(
+            { transition: 'border-color 0.15s ease, opacity 0.15s ease' },
+            isDragging ? { opacity: 0.45 } : {},
+            isDropTarget ? { borderColor: 'var(--dsw-alias-brand-primary)', boxShadow: '0 0 0 2px rgba(59, 130, 246, 0.18)' } : {}
+          ),
+          onDragOver: (e) => {
+            e.preventDefault()
+            if (dragIdx !== null && dragIdx !== idx) setOverIdx(idx)
+          },
+          onDrop: (e) => {
+            e.preventDefault()
+            if (dragIdx !== null && dragIdx !== idx) moveProvider(dragIdx, idx)
+            setDragIdx(null)
+            setOverIdx(null)
+          }
+        },
           el('div', { className: 'mcm-card-h', onClick: () => setExp((e) => Object.assign({}, e, { [name]: !e[name] })) },
+            el('span', {
+              title: '拖动此手柄调整供应商顺序（保存后生效）',
+              draggable: true,
+              onDragStart: (e) => { e.stopPropagation(); setDragIdx(idx); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(idx)) } catch (_e) {} },
+              onDragEnd: () => { setDragIdx(null); setOverIdx(null) },
+              onClick: (e) => e.stopPropagation(),
+              style: { cursor: 'grab', color: 'var(--dsw-alias-label-tertiary)', fontSize: 14, padding: '0 6px', userSelect: 'none' }
+            }, '⠿'),
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
             el('div', { className: 'mcm-card-title' }, el('span', null, p.displayName || name), el('span', { className: 'mcm-badge brand' }, name)),
             p.api ? el('span', { className: 'mcm-badge' }, p.api) : null,
@@ -656,7 +699,7 @@ window.__ModuleLoader__.load({
 
       return el('div', null,
         el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
-          el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, '已配置 ' + Object.keys(providers).length + ' 个提供商'),
+          el('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, '已配置 ' + Object.keys(providers).length + ' 个提供商 · 拖动左侧 ⠿ 手柄可调整顺序（保存后生效）'),
           btn('⚙️ 配置全局测试参数', () => setConfigWin(true))
         ),
         ...cards,
