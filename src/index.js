@@ -398,7 +398,6 @@ export function apply(ctx) {
                         break;
                     }
                     catch (err) {
-                        const code = (err && err.code) || 'STREAM_ERROR';
                         const message = (err && err.message) || 'candidate failed';
                         lastFail = message;
                         if (r < (cfg.maxRetriesPerCandidate || 0)) {
