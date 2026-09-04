@@ -1164,6 +1164,11 @@ window.__ModuleLoader__.load({
             if (Number.isFinite(pVal.timeoutMs) && pVal.timeoutMs > 0) pObj.timeoutMs = pVal.timeoutMs
             if (Number.isFinite(pVal.streamIdleTimeoutMs) && pVal.streamIdleTimeoutMs > 0) pObj.streamIdleTimeoutMs = pVal.streamIdleTimeoutMs
             if (Number.isFinite(pVal.websocketConnectTimeoutMs) && pVal.websocketConnectTimeoutMs > 0) pObj.websocketConnectTimeoutMs = pVal.websocketConnectTimeoutMs
+            if (Number.isSafeInteger(pVal.defaultContextWindow) && pVal.defaultContextWindow > 0) pObj.defaultContextWindow = pVal.defaultContextWindow
+            if (Number.isSafeInteger(pVal.defaultMaxTokens) && pVal.defaultMaxTokens > 0) pObj.defaultMaxTokens = pVal.defaultMaxTokens
+            if (pVal.reasoning) pObj.reasoning = pVal.reasoning
+            if (Number.isSafeInteger(pVal.requestImagePixelBudget) && pVal.requestImagePixelBudget > 0) pObj.requestImagePixelBudget = pVal.requestImagePixelBudget
+            if (Number.isSafeInteger(pVal.requestImageMaxBytes) && pVal.requestImageMaxBytes > 0) pObj.requestImageMaxBytes = pVal.requestImageMaxBytes
             cleanProviders[pKey] = pObj
           }
         }
@@ -1173,7 +1178,10 @@ window.__ModuleLoader__.load({
         //  - mutate：先 unset 全部旧键（含删除项），再按最终顺序 set → 键序即持久化顺序
         const p1 = draft ? (() => {
           const keys = Object.keys(cleanProviders)
-          const storedKeys = Object.keys((state && state.userProviders) || {})
+          // 用 resolved 键集（state.providers）而非 user 层（state.userProviders）作为 unset 依据：
+          // 面板展示/编辑的正是 resolved 视图，user 层可能为空或与展示不一致，漏 unset 会导致
+          // 删除/改名失效（旧键残留）与排序无效。
+          const storedKeys = Object.keys((state && (state.providers || state.userProviders)) || {})
           const ops = []
           const allKeys = Array.from(new Set([...storedKeys, ...keys]))
           for (const k of allKeys) ops.push({ op: 'unset', path: ['providers', k] })
