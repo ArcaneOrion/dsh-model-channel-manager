@@ -328,7 +328,9 @@ export function apply(ctx) {
                 const remaining = Math.max(0, timeoutMs - (Date.now() - (started ? lastAt : attemptStart)));
                 if (remaining <= 0)
                     throw { code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' };
-                const guard = timed(Math.max(1, Math.min(remaining, 30000)), () => ({ code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' }));
+                // guard 覆盖全量 remaining：不能 cap 到 30s，否则 timeoutMs>30s 的首响应
+                // 超时与动态超时（min(120s, ttft×2)）在 >30s 区间全部退化为 30s 切候选
+                const guard = timed(Math.max(1, remaining), () => ({ code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' }));
                 let next;
                 try {
                     next = await Promise.race([inner.next(), guard.promise]);
@@ -679,20 +681,29 @@ export function apply(ctx) {
         if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || typeof req.nonce !== 'number' || req.nonce === last)
             return;
         settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch(() => { });
-        // 读写都以 healthScope.get()（settings 已提交的最新值）为准，而不是 watcher 同步的 state 快照：
-        // 连续两个测试请求时 state 可能滞后，读到旧 testResults 会互相覆盖结果
-        const readResults = () => ((bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {});
+        // 结果写入走 mutate path-ops 原子设置单 nonce：read-merge-write 整包 update 在
+        // 两个测试并发完成时会互相覆盖（读旧包→写入丢掉对方 nonce）；path-ops 对
+        // settings 队列中的 section 现势作用，不再依赖调用方快照
+        const setResult = (entry) => {
+            settings.mutate(NS_HEALTH, [{ op: 'set', path: ['testResults', String(req.nonce)], value: Object.assign({}, entry, { nonce: req.nonce, provider: req.provider, model: req.model }) }]).catch(() => { });
+        };
+        // 修剪低频执行：只在条目数超限时砍到 50（不在每次写入时整包重写）
+        const maybePrune = () => {
+            const all = (bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {};
+            const entries = Object.entries(all);
+            if (entries.length <= 50) return;
+            const drop = entries.sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(50).map(([k]) => ({ op: 'unset', path: ['testResults', String(k)] }));
+            if (drop.length > 0)
+                settings.mutate(NS_HEALTH, drop).catch(() => { });
+        };
         const done = async (r) => {
             try {
-                const all = Object.assign({}, readResults(), { [req.nonce]: Object.assign({}, r, { nonce: req.nonce, provider: req.provider, model: req.model, finishedAt: Date.now() }) });
-                // 只保留最近 50 条测试结果，避免 testResults 无限增长
-                const pruned = Object.fromEntries(Object.entries(all).sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50));
-                await settings.update(NS_HEALTH, { testResults: pruned });
+                setResult(Object.assign({}, r, { finishedAt: Date.now() }));
+                maybePrune();
             }
             catch (_e) { }
         };
-        const running = Object.assign({}, readResults(), { [req.nonce]: { status: 'running', nonce: req.nonce, provider: req.provider, model: req.model, startedAt: Date.now() } });
-        settings.update(NS_HEALTH, { testResults: running }).catch(() => { });
+        setResult({ status: 'running', startedAt: Date.now() });
         runModelTest(req.provider, req.model, req.prompt, req.maxTokens).then(async (r) => {
             await done(Object.assign({ status: 'ok' }, r));
         }).catch(async (e) => {
@@ -769,6 +780,17 @@ export function apply(ctx) {
         let ttft = null;
         let lastError = null;
         let isSuccess = false;
+        // 用户主动中止不是渠道故障：AbortError / code ABORTED / signal 已 aborted
+        // 三种形态都不进健康流水，否则污染成功率与 smart 键的 reliability 权重
+        const isAbortLike = (err) => {
+            if (options && options.signal && options.signal.aborted)
+                return true;
+            if (!err)
+                return false;
+            if (err.code === 'ABORTED' || err.name === 'AbortError')
+                return true;
+            return typeof err.message === 'string' && /abort/i.test(err.message);
+        };
         try {
             for await (const chunk of next()) {
                 if (ttft === null && isContentChunk(chunk)) {
@@ -784,7 +806,8 @@ export function apply(ctx) {
                 }
                 yield chunk;
             }
-            if (options && options.provider && options.model) {
+            if (options && options.provider && options.model && lastError !== 'ABORTED') {
+                // lastError 'ABORTED' = 终止块 kind aborted（用户中止而非渠道故障），不进健康流水
                 const latency = Date.now() - startTs;
                 const p = options.provider;
                 recordHealth(p, { provider: p, model: options.model }, {
@@ -795,7 +818,7 @@ export function apply(ctx) {
                 });
             }
         } catch (err) {
-            if (options && options.provider && options.model) {
+            if (options && options.provider && options.model && !isAbortLike(err)) {
                 const p = options.provider;
                 recordHealth(p, { provider: p, model: options.model }, {
                     ok: false,
