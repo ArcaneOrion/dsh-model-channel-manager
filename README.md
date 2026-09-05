@@ -3,7 +3,8 @@
 DSH 原生模型渠道管理。两半结构：
 
 - **host 半** `src/index.js`：轮询故障转移引擎（`llm.registerAdapter` 虚拟路由 `roundrobin/<组id>`）+ 7 天健康流水 + 测速排序 + 单模型真实请求测试通道。
-- **client 半** `src/client.js`：① `conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试）、**轮询渠道**（groups 编辑 + ⚡测速）、**健康统计**（7 天聚合）；② **会话模型选择器**（搜索增强，替换原生 `conversation.input.model` 座位：搜索框过滤模型/供应商/描述 + 近 7 天最近使用 provider 置顶，复用原生 directory 数据流）。
+- **client 半** `src/client.js`：`conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试、供应商搜索过滤）、**轮询渠道**（groups 编辑 + ⚡测速）、**健康统计**（7 天聚合）。
+- **会话模型选择器已拆出**为独立 cordis client 插件 [`@arcaneorion/dsh-model-selector-search`](../model-selector-search/)（一个占座者一个插件单元，可独立启停/替换；座位遮蔽 + 搜索 + 近 7 天置顶 + 菜单向上展开都在该仓）。
 
 语义参考 pi 的 `pi-provider-manager`，但完全走 DSH 原生 seam（无独立 HTTP 服务/端口/token）：
 
@@ -102,7 +103,7 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 配置里 provider 必须非虚拟路由（防自引用）
 - 轮询渠道/健康统计面板需要 host 新代码（重启后生效）；健康流水的数据在**实际请求过轮询组**后才出现
 - `reasoningEfforts` 缺失（undefined）的 model 正确渲染（`|| {}` 兜底）
-- 会话模型选择器搜索版替换原生 ModelSelect（`conversation.input.model` 座位，`replaceRisk: shadows-shipped-ui`）：原生组件升级不自动跟随；effort 档位切换暂未实现（原生 ModelSelect 有，需要时可在菜单项内加二级）；/model 弹窗入口仍是原生平铺
+- 会话模型选择器搜索版已拆出为独立插件 `@arcaneorion/dsh-model-selector-search`（原生座位遮蔽、搜索、向上展开菜单、effort 档位未实现等边界见该仓 README）；本插件不再注册任何座位
 
 ## 踩坑速记（本项目，按严重程度）
 
@@ -124,4 +125,6 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 16. **save() 白名单重建会真删面板外字段**：mutate 是 unset+set 真删不是 merge；从零构建只带面板认识的字段，手工配置的 thinkingBudgets/retryPolicy/modelOverrides/defaultInput 任何一次保存（含只改轮询组）都被整批静默删除。修复：pObj 基底 `{...pVal}` 浅拷贝再覆盖面板字段，空值靠覆盖后删键而非忽略。模型对象同理。
 17. **compat 面板只暴露真实生效的两字段**：harness `PiAiCompatProfile` 只消费 thinkingFormat + supportsReasoningEffort，其余 18 个曾出现在编辑器的开关 harness 0 处引用（存了不报错但不生效）；且 thinkingFormat 下拉不可含 withheld 的 chat-template/qwen-chat-template（schema 拒绝整包失败），「— 默认 —」空串同样被拒——save 时统一 cleanCompat 净化。
 18. **guard 不能 cap 到 30s**：streamAttempt 的超时 guard 曾用 `Math.min(remaining, 30000)`，timeoutMs>30s 与动态超时 min(120s, ttft×2) 在 >30s 区间全部退化为 30s 切候选。guard 必须覆盖全量 remaining。另：用户主动 abort 不进健康流水（isAbortLike 三形态 + 终止块 ABORTED 跳过），否则污染成功率与 smart 键 reliability。
-19. **single slot 换占必须传负 priority**：`conversation.input.model` 是单占位 seat，cell = slot 本身；原生无 priority（= 0），插件同名注册同不传 → **exact-priority 撞格直接抛错**（「already has a registration at priority 0」→ apply 失败 → 整个插件含模型配置页签加载失败，面板全白）。规则：同 cell 多 entry 按 priority **升序、数值最小者渲染**，遮蔽原生传 `priority: -1`。注意 slot-catalog 的「Do NOT pass priority」只适用于**动态包**（guard 自动分配）；静态 bundle 必须自己传。另：mock 验证 slots.register 不会暴露 occupancy 检查（mock 不抛）——验证座位替换必须复刻真实 SlotCore 撞格语义（tests/slot-priority.test.cjs）。
+19. **single slot 换占必须传负 priority**：`conversation.input.model` 是单占位 seat，cell = slot 本身；原生无 priority（= 0），插件同名注册同不传 → **exact-priority 撞格直接抛错**（「already has a registration at priority 0」→ apply 失败 → 整个插件含模型配置页签加载失败，面板全白）。规则：同 cell 多 entry 按 priority **升序、数值最小者渲染**，遮蔽原生传 `priority: -1`。注意 slot-catalog 的「Do NOT pass priority」只适用于**动态包**（guard 自动分配）；静态 bundle 必须自己传。另：mock 验证 slots.register 不会暴露 occupancy 检查（mock 不抛）——验证座位替换必须复刻真实 SlotCore 撞格语义。选择器拆出后，回归测试随代码迁至 `../model-selector-search/tests/slot-priority.test.cjs`。
+20. **诊断临时实例必须独立 home（`DSH_HOME=/tmp/dsh-diag dsh ...`）**：临时实例与主实例共用 `~/.dsh` 会并发写同一会话日志与 `session_projcache.json`——两进程各自的 seq 计数器交错追加，日志出现重复 seq → `corrupt session log: seq gap in committed region` → 会话 resume 直接拒绝，表现为该会话内模型目录加载失败（选择器「暂无可用模型」）。修复：解压 jsonl 删掉多余事件即可（后续 seq 连续则天然对齐），用 `session-persistence-jsonl` 的 `scanLog` 校验后压缩回写；杀进程前务必备份。
+21. **适配器契约以安装运行时的 d.ts 为准，不能照抄源码仓快照**：源码仓较新、rc.2 运行时的 `LlmAdapter` 多一个必需的 `prepareCall(provider, model, signal) → Promise<{model, stream}>`（主分发路径 llm.stream/llm.prepareCall 都先走它再 `adapterCall.stream(options)`；`adapter.stream` 在 rc.2 服务层从不直调）。缺它的症状极具迷惑性：注册/目录/菜单全正常，**真实发对话**才报 `registration.adapter.prepareCall is not a function`。实现对齐 llm-pi-ai 的快照模式：prepare 时捕获一份配置快照，元数据与 dispatch 都出自同一代。回归：`tests/adapter-contract.test.cjs`（T3 直接解析安装版 d.ts 的 LlmAdapter 方法集做契约同步）。
