@@ -1328,7 +1328,7 @@ window.__ModuleLoader__.load({
     // 与面板分开自持拉取（selector 是独立组件树，不共享 ModelConfigView 的 state）。
     let selHealthCache = { at: 0, order: [] }
     const pullRecentProviders = (force) => {
-      if (!apiRef) return Promise.resolve(selHealthCache.order)
+      if (!apiRef || !apiRef.settings || typeof apiRef.settings.describe !== 'function') return Promise.resolve(selHealthCache.order)
       const now = Date.now()
       if (!force && now - selHealthCache.at < 30000 && selHealthCache.order.length > 0) return Promise.resolve(selHealthCache.order)
       return apiRef.settings.describe({}).then((resp) => {
@@ -1519,12 +1519,15 @@ window.__ModuleLoader__.load({
       }, 'model-config: styles')
       const slots = ctx.get('slots')
       if (!slots) return
-      // 会话模型选择器座位替换：插件 entry priority 低于 shipped（slot 系规则），同名注册
-      // 即占领 conversation.input.model（单占位 seat，replaceRisk: shadows-shipped-ui，官方支持路径）。
+      // 会话模型选择器座位替换：single slot 的 cell 是 slot 本身，同 priority 撞格直接抛错
+      // （「already has a registration at priority 0」→ 插件加载失败，整个面板消失——实测踩坑）。
+      // 阴影规则：同 cell 多 entry 按 priority 升序，**数值最小者渲染**。原生无 priority = 0，
+      // 插件要遮蔽它必须传负数（-1）。注意：动态包另有 guard 自动分配 priority 且禁止手传
+      // （slot-catalog 规则「Do NOT pass priority」只适用于动态包），静态 bundle 必须自己传。
       // 组件复用声明方注入的 directory/load/select（谁占座谁收到，不会出现两套状态）；
       // /model 弹窗入口不动（两入口共享同一 directory store，行为一致）。
       slots.inject('conversation.input.model', () => slots.register(
-        { name: 'conversation.input.model', id: 'mcm-search-select' },
+        { name: 'conversation.input.model', id: 'mcm-search-select', priority: -1 },
         (p) => el(SearchModelSelect, p)
       ))
       slots.inject('conversation.view', () => slots.register(
