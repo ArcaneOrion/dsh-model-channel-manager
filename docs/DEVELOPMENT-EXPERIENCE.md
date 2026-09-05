@@ -139,7 +139,7 @@ const unwrap = (resp) => {
 1. **长列表编辑器**：Provider 卡片（外层）→ 模型子卡片 → 兼容性折叠区，逐层展开，避免一屏塞满字段。
 2. **静默异步 + 行内状态**：⚡测速 / ⚡测试不弹窗打断，行内徽标流转 `测试中… → ✓ 成功(详情) / ✗ 异常(详情)`，点击徽标才展开结果详情浮窗。
 3. **全局参数一次配置**：测试 Prompt / MaxTokens 存 `localStorage`（`mcm_test_prompt` / `mcm_test_max_tokens`），全局共用。
-4. **拖动排序**：见 [3.7](#37-供应商拖动排序) —— 独立 ⠿ 手柄 + 保序重建字典 + mutate 提交持久化。
+4. **拖动排序**：见 [3.7](#37-供应商拖动排序) —— 独立 ⠿ 手柄 + 保序重建字典 + providerOrder 数组持久化（[3.7.1](#371-上游-pr-路线图patchnode-键序感知未提待时机) 含上游 PR 路线图）。
 
 ### 3.4 拉取上游模型 Diff 语义（务必保持）
 
@@ -215,6 +215,48 @@ await apiRef.settings.mutate({ ns: 'llm-pi-ai', ops });
 - merge 语义下只 patch groups 不带 order 时旧 order 保留（实测），别的调用者不会误冲。
 - 已知边界：llm-pi-ai 文件键序仍是创建时序（map 盲区在上游）；**原生 Models 页**顺序由 directory 决定（catalog 内置序 + settings 键序两段拼接，无排序交互，详见 README 踩坑 #15）——要原生持久需上游修 patchNode（键序感知 diff）。
 
+### 3.7.1 上游 PR 路线图：patchNode 键序感知（未提，待时机）
+
+**决策（2026-09）**：暂不打 patchNode 本地补丁，插件侧 providerOrder 方案已闭环。补丁的边际收益只剩原生页排序持久（但原生无拖拽交互）、rename 挪到文件末尾的键序漂移（纯观感）；边际成本是核心写路径改动 + 每次升级的语义冲突审计 + **段内注释丢失副作用**（yaml 库 deleteIn+setIn 不保注释，settings.yaml providers 段的手写注释会被抹）。触发条件（满足其一再动）：
+
+- 上游 issue/PR 表明要修键序持久化 → 跟进其方案
+- 原生 UI 开始提供排序交互（先有交互才有持久化需求）
+- settings.yaml 键序漂移造成实际困扰（多工具对顺序敏感）
+
+**PR 草案（可行性已离线验证）**：`packages/settings/settings-file/src/index.ts` 的 `patchNode` map 分支开头加纯键序检测：
+
+```ts
+// map 分支开头：键集合相同、值相同、仅顺序不同 → 整段重建采纳新键序
+const ck = Object.keys(current), nk = Object.keys(next)
+if (ck.length === nk.length && nk.every(k => k in current)
+    && deepEqualJson(current, next) && ck.some((k, i) => nk[i] !== k)) {
+  document.deleteIn([...path]); document.setIn([...path], next); return
+}
+```
+
+依据（本仓离线复刻实验，`tests/provider-order-persistence.test.cjs`）：
+
+- map 纯重排（值不变）= 零 diff，文件不动（原根因）；
+- `setIn` 对已存在键原地替换不挪位；`deleteIn`+`setIn` 新键 append 到末尾（rename 挪位现象）；
+- 整段 `deleteIn`+`setIn` → 新键序真实落盘（实验 ✅）；
+- **分支次序注意**：`deepEqualJson(current, next)` 用 JSON.stringify 比较——按对象插入序序列化，纯重排的两个对象 stringify **不相等**，所以实际会先落入叶子分支触发整值 setIn（而非新加的键序检测）。键序检测必须放在 map 分支**之前**才能拦截纯重排；提案时需向上游说明这个次序细节并补测试；
+- 数组重排/重写走 wholesale replace 且保持原位（本插件 providerOrder 方案的立足点）。
+
+**替代方案对照（曾评估）**：
+
+| 方案 | 机制 | 代价 | 结论 |
+| --- | --- | --- | --- |
+| ① 两次 mutate（unset-all 落盘 → set-all 落盘） | 中间态 providers 全空，llm-pi-ai watcher 瞬间 directory.replace([]) | 新请求 NO_ADAPTER 闪断；ops 单次 mutate 只 persist 一次，合并成单次 RPC 无效（必须真两次 RPC） | 弃 |
+| ② providerOrder 数组（本插件已采用） | 数组 wholesale replace 真实落盘 | 无闪断、单次写；原生页不受益 | ✅ 现行 |
+| ③ 上游 patchNode 键序感知 | 整段重建采纳新键序 | 段内注释丢失 + 升级语义冲突审计；一次修复所有消费方 | 本节，待提 PR |
+
+**升级冲突审计清单（若未来打了本地补丁）**：改动位于 `packages/settings/settings-file/src/index.ts` `patchNode`（核心写路径，有测试覆盖，上游重构概率不低）。每次升级 harness 后：
+
+1. `git diff` 确认补丁仍在或手工重放（十几行逻辑）；
+2. 跑 `pnpm --filter settings-file test` 回归（不靠记忆靠测试）；
+3. 关注上游是否改了 diff 算法（语义冲突比文本冲突危险——git 无冲突但行为已变）；
+4. 建议落仓内 patch 文件（如 `patches/settings-file-keyorder.patch` + 升级 checklist），同 `cordis.patch.yml` 先例。
+
 ### 3.8 凭据引用归一化
 
 DSH apiproxy 的 zod（`credentials.schema.js`）：
@@ -275,6 +317,8 @@ export const credentialRefNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*
 | 21 | 用户清空全部轮询组后重启，旧配置复活 | 遗留迁移条件是「当前组数为空」且不写迁移标记 | `legacyMigrated` 哨兵 + fs 未就绪 5s×6 重试 |
 | 22 | 编辑器删掉的默认请求头保存后又回来 | 加载/保存两处无条件 `Object.assign({}, DEFAULT_HEADERS, p.headers)` | 默认头只在新增供应商注入一次；保存原样保留用户 headers（仅剔空键与 UA） |
 | 23 | 轮询组流量几乎不进健康统计 | 引擎提前终止的内层流不被全局拦截器完整排水 | `streamAttempt` 侧对超时/首响应前失败/成功自行 `recordHealth` |
+| 24 | 拖拽顺序重启还原（文件层零 diff） | settings-file `patchNode` 对 map 键序盲：纯重排 = 零 diff，`setIn` 不挪位、新键只 append；顺序只活在 host 内存 | `providerOrder` 数组持久化（见 3.7/3.7.1）；原生页无排序交互，顺序由 directory 恒定 |
+| 25 | compat 编辑器 20 字段里 18 个是死开关，文档曾误称「全部真实生效」 | `PiAiCompatProfile` 只声明并消费 thinkingFormat + supportsReasoningEffort 两个字段；其余字段 schema loose 容忍存储但 harness 0 处引用 | 面板待修：删除或标注死字段（P0 待办）；`thinkingFormat` 下拉含 withheld 的 chat-template/qwen-chat-template + 空串「切回默认」，选中即整包保存失败（P0 待办） |
 
 ---
 
@@ -328,13 +372,22 @@ DSH `llm-pi-ai` 官方三协议（`PROTOCOLS` 定义）：
 | `reasoningEfforts` | 各思考档（off/minimal/low/medium/high/xhigh/max）→ 上游 wire 值的映射，null=关闭 |
 | `compat` | 模型级兼容覆写（优先级高于供应商级） |
 
-### 5.4 Compat 字段（全部真实生效，均有内核证据）
+### 5.4 Compat 字段（重要修正：仅 2 项真实生效，其余为面板占位）
 
-**OpenAI Completions 系**：`supportsStore` / `supportsDeveloperRole` / `supportsReasoningEffort` / `supportsUsageInStreaming` / `maxTokensField` / `thinkingFormat`(10 种厂商线格式) / `requiresToolResultName` / `requiresAssistantAfterToolResult` / `requiresThinkingAsText` / `requiresReasoningContentOnAssistantMessages` / `supportsStrictMode` / `supportsLongCacheRetention` / `cacheControlFormat` / `sendSessionAffinityHeaders` / `supportsOpenAIGrammarTools` / `chatTemplateKwargs`
+**2026-09 审计修正**：harness 源码逐字段 grep 验证（`packages/llm` 全栈 0 处引用）+ 实测，`PiAiCompatProfile` 接口（`llm-pi-ai/src/catalog.ts:194`）**只声明并消费 2 个字段**：
 
-**Anthropic 系**：`supportsEagerToolInputStreaming` / `supportsCacheControlOnTools` / `supportsTemperature` / `forceAdaptiveThinking` / `allowEmptySignature` / `supportsStrictTools` / `supportsToolReferences` / `sendSessionAffinityHeaders` / `supportsLongCacheRetention`
+| 字段 | 状态 | 内核证据 |
+| --- | --- | --- |
+| `thinkingFormat` | ✅ 真实生效 | `resolveModelCompat()` 读取，仅 `openai-completions` 协议有效 |
+| `supportsReasoningEffort` | ✅ 真实生效 | 同上 |
+| 其余 18 项（`supportsStore`/`supportsDeveloperRole`/`sendSessionAffinityHeaders`/`maxTokensField`/`cacheControlFormat`/`requiresToolResultName`/...全表） | ⚠️ 面板可编辑、schema loose 容忍存储，**harness 不消费**（存了不报错但不生效） | `packages/llm` 0 处引用 |
 
-典型禁用场景：Ollama/vLLM/中转站不吃 `developer` role 或 `reasoning_effort` → `supportsDeveloperRole: false` + `supportsReasoningEffort: false`。
+注意两点：
+
+1. **`thinkingFormat` 面板下拉列表有陷阱**：client `TF` 列表含 `chat-template`/`qwen-chat-template`，但 harness `THINKING_FORMAT_GATE` 明确将其 withheld（实测 schema 拒绝），选中后保存整包失败；另有「— 默认 —」选项写出空串 `''` 同样被 schema 拒绝。待修（见踩坑表）。
+2. 旧版「全部真实生效，均有内核证据」的说法是**错的**——当时验证的是 pi 上游库的字段面，未区分「pi-ai 类型存在」与「harness profile schema 暴露」两层。典型误用：`sendSessionAffinityHeaders`（会话亲和头）存了毫无效果，KV 缓存命中率专题 §6.3 的「会话亲和」建议不成立。
+
+典型禁用场景（真实有效部分）：Ollama/vLLM/中转站不吃 `reasoning_effort` → `supportsReasoningEffort: false`（✅ 生效）；换思考调度线格式 → `thinkingFormat: deepseek/openrouter/...`（✅ 生效，8 种非 withheld 格式）。
 
 ---
 
@@ -350,21 +403,21 @@ DSH `llm-pi-ai` 官方三协议（`PROTOCOLS` 定义）：
 2. **每回合运行时上下文注入**：`{kind:"inject", form:"snapshot", name:"@deepseek-ai/dsh-system-prompt"}` + `cordis-host-runner` 的 context 注入每回合变化（policy/approval/goal），以替换语义写进消息面 → 每回合从该位置起前缀失效。这是 agent-loop 核心行为，插件层不可移除。
 3. **中转站节点漂移**：无会话亲和的第三方中转把连续请求轮询到不同副本，前缀再稳定也命中不了其他机器的缓存。~1% ≈ 连续两轮碰巧同副本。**中途换模型路由**（`DeepSeek-V4-Pro-0813-think → deepseek-v4-flash-vision-exp`）则直接切换缓存域。
 
-### 6.3 提升命中率四件套（面板已齐全）
+### 6.3 提升命中率四件套（2026-09 修正：仅 ① 真实生效）
 
 ```yaml
 # lucky-gemini 示例
 lucky-gemini:
   api: openai-completions
   baseURL: https://new.lucky0625.qzz.io/v1
-  cacheRetention: long                    # ① 面板：供应商高级选项 → Prompt 缓存保留
+  cacheRetention: long                    # ① ✅ 真实生效：adapter.ts:92 直接透传 profile.cacheRetention 给 pi-ai
   compat:
-    cacheControlFormat: anthropic         # ② Compat → 缓存控制协议规范
-    supportsLongCacheRetention: true      # ③ Compat → 支持长周期 Prompt 缓存
-    sendSessionAffinityHeaders: true      # ④ Compat → 会话亲和头
+    cacheControlFormat: anthropic         # ② ⚠️ 死配置：harness 不透传（PiAiCompatProfile 只有 2 字段，见 5.4 修正）
+    supportsLongCacheRetention: true      # ③ ⚠️ 死配置：同上
+    sendSessionAffinityHeaders: true      # ④ ⚠️ 死配置：同上
 ```
 
-内核逻辑（`openai-completions.js:519`）：`prompt_cache_key` 仅对 `api.openai.com` 自动挂载，第三方中转必须显式 `cacheRetention !== "none"` 才走缓存路径；`cacheControlFormat: "anthropic"` 才会在 system/最后工具/最后消息打 `cache_control` 断点。
+内核证据复核：`prompt_cache_key` / `cache_control` 的调度逻辑在 pi-ai 上游 vendor 库（原文「openai-completions.js:519」），但插件 profile 里 compat 的 ②③④ 字段 harness 根本不透传给 pi-ai（`resolveModelCompat` 只取 thinkingFormat + supportsReasoningEffort，其余丢在 profile 层）——**只有 ①`cacheRetention` 走 `ResolvedPiAiProviderProfile` 直达 pi-ai**。想要 ②③④ 生效需要上游把 compat 字段面扩到 PiAiCompatProfile（可作为与 patchNode 键序 PR 并行的另一个上游议题）。
 
 ### 6.4 治本建议
 
