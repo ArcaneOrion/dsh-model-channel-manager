@@ -175,7 +175,8 @@ stale      = 本地已配但端点已下线    → 默认不勾，提交清理
 - 剔除空 id 的占位模型行、空字符串字段、非法 0 值超时；
 - `apiKeyEnv` 走 `normalizeCredentialRef` 归一化（见 [3.8](#38-凭据引用归一化)）；
 - `headers` 原样保存（默认头仅在新增供应商时注入一次，见 [3.9](#39-默认请求头)；仅剔空键与 UA）；
-- `compat` / `reasoningEfforts` 仅保留非空对象。
+- **字段基底 = 原值浅拷贝再覆盖面板字段**（踩坑 #26）：thinkingBudgets/retryPolicy/modelOverrides/defaultInput 等手工配置的 schema 合法字段不在面板范围，从零重建 + unset-all/set-all mutate 会把它们真删；空值语义靠「覆盖后删键」而非「白名单忽略」；
+- `compat` 只留真实生效的 thinkingFormat / supportsReasoningEffort 两键（踩坑 #25）：空串（「— 默认 —」）与 withheld 格式剔除，其余 18 个 harness 不消费的字段不写入；`reasoningEfforts` 仅保留非空对象。
 
 **提交**（llm-pi-ai 专用路径，源码 `dsh-settings/lib/index.js` 实证）：
 
@@ -318,7 +319,11 @@ export const credentialRefNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*
 | 22 | 编辑器删掉的默认请求头保存后又回来 | 加载/保存两处无条件 `Object.assign({}, DEFAULT_HEADERS, p.headers)` | 默认头只在新增供应商注入一次；保存原样保留用户 headers（仅剔空键与 UA） |
 | 23 | 轮询组流量几乎不进健康统计 | 引擎提前终止的内层流不被全局拦截器完整排水 | `streamAttempt` 侧对超时/首响应前失败/成功自行 `recordHealth` |
 | 24 | 拖拽顺序重启还原（文件层零 diff） | settings-file `patchNode` 对 map 键序盲：纯重排 = 零 diff，`setIn` 不挪位、新键只 append；顺序只活在 host 内存 | `providerOrder` 数组持久化（见 3.7/3.7.1）；原生页无排序交互，顺序由 directory 恒定 |
-| 25 | compat 编辑器 20 字段里 18 个是死开关，文档曾误称「全部真实生效」 | `PiAiCompatProfile` 只声明并消费 thinkingFormat + supportsReasoningEffort 两个字段；其余字段 schema loose 容忍存储但 harness 0 处引用 | 面板待修：删除或标注死字段（P0 待办）；`thinkingFormat` 下拉含 withheld 的 chat-template/qwen-chat-template + 空串「切回默认」，选中即整包保存失败（P0 待办） |
+| 25 | compat 编辑器 20 字段里 18 个是死开关，文档曾误称「全部真实生效」 | `PiAiCompatProfile` 只声明并消费 thinkingFormat + supportsReasoningEffort 两个字段；其余字段 schema loose 容忍存储但 harness 0 处引用 | ✅ 已修：编辑器只留 2 个真字段 + 说明文案；save() cleanCompat 净化（剔死字段/空串/withheld 格式）；TF 删 chat-template/qwen-chat-template |
+| 26 | save() 从零重建 provider 对象 + unset-all/set-all mutate，手工配置的面板外字段（thinkingBudgets/retryPolicy/modelOverrides/defaultInput）任何一次保存都被整批静默删除（含只改轮询组的保存） | mutate 是真删不是 merge；白名单重建丢字段 | ✅ 已修：pObj 基底改为 `{...pVal}` 浅拷贝再覆盖面板字段，模型对象同理；空值语义靠覆盖/删键而非忽略 |
+| 27 | timeoutMs>30s 与动态超时（min(120s, ttft×2)）整条失效 | streamAttempt guard 曾 cap 到 `Math.min(remaining, 30000)`，到点即抛 TIMEOUT 不重 arm | ✅ 已修：guard 覆盖全量 remaining（对照 measureCandidate 用满 st.timeoutMs 的行为） |
+| 28 | 用户主动中止被记为渠道失败，污染成功率与 smart 键 reliability | 拦截器 catch 无差别 recordHealth(ok:false)；aborted 终止块同理 | ✅ 已修：isAbortLike 三形态（signal.aborted / code ABORTED / name AbortError / message 正则）+ 终止块 lastError ABORTED 跳过 |
+| 29 | 连续两测试并发完成时 testResults 仍可能互相覆盖 | done() read-merge-write 整包 update 依赖调用方快照 | ✅ 已修：setResult 走 mutate path-ops 原子写单 nonce（对 settings 队列现势作用）；prune 改低频（>50 才砍） |
 
 ---
 
