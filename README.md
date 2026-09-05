@@ -3,7 +3,7 @@
 DSH 原生模型渠道管理。两半结构：
 
 - **host 半** `src/index.js`：轮询故障转移引擎（`llm.registerAdapter` 虚拟路由 `roundrobin/<组id>`）+ 7 天健康流水 + 测速排序 + 单模型真实请求测试通道。
-- **client 半** `src/client.js`：`conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试）、**轮询渠道**（groups 编辑 + ⚡测速）、**健康统计**（7 天聚合）。
+- **client 半** `src/client.js`：① `conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试）、**轮询渠道**（groups 编辑 + ⚡测速）、**健康统计**（7 天聚合）；② **会话模型选择器**（搜索增强，替换原生 `conversation.input.model` 座位：搜索框过滤模型/供应商/描述 + 近 7 天最近使用 provider 置顶，复用原生 directory 数据流）。
 
 语义参考 pi 的 `pi-provider-manager`，但完全走 DSH 原生 seam（无独立 HTTP 服务/端口/token）：
 
@@ -101,7 +101,8 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 测速结果不入健康流水（pi 记）；smart 键只统计真实请求
 - 配置里 provider 必须非虚拟路由（防自引用）
 - 轮询渠道/健康统计面板需要 host 新代码（重启后生效）；健康流水的数据在**实际请求过轮询组**后才出现
-- `reasoningEfforts` 缺失（undefined）的 model 正常渲染（`|| {}` 兜底）
+- `reasoningEfforts` 缺失（undefined）的 model 正确渲染（`|| {}` 兜底）
+- 会话模型选择器搜索版替换原生 ModelSelect（`conversation.input.model` 座位，`replaceRisk: shadows-shipped-ui`）：原生组件升级不自动跟随；effort 档位切换暂未实现（原生 ModelSelect 有，需要时可在菜单项内加二级）；/model 弹窗入口仍是原生平铺
 
 ## 踩坑速记（本项目，按严重程度）
 

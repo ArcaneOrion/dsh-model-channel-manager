@@ -6,7 +6,7 @@
 window.__ModuleLoader__.load({
   id: '@arcaneorion/dsh-model-channel-manager',
   factory: (require) => {
-    const { createElement: el, useState, useEffect } = require('react')
+    const { createElement: el, useState, useEffect, useRef, useSyncExternalStore } = require('react')
     let apiRef = null
     const savedKeys = {}
 
@@ -68,6 +68,31 @@ window.__ModuleLoader__.load({
 .mcm-modal-b { padding:18px 20px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:12px; }
 .mcm-modal-f { padding:12px 20px; border-top:1px solid var(--dsw-alias-border-l1); display:flex; justify-content:flex-end; gap:8px; background:var(--dsw-alias-bg-layer-1); }
 .mcm-empty { color:var(--dsw-alias-label-tertiary); padding:32px 16px; text-align:center; font-size:13px; }
+.mcm-sel-root { position:relative; }
+.mcm-sel-trigger { box-sizing:border-box; height:30px; border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:8px; padding:0 10px 0 12px; font:inherit; font-size:12px; cursor:pointer; display:inline-flex; align-items:center; gap:6px; max-width:220px; transition:all 0.15s ease; }
+.mcm-sel-trigger:hover { background:var(--dsw-alias-interactive-bg-hover); border-color:var(--dsw-alias-border-l3); }
+.mcm-sel-trigger:disabled { opacity:0.5; cursor:not-allowed; }
+.mcm-sel-trigger-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mcm-sel-trigger-eff { color:var(--dsw-alias-label-tertiary); font-size:11px; }
+.mcm-sel-caret { font-size:9px; color:var(--dsw-alias-label-tertiary); transition:transform 0.15s ease; flex-shrink:0; }
+.mcm-sel-menu { position:absolute; right:0; top:calc(100% + 6px); z-index:1200; background:var(--dsw-alias-bg-layer-1); border:1px solid var(--dsw-alias-border-l2); border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,0.18); width:340px; max-height:420px; display:flex; flex-direction:column; overflow:hidden; }
+.mcm-sel-search { padding:10px 12px; border-bottom:1px solid var(--dsw-alias-border-l1); flex-shrink:0; display:flex; gap:8px; align-items:center; background:var(--dsw-alias-bg-layer-2); }
+.mcm-sel-search input { flex:1; box-sizing:border-box; border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:8px; height:30px; padding:0 10px; font:inherit; font-size:12px; outline:none; }
+.mcm-sel-search input:focus { border-color:var(--dsw-alias-brand-primary); }
+.mcm-sel-clear { border:none; background:none; color:var(--dsw-alias-label-tertiary); cursor:pointer; font-size:12px; padding:2px 4px; }
+.mcm-sel-clear:hover { color:var(--dsw-alias-label-primary); }
+.mcm-sel-list { flex:1; overflow-y:auto; padding:4px 0; }
+.mcm-sel-group { padding:6px 12px 2px; font-size:10px; font-weight:600; color:var(--dsw-alias-label-dimmed); text-transform:uppercase; letter-spacing:0.4px; display:flex; align-items:center; gap:6px; }
+.mcm-sel-group .mcm-sel-recent { color:var(--dsw-alias-brand-primary); font-size:9px; font-weight:500; text-transform:none; letter-spacing:0; }
+.mcm-sel-opt { display:flex; align-items:center; gap:8px; width:100%; text-align:left; box-sizing:border-box; padding:7px 12px; font:inherit; font-size:12px; cursor:pointer; border:none; background:transparent; color:var(--dsw-alias-label-primary); }
+.mcm-sel-opt:hover { background:var(--dsw-alias-interactive-bg-hover); }
+.mcm-sel-opt.sel { background:rgba(var(--dsw-rgb-brand-primary, 59, 130, 246), 0.08); }
+.mcm-sel-opt-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mcm-sel-opt-desc { color:var(--dsw-alias-label-tertiary); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mcm-sel-check { color:var(--dsw-alias-brand-primary); font-size:12px; flex-shrink:0; }
+.mcm-sel-foot { padding:6px 12px; border-top:1px solid var(--dsw-alias-border-l1); font-size:10px; color:var(--dsw-alias-label-dimmed); display:flex; justify-content:space-between; flex-shrink:0; background:var(--dsw-alias-bg-layer-2); }
+.mcm-sel-status { padding:14px 12px; font-size:12px; color:var(--dsw-alias-label-tertiary); text-align:center; }
+.mcm-sel-hl { color:var(--dsw-alias-brand-primary); font-weight:600; }
 .mcm-spin { width:18px; height:18px; border:2px solid var(--dsw-alias-border-l2); border-top-color:var(--dsw-alias-brand-primary); border-radius:50%; animation:mcm-spin .8s linear infinite; display:inline-block; }
 @keyframes mcm-spin { to { transform:rotate(360deg); } }
 `
@@ -1298,6 +1323,190 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---------- 会话模型选择器（搜索增强，替换原生 conversation.input.model 座位） ----------
+    // 置顶数据源：model-channel-health records 最近 7 天成功调用的 provider，按 lastTs 降序去重。
+    // 与面板分开自持拉取（selector 是独立组件树，不共享 ModelConfigView 的 state）。
+    let selHealthCache = { at: 0, order: [] }
+    const pullRecentProviders = (force) => {
+      if (!apiRef) return Promise.resolve(selHealthCache.order)
+      const now = Date.now()
+      if (!force && now - selHealthCache.at < 30000 && selHealthCache.order.length > 0) return Promise.resolve(selHealthCache.order)
+      return apiRef.settings.describe({}).then((resp) => {
+        const r = resp && resp.result ? resp.result : resp
+        if (r && r.ok === false) return selHealthCache.order
+        const d = r && r.value !== undefined ? r.value : r
+        const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
+        const recs = (hn && hn.value && hn.value.records) || {}
+        const cutoff = now - 7 * 24 * 3600 * 1000
+        const last = new Map()
+        for (const evs of Object.values(recs)) {
+          for (const e of (evs || [])) {
+            if (!e || !e.provider || !e.ts || e.ts < cutoff) continue
+            if (!e.ok) continue
+            if (!last.has(e.provider) || (e.ts || 0) > last.get(e.provider)) last.set(e.provider, e.ts)
+          }
+        }
+        const order = [...last.entries()].sort((a, b) => b[1] - a[1]).map((x) => x[0])
+        selHealthCache = { at: now, order }
+        return order
+      }).catch(() => selHealthCache.order)
+    }
+
+    // 高亮匹配片段：返回 children 数组（文本 + 高亮 span）
+    const hlParts = (text, q) => {
+      if (!q || !text) return [text]
+      const s = String(text)
+      const i = s.toLowerCase().indexOf(q)
+      if (i < 0) return [s]
+      return [s.slice(0, i), el('span', { className: 'mcm-sel-hl' }, s.slice(i, i + q.length)), s.slice(i + q.length)]
+    }
+
+    function SearchModelSelect(props) {
+      const available = props.available !== false
+      const directory = props.directory
+      const load = props.load
+      const select = props.select
+      const locked = props.locked === true
+      const useStore = (directory && directory.subscribe && directory.getSnapshot) ? directory : null
+      const state = useSyncExternalStore((fn) => useStore.subscribe(fn), () => useStore.getSnapshot())
+      const [open, setOpen] = useState(false)
+      const [q, setQ] = useState('')
+      const [recent, setRecent] = useState([])
+      const rootRef = useRef(null)
+      const searchRef = useRef(null)
+      const listRef = useRef(null)
+      const qLower = q.trim().toLowerCase()
+
+      // 打开菜单时：加载目录 + 刷新置顶（强制）
+      useEffect(() => {
+        if (!open) return
+        if (load) load()
+        pullRecentProviders(true).then(setRecent)
+        queueMicrotask(() => { if (searchRef.current) searchRef.current.focus() })
+      }, [open])
+      // 外点关闭
+      useEffect(() => {
+        if (!open) return
+        const closeOutside = (e) => { if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false) }
+        document.addEventListener('mousedown', closeOutside)
+        return () => document.removeEventListener('mousedown', closeOutside)
+      }, [open])
+      // 关闭时清空搜索
+      useEffect(() => { if (!open) setQ('') }, [open])
+
+      if (!available) return null
+      const groups = (state && state.groups) || []
+      const current = state && state.current
+      // 置顶：最近使用 provider 集合（仅无搜索时重排）
+      const recentSet = new Set(recent)
+      const matches = (group, model) => {
+        if (!qLower) return true
+        return (group.name || group.id || '').toLowerCase().includes(qLower) || (model.name || '').toLowerCase().includes(qLower) || (model.id || '').toLowerCase().includes(qLower) || (model.description || '').toLowerCase().includes(qLower)
+      }
+      let ordered = groups
+      if (!qLower && recentSet.size > 0) {
+        // 按 recent 顺序重排组（未在 recent 的按原序 append）
+        const rank = new Map(recent.map((p, i) => [p, i]))
+        ordered = groups.slice().sort((a, b) => {
+          const ra = rank.has(a.id) ? rank.get(a.id) : 1e9
+          const rb = rank.has(b.id) ? rank.get(b.id) : 1e9
+          return ra - rb
+        })
+      }
+      // 渲染体：过滤后的组列表（搜索时含匹配的组+模型；无搜索时全量+置顶标记）
+      const sections = []
+      for (const g of ordered) {
+        const rows = (g.models || []).filter((m) => matches(g, m))
+        if (rows.length === 0) continue
+        if (qLower && !rows.some((m) => (m.name || '').toLowerCase().includes(qLower) || (m.id || '').toLowerCase().includes(qLower) || (m.description || '').toLowerCase().includes(qLower)) && !(g.name || g.id || '').toLowerCase().includes(qLower)) {
+          // 组名不匹配且无匹配模型时不渲染（防空白组）
+        }
+        const isTop = !qLower && recentSet.has(g.id)
+        sections.push({ g, rows, isTop })
+      }
+      const currentChoice = (() => {
+        for (const g of groups) {
+          if (g.id === (current && current.provider)) {
+            const m = (g.models || []).find((mm) => mm.id === (current && current.model))
+            if (m) return { g, m }
+          }
+        }
+        return null
+      })()
+      const modelLabel = currentChoice ? (currentChoice.m.name || currentChoice.m.id) : '模型'
+      const busy = state && state.status === 'selecting'
+      const choose = (provider, model) => {
+        if (current && current.provider === provider && current.model === model) { setOpen(false); return }
+        if (!select) return
+        Promise.resolve(select({ provider, model })).then(() => { setOpen(false) }).catch(() => {})
+      }
+      // 键盘：Escape 关闭；↑↓ 在列表项间移动焦点
+      const onKeyDown = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); setOpen(false) }
+        else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && listRef.current) {
+          e.preventDefault()
+          const items = listRef.current.querySelectorAll('.mcm-sel-opt')
+          const arr = Array.from(items)
+          if (arr.length === 0) return
+          const active = arr.findIndex((it) => it === document.activeElement)
+          const next = (Math.max(active, 0) + (e.key === 'ArrowDown' ? 1 : -1) + arr.length) % arr.length
+          arr[next].focus()
+        }
+      }
+
+      return el('div', { className: 'mcm-sel-root', ref: rootRef, onKeyDown },
+        el('button', {
+          className: 'mcm-sel-trigger', type: 'button', disabled: locked, title: modelLabel,
+          'aria-haspopup': 'menu', 'aria-expanded': open,
+          onClick: () => setOpen((v) => !v)
+        },
+          el('span', { className: 'mcm-sel-trigger-label' }, modelLabel),
+          el('span', { className: 'mcm-sel-caret', style: open ? { transform: 'rotate(180deg)' } : undefined }, '▼')
+        ),
+        open ? el('div', { className: 'mcm-sel-menu', role: 'menu' },
+          el('div', { className: 'mcm-sel-search' },
+            el('input', {
+              ref: searchRef, placeholder: '搜索模型 / 供应商…', value: q,
+              onChange: (e) => setQ(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === 'Escape') { e.preventDefault(); setOpen(false) }
+                else if (e.key === 'ArrowDown') { e.preventDefault(); const it = listRef.current && listRef.current.querySelector('.mcm-sel-opt'); if (it) it.focus() }
+              }
+            }),
+            q ? el('button', { className: 'mcm-sel-clear', type: 'button', onClick: () => setQ('') }, '✕') : null
+          ),
+          el('div', { className: 'mcm-sel-list', ref: listRef },
+            state && state.status === 'loading' ? el('div', { className: 'mcm-sel-status' }, '加载目录中…') :
+            sections.length === 0 ? el('div', { className: 'mcm-sel-status' }, qLower ? '无匹配「' + q.trim() + '」的模型' : '暂无可用模型') :
+            sections.map(({ g, rows, isTop }) =>
+              el('div', { key: g.id },
+                el('div', { className: 'mcm-sel-group' },
+                  el('span', null, hlParts(g.name || g.id, qLower)),
+                  isTop ? el('span', { className: 'mcm-sel-recent' }, '· 最近') : null
+                ),
+                rows.map((m) => {
+                  const sel = current && current.provider === g.id && current.model === m.id
+                  return el('button', {
+                    key: m.id, className: 'mcm-sel-opt' + (sel ? ' sel' : ''), type: 'button', role: 'menuitemradio', 'aria-checked': sel,
+                    title: m.id, disabled: busy,
+                    onClick: () => choose(g.id, m.id)
+                  },
+                    el('span', { className: 'mcm-sel-opt-name' }, hlParts(m.name || m.id, qLower)),
+                    m.description ? el('span', { className: 'mcm-sel-opt-desc' }, m.description) : null,
+                    sel ? el('span', { className: 'mcm-sel-check' }, '✓') : null
+                  )
+                })
+              )
+            )
+          ),
+          el('div', { className: 'mcm-sel-foot' },
+            el('span', null, sections.reduce((n, s) => n + s.rows.length, 0) + ' 个模型'),
+            el('span', null, recent.length > 0 && !qLower ? '置顶：近 7 天使用' : '')
+          )
+        ) : null
+      )
+    }
+
     function apply(ctx) {
       const connection = ctx.get('connection')
       apiRef = connection && connection.api ? connection.api : null
@@ -1310,6 +1519,14 @@ window.__ModuleLoader__.load({
       }, 'model-config: styles')
       const slots = ctx.get('slots')
       if (!slots) return
+      // 会话模型选择器座位替换：插件 entry priority 低于 shipped（slot 系规则），同名注册
+      // 即占领 conversation.input.model（单占位 seat，replaceRisk: shadows-shipped-ui，官方支持路径）。
+      // 组件复用声明方注入的 directory/load/select（谁占座谁收到，不会出现两套状态）；
+      // /model 弹窗入口不动（两入口共享同一 directory store，行为一致）。
+      slots.inject('conversation.input.model', () => slots.register(
+        { name: 'conversation.input.model', id: 'mcm-search-select' },
+        (p) => el(SearchModelSelect, p)
+      ))
       slots.inject('conversation.view', () => slots.register(
         { name: 'conversation.view', id: 'models', order: 25, label: '模型配置' },
         (p) => el(ModelConfigView, p)
