@@ -700,12 +700,29 @@ export function apply(ctx) {
         const last = next.lastTestHandledNonce || 0;
         if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || typeof req.nonce !== 'number' || req.nonce === last)
             return;
-        settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch(() => { });
-        // 结果写入走 mutate path-ops 原子设置单 nonce：read-merge-write 整包 update 在
-        // 两个测试并发完成时会互相覆盖（读旧包→写入丢掉对方 nonce）；path-ops 对
-        // settings 队列中的 section 现势作用，不再依赖调用方快照
-        const setResult = (entry) => {
-            settings.mutate(NS_HEALTH, [{ op: 'set', path: ['testResults', String(req.nonce)], value: Object.assign({}, entry, { nonce: req.nonce, provider: req.provider, model: req.model }) }]).catch(() => { });
+        settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
+        // 结果写入：首选 mutate path-ops 原子设置单 nonce（并发测试互不覆盖）。
+        // 实测踩坑（#21 同源）：部分运行时（rc.2 file provider）会静默拒绝 mutate——
+        // promise 正常 resolve 但条目未落盘。故写后回读校验，未落上则回退 update
+        // 合并写（现势整段 + 本条目），保证结果必然可被 client 轮询读到。
+        let mutateWorks = null;
+        const setResult = async (entry) => {
+            const key = String(req.nonce);
+            const value = Object.assign({}, entry, { nonce: req.nonce, provider: req.provider, model: req.model });
+            const cur = (bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {};
+            if (mutateWorks !== false) {
+                try {
+                    await settings.mutate(NS_HEALTH, [{ op: 'set', path: ['testResults', key], value }]);
+                    const landed = ((bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {})[key];
+                    if (landed) { mutateWorks = true; return; }
+                    mutateWorks = false;
+                    console.error('[model-channel-manager] testResults mutate 未生效，回退 update 合并写');
+                } catch (e) {
+                    mutateWorks = false;
+                    console.error('[model-channel-manager] testResults mutate 失败，回退 update 合并写:', e);
+                }
+            }
+            await settings.update(NS_HEALTH, { testResults: Object.assign({}, cur, { [key]: value }) }).catch((e) => console.error('[model-channel-manager] testResults update 兜底写入失败:', e));
         };
         // 修剪低频执行：只在条目数超限时砍到 50（不在每次写入时整包重写）
         const maybePrune = () => {
@@ -713,17 +730,23 @@ export function apply(ctx) {
             const entries = Object.entries(all);
             if (entries.length <= 50) return;
             const drop = entries.sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(50).map(([k]) => ({ op: 'unset', path: ['testResults', String(k)] }));
-            if (drop.length > 0)
-                settings.mutate(NS_HEALTH, drop).catch(() => { });
+            if (drop.length === 0) return;
+            if (mutateWorks === false) {
+                const kept = {};
+                for (const [k, v] of entries.slice(0, 50)) kept[k] = v;
+                settings.update(NS_HEALTH, { testResults: kept }).catch((e) => console.error('[model-channel-manager] testResults 修剪 update 失败:', e));
+                return;
+            }
+            settings.mutate(NS_HEALTH, drop).catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
         };
         const done = async (r) => {
             try {
-                setResult(Object.assign({}, r, { finishedAt: Date.now() }));
+                await setResult(Object.assign({}, r, { finishedAt: Date.now() }));
                 maybePrune();
             }
             catch (_e) { }
         };
-        setResult({ status: 'running', startedAt: Date.now() });
+        void setResult({ status: 'running', startedAt: Date.now() });
         runModelTest(req.provider, req.model, req.prompt, req.maxTokens).then(async (r) => {
             await done(Object.assign({ status: 'ok' }, r));
         }).catch(async (e) => {
