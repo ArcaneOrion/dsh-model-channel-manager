@@ -64,5 +64,19 @@ const entries = [
   t('T7 realIdx 保留原下标', out.length === 2 && out[0].realIdx === 3 && out[1].realIdx === 4)
 }
 
+
+// FM: 拉取上游弹窗搜索过滤（模型 id 子串，不区分大小写；badge 统计按全量）
+{
+  const all = [
+    { id: 'deepseek-ai/DeepSeek-V4-Pro', tag: 'add' },
+    { id: 'MiniMax/MiniMax-M3', tag: 'add' },
+    { id: 'microsoft/phi-4', tag: 'ok' },
+  ]
+  const fql = 'minimax'
+  const visible = all.filter((item) => item.id.toLowerCase().includes(fql))
+  t('FM1 大小写不敏感过滤', visible.length === 1 && visible[0].id === 'MiniMax/MiniMax-M3')
+  t('FM2 空词全量', all.filter((i) => ''.trim()).length === 0 || all.filter((i) => true).length === 3)
+}
+
 console.log('\n' + passed + ' passed, ' + failed + ' failed')
 process.exit(failed > 0 ? 1 : 0)

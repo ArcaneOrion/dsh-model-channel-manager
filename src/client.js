@@ -310,7 +310,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function fetchModal(name, p, disc, setDisc, getTypedKey, onApply) {
+    function fetchModal(name, p, disc, setDisc, getTypedKey, onApply, fq, setFq) {
       if (!disc || disc.provider !== name) return null
       let body
       if (disc.loading) {
@@ -330,6 +330,9 @@ window.__ModuleLoader__.load({
           ...d.configured.map((id) => ({ id, tag: 'ok', txt: '✓ 已配置' })),
           ...d.stale.map((id) => ({ id, tag: 'stale', txt: '! 端点已下线' }))
         ]
+        // 搜索过滤：模型 id 子串匹配（不区分大小写）；badge 统计仍按全量
+        const fql = (fq || '').trim().toLowerCase()
+        const visible = fql ? all.filter((item) => item.id.toLowerCase().includes(fql)) : all
         const toggle = (item) => {
           const s = new Set(d.selected)
           if (s.has(item.id)) { s.delete(item.id) } else { s.add(item.id) }
@@ -342,10 +345,17 @@ window.__ModuleLoader__.load({
             el('span', { className: 'mcm-badge brand' }, '+ 可新增: ' + d.missing.length),
             d.stale.length > 0 ? el('span', { className: 'mcm-badge error' }, '! 端点无此模型: ' + d.stale.length) : null
           ),
+          el('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+            el('input', {
+              className: 'mcm-in', style: { flex: 1 }, placeholder: '搜索模型 id…（不区分大小写）', value: fq || '',
+              onChange: (e) => setFq(e.target.value)
+            }),
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', flexShrink: 0 } }, '显示 ' + visible.length + ' / ' + all.length)
+          ),
           el('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } }, '说明：勾选 = 保留或添加；取消勾选 = 删除。已配置项默认勾选。'),
           el('div', { style: { maxHeight: 300, overflowY: 'auto', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-1)' } },
-            all.length === 0 ? el('div', { className: 'mcm-empty' }, '端点未返回任何可用模型') :
-            all.map((item) => {
+            visible.length === 0 ? el('div', { className: 'mcm-empty' }, fql ? '无匹配「' + fq.trim() + '」的模型' : '端点未返回任何可用模型') :
+            visible.map((item) => {
               const checked = d.selected.has(item.id)
               return el('div', {
                 key: item.id,
@@ -417,6 +427,8 @@ window.__ModuleLoader__.load({
       const [dragIdx, setDragIdx] = useState(null)
       const [overIdx, setOverIdx] = useState(null)
       const [pq, setPq] = useState('')
+      // 拉取上游模型弹窗的搜索词（打开新弹窗时复位）
+      const [fq, setFq] = useState('')
       const providers = draft || {}
 
       // 拖动排序：provider 字典保序重建（对象键插入顺序即 YAML/JSON 持久化顺序）
@@ -648,7 +660,7 @@ window.__ModuleLoader__.load({
               el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 } },
                 el('span', { style: { fontWeight: 600, fontSize: 13 } }, '模型列表 (' + models.length + ')'),
                 el('div', { style: { display: 'flex', gap: 6 } },
-                  btn('🔍 拉取上游模型', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, keyInput[name]) }, 'primary'),
+                  btn('🔍 拉取上游模型', () => { setFq(''); setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, keyInput[name]) }, 'primary'),
                   btn('＋添加模型', () => updateP(name, { models: models.concat([{ id: '', name: '', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } }]) }))
                 )
               ),
@@ -665,7 +677,7 @@ window.__ModuleLoader__.load({
                   reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' }
                 }))
                 updateP(name, { models: kept.concat(news) })
-              }),
+              }, fq, setFq),
               models.map((m, mi) => {
                 const isMOpen = !!em[name + '::' + mi]
                 const ts = testStates[name + '::' + m.id]
