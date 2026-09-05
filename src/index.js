@@ -588,6 +588,22 @@ export function apply(ctx) {
         }
     }
     // ---------- LLM 适配器（虚拟 route 注册） ----------
+    // 模型元数据解析。config 显式传入：resolveModel 用现势 pullConfig()，
+    // prepareCall 用准备时刻的快照——「prepare 与 dispatch 间 settings 变化不得混代」。
+    function resolveModelWith(config, provider, model) {
+        const id = groupOfRoute(provider) || provider;
+        const cfg = config.groups.find((g) => g.id === id);
+        if (!cfg)
+            return { provider, id: model, name: model };
+        const levels = cfg.virtualModel.reasoning ? ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] : [];
+        return {
+            provider, id: model, name: cfg.virtualModel.name,
+            context: { contextWindow: cfg.virtualModel.contextWindow },
+            defaultMaxTokens: cfg.virtualModel.maxTokens,
+            inputModalities: cfg.virtualModel.input.slice(),
+            reasoning: levels.length > 0 ? { efforts: levels.map((l) => ({ id: l, name: l })), defaultEffort: 'medium' } : undefined,
+        };
+    }
     const adapter = {
         providerInfo(provider) {
             const id = groupOfRoute(provider) || provider;
@@ -602,19 +618,23 @@ export function apply(ctx) {
                 return [];
             return [{ provider, id: cfg.id, name: cfg.virtualModel.name, inputModalities: cfg.virtualModel.input.slice() }];
         },
-        async resolveModel(provider, model) {
-            const id = groupOfRoute(provider) || provider;
-            const cfg = pullConfig().groups.find((g) => g.id === id);
-            if (!cfg)
-                return { provider, id: model, name: model };
-            const levels = cfg.virtualModel.reasoning ? ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] : [];
-            return {
-                provider, id: model, name: cfg.virtualModel.name,
-                context: { contextWindow: cfg.virtualModel.contextWindow },
-                defaultMaxTokens: cfg.virtualModel.maxTokens,
-                inputModalities: cfg.virtualModel.input.slice(),
-                reasoning: levels.length > 0 ? { efforts: levels.map((l) => ({ id: l, name: l })), defaultEffort: 'medium' } : undefined,
-            };
+        async resolveModel(provider, model, _signal) {
+            return resolveModelWith(pullConfig(), provider, model);
+        },
+        // rc.2 运行时契约：主分发路径（llm.stream / llm.prepareCall）都先调
+        // adapter.prepareCall(provider, model, signal) 拿 {model, stream}——
+        // 缺失会在真实发对话时报 `registration.adapter.prepareCall is not a function`
+        // （注册/目录/菜单不经过它，所以此前未暴露）。快照绑定对齐 llm-pi-ai 的
+        // current() 模式：元数据与本次 dispatch 都用同一份组配置。
+        prepareCall(provider, model, _signal) {
+            const snapshot = pullConfig();
+            const cfg = snapshot.groups.find((g) => g.id === groupOfRoute(provider));
+            return Promise.resolve({
+                model: resolveModelWith(snapshot, provider, model),
+                stream: (options) => cfg === undefined
+                    ? (async function* () { yield failChunk('unknown channel group "' + provider + '"', 'NO_ADAPTER'); })()
+                    : streamGroup(cfg, options),
+            });
         },
         stream(options) {
             const gid = groupOfRoute(options.provider);
