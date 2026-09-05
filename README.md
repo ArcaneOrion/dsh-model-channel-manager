@@ -119,3 +119,4 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 12. **新增项命名 N+1 撞键**：`Object.keys().length + 1` 在删除中间项后撞已有键（provider 覆盖草稿、group 被 host seen-set 静默去重消失）。用 `uniqueSuffixName` 取第一个未占用后缀。
 13. **超时 guard 必须 finally dispose**：`ctx.effect` 注册条目只有显式 disposer 才移除；`Promise.race` 超时路径跳过后面的 `guard.dispose()` 会按超时次数泄漏。race 包 try/finally。
 14. **引擎提前终止的内层流拦截器记不到账**：全局拦截器只有流被完整排水才写记录；引擎超时关闭/收到终止块即停的请求要在 `streamAttempt` 侧自行 `recordHealth`，否则轮询组流量几乎不进健康统计。
+15. **拖拽顺序不能依赖 map 键序落盘**：`@deepseek-ai/dsh-settings-file` 落盘是注释保留型叶子 diff（`patchNode`），对 map 键序是盲的——纯重排（值不变）在文件层是零 diff，`setIn` 对已存在键原地替换不挪位，新键只 append。settings 服务的内存 user 层顺序确实变了（运行中一切正常），但文件永远是创建时序，重启即还原。修复：**顺序存成数组数据**——`model-channels` ns 里 `providerOrder: [...]` 字段（数组走 wholesale replace 真实落盘），client 加载时按它重排渲染，未列出的 provider append 在后。llm-pi-ai 的 mutate 照旧（当次会话内存序即刻生效）。注：原生 Models 页本无拖拽交互，其顺序由 directory 决定（catalog 内置序 + settings 键序拼接）恒定；要原生排序持久需上游修 patchNode。回归测试见 `tests/provider-order-persistence.test.cjs`。

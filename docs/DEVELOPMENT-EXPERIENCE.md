@@ -203,6 +203,18 @@ await apiRef.settings.mutate({ ns: 'llm-pi-ai', ops });
 - 排序 = 保序重建字典：`const [item] = entries.splice(from,1); entries.splice(to,0,item)`，对象键插入序即内存序。
 - **持久化必须走 mutate 路径**（见 3.6），否则刷新即还原——但这只覆盖运行中会话。
 
+**持久化的文件层盲区与修复（2026-09）**：
+
+上游 `@deepseek-ai/dsh-settings-file` 落盘是注释保留型叶子 diff（`patchNode`）：map 分支按键递归、**键序不参与 diff**；纯重排（值不变）在文件层是零 diff，`setIn` 对已存在键原地替换不挪位，新键只 append。后果：拖拽顺序只活在 host 内存里（当次会话正常），文件永远是创建时序，**重启即还原**。验证与回归见 `tests/provider-order-persistence.test.cjs`（复刻 patchNode+mergeLayers+applyPathOp 链路）。
+
+修复方案（与 pi-provider-manager 的 rr candidates 数组同构——顺序存成数据而非元数据）：
+
+- `model-channels` ns 新增 `providerOrder: string[]` 字段（host CONFIG_SCHEMA 已声明，引擎不消费）。
+- `save()`：与 groups 同一次 update 写入 `providerOrder = Object.keys(cleanProviders)`。数组在 patchNode 下是 **deepEqual 不等即整值 setIn（原位、保序）**，真实落盘。
+- `refresh()`：按 `providerOrder` 重排 providers 渲染（未列出的 append 在后，防 order 过期丢供应商；order 全失效则回退文件键序）。
+- merge 语义下只 patch groups 不带 order 时旧 order 保留（实测），别的调用者不会误冲。
+- 已知边界：llm-pi-ai 文件键序仍是创建时序（map 盲区在上游）；**原生 Models 页**顺序由 directory 决定（catalog 内置序 + settings 键序两段拼接，无排序交互，详见 README 踩坑 #15）——要原生持久需上游修 patchNode（键序感知 diff）。
+
 ### 3.8 凭据引用归一化
 
 DSH apiproxy 的 zod（`credentials.schema.js`）：

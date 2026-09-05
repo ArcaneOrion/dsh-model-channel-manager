@@ -9,6 +9,10 @@ const CONFIG_SCHEMA = z.object({
     groups: z.array(z.object({
         id: z.string(),
     }).loose(true)).default([]),
+    // 面板供应商顺序的持久化载体：settings-file 的 patchNode 对 map 键序是盲的
+    // （纯重排 = 零 diff），但数组是 deepEqual 不等即整值 setIn（原位、保序）。
+    // 顺序存成数组数据而不是对象键序元数据，重启后从文件真实还原。引擎不消费它。
+    providerOrder: z.array(z.string()).default([]),
 }).loose(true);
 const HEALTH_SCHEMA = z.object({
     records: z.dict(z.array(z.any())).default({}),

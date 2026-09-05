@@ -1097,6 +1097,21 @@ window.__ModuleLoader__.load({
         return r && r.value !== undefined ? r.value : r
       }
 
+      // 按持久化的 providerOrder 重排 providers 的键序：settings-file 的 patchNode
+      // 对 map 键序盲（拖拽纯重排在文件层是零 diff），顺序由 model-channels ns 里的
+      // providerOrder 数组携带（数组 wholesale replace 真实落盘）。未列出的 provider
+      // append 在后（保持文件键序），防止 providerOrder 过期时丢供应商。
+      const applyProviderOrder = (providers, order) => {
+        if (!providers || !Array.isArray(order) || order.length === 0) return providers
+        const known = new Set(Object.keys(providers))
+        const ranked = order.filter((k) => known.has(k))
+        if (ranked.length === 0) return providers
+        const rest = Object.keys(providers).filter((k) => !ranked.includes(k))
+        const out = {}
+        for (const k of ranked.concat(rest)) out[k] = providers[k]
+        return out
+      }
+
       const refresh = () => {
         if (!apiRef) return
         apiRef.settings.describe({}).then((resp) => {
@@ -1104,12 +1119,13 @@ window.__ModuleLoader__.load({
           const nss = (d && d.namespaces) || []
           const findNs = (name) => nss.find((n) => n && n.ns === name)
           const ns = findNs('llm-pi-ai')
-          const providers = (ns && ns.value && ns.value.providers) || {}
+          const cn = findNs('model-channels')
+          const savedOrder = (cn && cn.value && Array.isArray(cn.value.providerOrder)) ? cn.value.providerOrder : null
+          const providers = applyProviderOrder((ns && ns.value && ns.value.providers) || {}, savedOrder)
           // user 层 = 仅用户手工声明的路由（用于真正删除与重排序的 mutate 依据）
           const userProviders = (ns && ns.user && ns.user.providers) || {}
-          setState({ providers, userProviders })
+          setState({ providers, userProviders, providerOrder: savedOrder || [] })
           setDraft((prev) => prev || clone(providers))
-          const cn = findNs('model-channels')
           const ch = (cn && cn.value && cn.value.groups) || []
           setChannels(ch)
           setChannelsDraft((prev) => prev || clone(ch))
@@ -1214,16 +1230,22 @@ window.__ModuleLoader__.load({
             return r
           })
         })() : Promise.resolve()
-        const p2 = channelsDraft ? apiRef.settings.update({ ns: 'model-channels', patch: { groups: channelsDraft } }).then((resp) => {
+        // 顺序持久化：patchNode 对 map 键序盲，拖拽顺序写进 providerOrder 数组（同一次 update 落盘）；
+        // 即使 channelsDraft 为空（无轮询组），只要 draft 非空也要写——这是排序的唯二持久化时机
+        const orderPatch = draft ? { providerOrder: Object.keys(cleanProviders) } : {}
+        const p2 = apiRef.settings.update({
+          ns: 'model-channels',
+          patch: Object.assign({ groups: channelsDraft || [] }, orderPatch)
+        }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'model-channels save failed')
           return r
-        }) : Promise.resolve()
+        })
         Promise.all([p1, p2]).then(() => {
           setNotice('已全部保存（即时生效）')
           // 同步草稿与状态为刚保存的清洗版本（含默认请求头合并结果）
           setDraft(clone(cleanProviders))
-          setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders }))
+          setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders, providerOrder: Object.keys(cleanProviders) }))
           setTimeout(() => setNotice(null), 3000)
           refresh()
         }).catch((e) => setNotice('保存失败: ' + String((e && e.message) || e))).finally(() => setSaving(false))
