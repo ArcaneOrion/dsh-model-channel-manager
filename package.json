@@ -1,7 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -11,6 +10,29 @@
   },
   "description": "DSH model channel manager: roundrobin failover engine (host) + model config view tab (client).",
   "license": "MIT",
+  "author": "arcanexis",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arcanexis/dsh-model-channel-manager.git"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "llm",
+    "roundrobin",
+    "failover",
+    "model"
+  ],
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": ">=3.18.2"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
