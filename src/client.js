@@ -1367,8 +1367,13 @@ window.__ModuleLoader__.load({
       const load = props.load
       const select = props.select
       const locked = props.locked === true
-      const useStore = (directory && directory.subscribe && directory.getSnapshot) ? directory : null
-      const state = useSyncExternalStore((fn) => useStore.subscribe(fn), () => useStore.getSnapshot())
+      const useStore = (directory && typeof directory.subscribe === 'function' && typeof directory.getSnapshot === 'function') ? directory : null
+      // directory 缺失时用哑 store 兼底：uSES 的 subscribe/getSnapshot 是惰性调用的，
+      // 传 null 会当场 TypeError（slot entry crashed）——哑 store 保持 hooks 顺序合法，
+      // 组件体后续对 useStore 为 null 的分支直接返回 null
+      const dummyStore = { subscribe: () => () => {}, getSnapshot: () => ({ groups: [], current: null, status: 'idle', failures: [], error: null, routable: null }) }
+      const safeStore = useStore || dummyStore
+      const state = useSyncExternalStore((fn) => safeStore.subscribe(fn), () => safeStore.getSnapshot())
       const [open, setOpen] = useState(false)
       const [q, setQ] = useState('')
       const [recent, setRecent] = useState([])
@@ -1524,12 +1529,38 @@ window.__ModuleLoader__.load({
       // 阴影规则：同 cell 多 entry 按 priority 升序，**数值最小者渲染**。原生无 priority = 0，
       // 插件要遮蔽它必须传负数（-1）。注意：动态包另有 guard 自动分配 priority 且禁止手传
       // （slot-catalog 规则「Do NOT pass priority」只适用于动态包），静态 bundle 必须自己传。
-      // 组件复用声明方注入的 directory/load/select（谁占座谁收到，不会出现两套状态）；
-      // /model 弹窗入口不动（两入口共享同一 directory store，行为一致）。
-      slots.inject('conversation.input.model', () => slots.register(
-        { name: 'conversation.input.model', id: 'mcm-search-select', priority: -1 },
-        (p) => el(SearchModelSelect, p)
-      ))
+      // **injected face 来自注册 options 的 inject 字段**（renderer 的 runInject 读 entry.inject，
+      // 与 slot 声明无关）：不传 → directory/load/select 全空 → useSyncExternalStore 崩 →
+      // slot entry crashed（实测踩坑 #20）。必须复刻原生 ui-model-selection 的 inject 契约。
+      // modelDirectories/sessions 是 context 仓库服务（ui-model-selection 注册的全局键），
+      // 静态 bundle 同树可 get。
+      ctx.inject(['modelDirectories', 'sessions'], (scope) => {
+        const models = scope.get('modelDirectories')
+        const sessions = scope.get('sessions')
+        if (!models || !sessions) return
+        slots.inject('conversation.input.model', () => slots.register(
+          {
+            name: 'conversation.input.model',
+            id: 'mcm-search-select',
+            priority: -1,
+            inject: (sessionId) => {
+              const directory = models.directoryFor(sessionId)
+              const available = sessions.subagentAddress(sessionId) === undefined
+              return {
+                available,
+                directory: directory.store,
+                load: () => {
+                  if (available) directory.load().catch(() => { /* surfaced on the store */ })
+                },
+                select: (selection) => available
+                  ? directory.select(selection).then(() => true, () => false)
+                  : Promise.resolve(false),
+              }
+            },
+          },
+          (p) => el(SearchModelSelect, p)
+        ))
+      })
       slots.inject('conversation.view', () => slots.register(
         { name: 'conversation.view', id: 'models', order: 25, label: '模型配置' },
         (p) => el(ModelConfigView, p)
