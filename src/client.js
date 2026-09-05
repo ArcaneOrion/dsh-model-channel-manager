@@ -77,8 +77,10 @@ window.__ModuleLoader__.load({
     const uniqueSuffixName = (prefix, taken) => { let i = 1; while (taken(prefix + i)) i++; return prefix + i }
     const APIS = ['openai-completions', 'openai-responses', 'anthropic-messages']
     const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-    const TF = ['openai', 'deepseek', 'openrouter', 'together', 'zai', 'qwen', 'chat-template', 'qwen-chat-template', 'string-thinking', 'ant-ling']
-    const MTF = ['max_completion_tokens', 'max_tokens']
+    // thinkingFormat 合法集合 = harness THINKING_FORMAT_GATE（8 项）。
+    // 不可含 chat-template / qwen-chat-template：harness 明确 withheld（THINKING_FORMAT_GATE 源码），
+    // 选中会被 llm-pi-ai schema 拒绝 → 整包保存失败（实测）。
+    const TF = ['openai', 'deepseek', 'openrouter', 'together', 'zai', 'qwen', 'string-thinking', 'ant-ling']
     const TRANSPORTS = ['sse', 'websocket', 'websocket-cached', 'auto']
     const CACHE = ['none', 'short', 'long']
     // apiKeyEnv 凭据引用必须是 POSIX 环境变量名（DSH apiproxy zod: /^[A-Za-z_][A-Za-z0-9_]*$/）
@@ -142,26 +144,11 @@ window.__ModuleLoader__.load({
         )
       )
       return el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10, padding: '8px 0' } },
-        sF('thinkingFormat', TF, '推理调度格式'),
-        sF('maxTokensField', MTF, '最大输出 token 字段名'),
-        bF('supportsReasoningEffort', '支持 reasoning_effort 字段'),
-        bF('supportsDeveloperRole', '支持 developer role (OpenAI 新格式)'),
-        bF('supportsStore', '支持 store 参数'),
-        bF('supportsUsageInStreaming', '流式分片中包含 usage'),
-        bF('supportsLongCacheRetention', '支持长周期 Prompt 缓存'),
-        bF('supportsEagerToolInputStreaming', '工具调用流式输入'),
-        bF('supportsTemperature', '支持自定义 temperature'),
-        bF('forceAdaptiveThinking', '强制自适应思考'),
-        bF('allowEmptySignature', '允许空签名'),
-        bF('supportsStrictMode', '支持 strict 模式'),
-        bF('supportsStrictTools', '支持 strict tools'),
-        bF('supportsCacheControlOnTools', '支持对工具参数增加缓存控制'),
-        bF('sendSessionAffinityHeaders', '发送会话亲和请求头 (x-session-id / x-session-affinity，跨节点稳定路由可显著提升 KV 缓存命中)'),
-        bF('requiresToolResultName', '工具返回需携带 name'),
-        bF('requiresAssistantAfterToolResult', '工具返回后紧跟 assistant 角色'),
-        bF('requiresThinkingAsText', '思考过程作为纯文本消息传递'),
-        bF('requiresReasoningContentOnAssistantMessages', 'assistant 消息需携带 reasoning_content'),
-        sF('cacheControlFormat', ['anthropic'], '缓存控制协议规范')
+        sF('thinkingFormat', TF, '推理调度格式（仅 openai-completions 协议生效；其余协议自动探测）'),
+        bF('supportsReasoningEffort', '支持 reasoning_effort 字段（仅 openai-completions 协议生效）'),
+        el('div', { style: { gridColumn: '1 / -1', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.6, padding: '6px 0' } },
+          'Compat 仅此两项真实生效（harness PiAiCompatProfile 全部字段面）；其余兼容开关由 pi-ai 按 baseURL 自动探测，无需配置。仅对 openai-completions 协议模型有效；「— 默认 —」= 不写入该字段。'
+        )
       )
     }
 
@@ -1163,29 +1150,55 @@ window.__ModuleLoader__.load({
         if (!apiRef) return
         setSaving(true)
         setNotice(null)
-        // 自动清洗 draft 中的非法或空字段，保证完全满足 dsh-llm-pi-ai schema
+        // 自动清洗 draft 中的非法或空字段，保证完全满足 dsh-llm-pi-ai schema。
+        // 字段策略：以原值浅拷贝为基底再覆盖面板管理的字段——thinkingBudgets / retryPolicy /
+        // modelOverrides / defaultInput 等手工配置的 schema 合法字段不在面板编辑范围，
+        // 从零重建会静默抹掉（unset+set 是真删，不是 merge）；面板字段显式覆盖，
+        // 「清空再保存」语义靠覆盖值本身（空值剔除）而非忽略键。
+        const COMPAT_ALIVE = ['thinkingFormat', 'supportsReasoningEffort']
+        const cleanCompat = (raw) => {
+          if (!raw || typeof raw !== 'object') return undefined
+          const out = {}
+          for (const [k, v] of Object.entries(raw)) {
+            if (!COMPAT_ALIVE.includes(k)) continue
+            // 空串（「— 默认 —」）会被 schema 拒绝（实测），视作未设置剔除
+            if (v === '' || v == null) continue
+            if (k === 'thinkingFormat' && !TF.includes(v)) continue
+            if (k === 'supportsReasoningEffort') { if (typeof v === 'boolean') out[k] = v; continue }
+            if (typeof v === 'string') out[k] = v
+          }
+          return Object.keys(out).length > 0 ? out : undefined
+        }
         const cleanProviders = {}
         if (draft) {
           for (const [pKey, pVal] of Object.entries(draft)) {
             if (!pKey || !pVal) continue
             const cleanModels = (pVal.models || []).filter((m) => m && m.id && String(m.id).trim().length > 0).map((m) => {
-              const cleaned = { id: String(m.id).trim() }
-              if (m.name && String(m.name).trim()) cleaned.name = String(m.name).trim()
-              if (Number.isFinite(m.contextWindow) && m.contextWindow > 0) cleaned.contextWindow = m.contextWindow
-              if (Number.isFinite(m.maxTokens) && m.maxTokens > 0) cleaned.maxTokens = m.maxTokens
-              if (Array.isArray(m.input) && m.input.length > 0) cleaned.input = m.input.slice()
-              if (m.reasoningEfforts && typeof m.reasoningEfforts === 'object') cleaned.reasoningEfforts = Object.assign({}, m.reasoningEfforts)
-              if (m.compat && typeof m.compat === 'object' && Object.keys(m.compat).length > 0) cleaned.compat = Object.assign({}, m.compat)
+              // 同样保留模型级未知字段（面板外 schema 合法键），仅清洗/覆盖面板管理的
+              const cleaned = Object.assign({}, m)
+              cleaned.id = String(m.id).trim()
+              if (cleaned.name != null && String(cleaned.name).trim() === '') delete cleaned.name
+              if (!(Number.isFinite(cleaned.contextWindow) && cleaned.contextWindow > 0)) delete cleaned.contextWindow
+              if (!(Number.isFinite(cleaned.maxTokens) && cleaned.maxTokens > 0)) delete cleaned.maxTokens
+              if (Array.isArray(cleaned.input) && cleaned.input.length > 0) cleaned.input = cleaned.input.slice()
+              else delete cleaned.input
+              if (cleaned.reasoningEfforts != null && typeof cleaned.reasoningEfforts === 'object' && Object.keys(cleaned.reasoningEfforts).length > 0) cleaned.reasoningEfforts = Object.assign({}, cleaned.reasoningEfforts)
+              else delete cleaned.reasoningEfforts
+              const mc = cleanCompat(cleaned.compat)
+              if (mc) cleaned.compat = mc
+              else delete cleaned.compat
               return cleaned
             })
-            const pObj = {
-              api: pVal.api || 'openai-completions',
-              models: cleanModels
-            }
-            if (pVal.baseURL && String(pVal.baseURL).trim()) pObj.baseURL = String(pVal.baseURL).trim()
-            if (pVal.displayName && String(pVal.displayName).trim()) pObj.displayName = String(pVal.displayName).trim()
+            const pObj = Object.assign({}, pVal)
+            pObj.api = pVal.api || 'openai-completions'
+            pObj.models = cleanModels
+            if (!(pVal.baseURL && String(pVal.baseURL).trim())) delete pObj.baseURL
+            else pObj.baseURL = String(pVal.baseURL).trim()
+            if (!(pVal.displayName && String(pVal.displayName).trim())) delete pObj.displayName
+            else pObj.displayName = String(pVal.displayName).trim()
             const apiKeyEnvVal = normalizeCredentialRef(pVal.apiKeyEnv || '')
             if (apiKeyEnvVal) pObj.apiKeyEnv = apiKeyEnvVal
+            else delete pObj.apiKeyEnv
             // 请求头原样保存（默认头仅在新建供应商时注入一次），编辑器里删除即真实生效；
             // 仅剔除空键与 User-Agent（pi-ai 会用 deepseek-harness 归属 UA 强制覆盖，自定义是死数据）
             const hdrs = {}
@@ -1195,17 +1208,30 @@ window.__ModuleLoader__.load({
               hdrs[hk2] = String(hv)
             }
             if (Object.keys(hdrs).length > 0) pObj.headers = hdrs
-            if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
+            else delete pObj.headers
+            const pc = cleanCompat(pVal.compat)
+            if (pc) pObj.compat = pc
+            else delete pObj.compat
             if (pVal.transport) pObj.transport = pVal.transport
+            else delete pObj.transport
             if (pVal.cacheRetention) pObj.cacheRetention = pVal.cacheRetention
+            else delete pObj.cacheRetention
             if (Number.isFinite(pVal.timeoutMs) && pVal.timeoutMs > 0) pObj.timeoutMs = pVal.timeoutMs
+            else delete pObj.timeoutMs
             if (Number.isFinite(pVal.streamIdleTimeoutMs) && pVal.streamIdleTimeoutMs > 0) pObj.streamIdleTimeoutMs = pVal.streamIdleTimeoutMs
+            else delete pObj.streamIdleTimeoutMs
             if (Number.isFinite(pVal.websocketConnectTimeoutMs) && pVal.websocketConnectTimeoutMs > 0) pObj.websocketConnectTimeoutMs = pVal.websocketConnectTimeoutMs
+            else delete pObj.websocketConnectTimeoutMs
             if (Number.isSafeInteger(pVal.defaultContextWindow) && pVal.defaultContextWindow > 0) pObj.defaultContextWindow = pVal.defaultContextWindow
+            else delete pObj.defaultContextWindow
             if (Number.isSafeInteger(pVal.defaultMaxTokens) && pVal.defaultMaxTokens > 0) pObj.defaultMaxTokens = pVal.defaultMaxTokens
+            else delete pObj.defaultMaxTokens
             if (pVal.reasoning) pObj.reasoning = pVal.reasoning
+            else delete pObj.reasoning
             if (Number.isSafeInteger(pVal.requestImagePixelBudget) && pVal.requestImagePixelBudget > 0) pObj.requestImagePixelBudget = pVal.requestImagePixelBudget
+            else delete pObj.requestImagePixelBudget
             if (Number.isSafeInteger(pVal.requestImageMaxBytes) && pVal.requestImageMaxBytes > 0) pObj.requestImageMaxBytes = pVal.requestImageMaxBytes
+            else delete pObj.requestImageMaxBytes
             cleanProviders[pKey] = pObj
           }
         }
