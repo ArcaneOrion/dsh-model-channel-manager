@@ -80,9 +80,12 @@ window.__ModuleLoader__.load({
     const APIS = ['openai-completions', 'openai-responses', 'anthropic-messages']
     const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
     // thinkingFormat 合法集合 = harness THINKING_FORMAT_GATE（8 项）。
-    // 不可含 chat-template / qwen-chat-template：harness 明确 withheld（THINKING_FORMAT_GATE 源码），
-    // 选中会被 llm-pi-ai schema 拒绝 → 整包保存失败（实测）。
-    const TF = ['openai', 'deepseek', 'openrouter', 'together', 'zai', 'qwen', 'string-thinking', 'ant-ling']
+    // thinkingFormat 全集 = 安装运行时 rc.2 的 SUPPORTED_THINKING_FORMATS（10 项）。
+    // 此前注解「chat-template/qwen-chat-template 被 harness withheld」是源码仓快照的
+    // 认知——rc.2 实际 offer 这两项（实测 schema 接受）；适配器契约必须以安装运行时为准。
+    const TF = ['openai', 'deepseek', 'openrouter', 'together', 'zai', 'qwen', 'chat-template', 'qwen-chat-template', 'string-thinking', 'ant-ling']
+    const MAX_TOKENS_FIELDS = ['max_completion_tokens', 'max_tokens']
+    const CACHE_CONTROL_FORMATS = ['anthropic']
     const TRANSPORTS = ['sse', 'websocket', 'websocket-cached', 'auto']
     const CACHE = ['none', 'short', 'long']
     // apiKeyEnv 凭据引用必须是 POSIX 环境变量名（DSH apiproxy zod: /^[A-Za-z_][A-Za-z0-9_]*$/）
@@ -127,29 +130,56 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function compatEditor(compat, onSet) {
+    // rc.2 llm-pi-ai PiAiCompatProfile：全部字段真实生效（以安装运行时 d.ts/lib 为准，
+    // 非源码仓快照）。按协议分组——模型级开关填错协议会使 resolve 直接失败，
+    // route 级会跳过不适配的模型，所以编辑器只渲染当前协议接受的字段。
+    const COMPAT_BOOL = {
+      'openai-completions': ['supportsStore', 'supportsDeveloperRole', 'supportsReasoningEffort', 'supportsUsageInStreaming', 'requiresToolResultName', 'requiresAssistantAfterToolResult', 'requiresThinkingAsText', 'requiresReasoningContentOnAssistantMessages', 'supportsStrictMode', 'supportsLongCacheRetention'],
+      'openai-responses': ['supportsDeveloperRole', 'supportsStrictMode', 'supportsLongCacheRetention'],
+      'anthropic-messages': ['supportsEagerToolInputStreaming', 'supportsCacheControlOnTools', 'supportsTemperature', 'forceAdaptiveThinking', 'allowEmptySignature', 'supportsStrictTools', 'supportsLongCacheRetention'],
+    }
+    const COMPAT_SELECTS = {
+      'openai-completions': [
+        ['thinkingFormat', TF, '推理参数格式；chat-template / qwen-chat-template 会把 thinking 状态注入 chat_template_kwargs'],
+        ['maxTokensField', MAX_TOKENS_FIELDS, '输出上限字段拼写（缺省 max_tokens）'],
+        ['cacheControlFormat', CACHE_CONTROL_FORMATS, 'prompt-cache 标记约定'],
+      ],
+    }
+    const COMPAT_KV = { 'openai-completions': [['chatTemplateKwargs', 'chat_template_kwargs 键值对；值支持 $var 占位（如 {"$var":"thinking.enabled","omitWhenOff":true}，此处仅支持字符串值，占位对象请手改配置文件）']] }
+
+    function compatEditor(compat, onSet, apiType) {
       const c = compat || {}
-      const setB = (k, v) => onSet(Object.assign({}, c, { [k]: v }))
-      const setS = (k, v) => onSet(Object.assign({}, c, { [k]: v }))
-      const bF = (k, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-        el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: d }, k),
-        el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', height: 28, fontSize: 12 } },
-          el('input', { type: 'checkbox', checked: !!c[k], onChange: (e) => setB(k, e.target.checked) }),
-          c[k] ? '✓ 开' : '关'
+      const setK = (k, v) => { const n = Object.assign({}, c); if (v === '' || v === undefined) delete n[k]; else n[k] = v; onSet(n) }
+      const label = (k, d) => el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: d }, k)
+      // 布尔三态：未设置 = 交给 pi-ai 按 baseURL 自动探测；checkbox 表达不了三态
+      const boolF = (k, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+        label(k, d),
+        el('select', { className: 'mcm-in', style: { height: 28, fontSize: 12 }, value: c[k] == null ? '' : String(c[k]), onChange: (e) => setK(k, e.target.value === '' ? undefined : e.target.value === 'true') },
+          el('option', { value: '' }, '— 默认 —'),
+          el('option', { value: 'true' }, '开'),
+          el('option', { value: 'false' }, '关')
         )
       )
-      const sF = (k, opts, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-        el('label', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: d }, k),
-        el('select', { className: 'mcm-in', style: { height: 28, fontSize: 12 }, value: c[k] || '', onChange: (e) => setS(k, e.target.value) },
+      const selectF = (k, opts, d) => el('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+        label(k, d),
+        el('select', { className: 'mcm-in', style: { height: 28, fontSize: 12 }, value: c[k] || '', onChange: (e) => setK(k, e.target.value || undefined) },
           el('option', { value: '' }, '— 默认 —'),
           ...opts.map((o) => el('option', { key: o, value: o }, o))
         )
       )
-      return el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10, padding: '8px 0' } },
-        sF('thinkingFormat', TF, '推理调度格式（仅 openai-completions 协议生效；其余协议自动探测）'),
-        bF('supportsReasoningEffort', '支持 reasoning_effort 字段（仅 openai-completions 协议生效）'),
-        el('div', { style: { gridColumn: '1 / -1', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.6, padding: '6px 0' } },
-          'Compat 仅此两项真实生效（harness PiAiCompatProfile 全部字段面）；其余兼容开关由 pi-ai 按 baseURL 自动探测，无需配置。仅对 openai-completions 协议模型有效；「— 默认 —」= 不写入该字段。'
+      const kvF = (k, d) => field(k, d, false, kvEditor(c[k] && typeof c[k] === 'object' ? c[k] : {}, (v) => setK(k, v && Object.keys(v).length ? v : undefined)))
+      const api = apiType || 'openai-completions'
+      const items = [
+        ...(COMPAT_BOOL[api] || []).map((k) => boolF(k)),
+        ...(COMPAT_SELECTS[api] || []).map(([k, opts, d]) => selectF(k, opts, d)),
+        ...(COMPAT_KV[api] || []).map(([k, d]) => kvF(k, d)),
+      ]
+      return el('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: '8px 0' } },
+        items.length > 0
+          ? el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 } }, items)
+          : el('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '当前协议（' + api + '）没有可配置的 compat 字段'),
+        el('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.6 } },
+          'Compat 字段以安装运行时（rc.2 PiAiCompatProfile，20 项）为准、全部真实生效；保存时全量透传不再剥离。本编辑器只显示当前协议（' + api + '）接受的字段——模型级开关填错协议会使 resolve 直接失败。「— 默认 —」= 删除该键，交给 pi-ai 按 baseURL 自动探测。'
         )
       )
     }
@@ -611,7 +641,7 @@ window.__ModuleLoader__.load({
                   nf('图片总像素上限', 'requestImagePixelBudget', p.requestImagePixelBudget || 0, (v) => updateP(name, { requestImagePixelBudget: v })),
                   nf('单张图片字节上限', 'requestImageMaxBytes', p.requestImageMaxBytes || 0, (v) => updateP(name, { requestImageMaxBytes: v }))
                 ),
-                field('供应商级 Compat 兼容选项', '端点级 API 行为修正', false, compatEditor(p.compat, (v) => updateP(name, { compat: v })))
+                field('供应商级 Compat 兼容选项', '端点级 API 行为修正', false, compatEditor(p.compat, (v) => updateP(name, { compat: v }), p.api || 'openai-completions'))
               ) : null
             ),
             el('div', { style: { marginTop: 8 } },
@@ -699,7 +729,7 @@ window.__ModuleLoader__.load({
                       el('div', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--dsw-alias-label-secondary)', display: 'flex', alignItems: 'center', gap: 6 }, onClick: (e) => { e.stopPropagation(); setEm((s) => Object.assign({}, s, { ['cx_' + name + '_' + mi]: !s['cx_' + name + '_' + mi] })) } },
                         el('span', null, em['cx_' + name + '_' + mi] ? '▼' : '▶'), '模型级 Compat 兼容性覆写'
                       ),
-                      em['cx_' + name + '_' + mi] ? el('div', { style: { marginTop: 8 } }, compatEditor(m.compat, (v) => updateModel(name, mi, { compat: v }))) : null
+                      em['cx_' + name + '_' + mi] ? el('div', { style: { marginTop: 8 } }, compatEditor(m.compat, (v) => updateModel(name, mi, { compat: v }), p.api || 'openai-completions')) : null
                     )
                   ) : null
                 )
@@ -1177,22 +1207,28 @@ window.__ModuleLoader__.load({
         if (!apiRef) return
         setSaving(true)
         setNotice(null)
-        // 自动清洗 draft 中的非法或空字段，保证完全满足 dsh-llm-pi-ai schema。
-        // 字段策略：以原值浅拷贝为基底再覆盖面板管理的字段——thinkingBudgets / retryPolicy /
-        // modelOverrides / defaultInput 等手工配置的 schema 合法字段不在面板编辑范围，
-        // 从零重建会静默抹掉（unset+set 是真删，不是 merge）；面板字段显式覆盖，
-        // 「清空再保存」语义靠覆盖值本身（空值剔除）而非忽略键。
-        const COMPAT_ALIVE = ['thinkingFormat', 'supportsReasoningEffort']
+        // Compat 全量透传：rc.2 PiAiCompatProfile 的 20 个字段全部真实生效——此前
+        // 白名单净化（仅 thinkingFormat/supportsReasoningEffort）把用户配置的角色
+        // 模板类字段（thinkingFormat:chat-template / chatTemplateKwargs /
+        // requiresThinkingAsText 等）在每次保存时剥掉，上游报 400 角色信息不正确
+        // （Ark 1214）。现仅剔除：空串/null（「— 默认 —」语义）与枚举非法值；
+        // 其余键全量保留（真遇到 schema 不认的键会大声失败而不是静默丢弃）。
+        const TF_SET = new Set(TF)
+        const MAXTOK_SET = new Set(MAX_TOKENS_FIELDS)
+        const CCF_SET = new Set(CACHE_CONTROL_FORMATS)
         const cleanCompat = (raw) => {
           if (!raw || typeof raw !== 'object') return undefined
           const out = {}
           for (const [k, v] of Object.entries(raw)) {
-            if (!COMPAT_ALIVE.includes(k)) continue
-            // 空串（「— 默认 —」）会被 schema 拒绝（实测），视作未设置剔除
             if (v === '' || v == null) continue
-            if (k === 'thinkingFormat' && !TF.includes(v)) continue
-            if (k === 'supportsReasoningEffort') { if (typeof v === 'boolean') out[k] = v; continue }
-            if (typeof v === 'string') out[k] = v
+            if (k === 'thinkingFormat' && !TF_SET.has(v)) continue
+            if (k === 'maxTokensField' && !MAXTOK_SET.has(v)) continue
+            if (k === 'cacheControlFormat' && !CCF_SET.has(v)) continue
+            if (k === 'chatTemplateKwargs') {
+              if (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0) out[k] = v
+              continue
+            }
+            out[k] = v
           }
           return Object.keys(out).length > 0 ? out : undefined
         }
