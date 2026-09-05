@@ -19,6 +19,7 @@ const HEALTH_SCHEMA = z.object({
     testRequest: z.any(),
     testResults: z.dict(z.any()).default({}),
     lastTestHandledNonce: z.number().default(0),
+    legacyMigrated: z.any(),
 }).loose(true);
 export function apply(ctx) {
     const isContentChunk = (c) => {
@@ -36,7 +37,7 @@ export function apply(ctx) {
     const groupOfRoute = (p) => (p != null && p.startsWith(ROUTE_PREFIX) ? p.slice(ROUTE_PREFIX.length) : null);
     const routeOfGroup = (id) => ROUTE_PREFIX + id;
     const runtime = new Map();
-    const state = { config: { groups: [] }, records: {}, speedResults: {} };
+    const state = { config: { groups: [] }, records: {}, speedResults: {}, testResults: {} };
     const groupRuntime = (id) => {
         let g = runtime.get(id);
         if (g === undefined) {
@@ -97,7 +98,6 @@ export function apply(ctx) {
                     maxTokens: Number.isFinite(st.maxTokens) && st.maxTokens > 0 ? st.maxTokens : 2048,
                     timeoutMs: Number.isFinite(st.timeoutMs) && st.timeoutMs > 0 ? st.timeoutMs : 60000,
                     concurrency: Number.isSafeInteger(st.concurrency) && st.concurrency > 0 ? st.concurrency : 3,
-                    minIntervalMs: Number.isFinite(st.minIntervalMs) && st.minIntervalMs >= 0 ? st.minIntervalMs : 60000,
                     retries: Number.isSafeInteger(st.retries) && st.retries >= 0 ? st.retries : 2,
                     onFirstUse: st.onFirstUse === true,
                 },
@@ -258,22 +258,49 @@ export function apply(ctx) {
             }
         }
     }
-    const recordHealth = async (gid, cand, entry) => {
+    const recordHealth = (gid, cand, entry) => {
         const now = Date.now();
         const key = gid || 'global';
         const list = state.records[key] || (state.records[key] = []);
         list.push({ ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null });
         const cutoff = now - 7 * 24 * 3600 * 1000;
         state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-2000);
-        try {
-            await persistHealth();
-        } catch (_e) {}
+        persistHealth();
     };
     const persistSpeedResults = async (r) => {
         if (bus === null) return;
         await bus.settings.update(NS_HEALTH, { speedResults: clone(r), runtime: await persistRuntime() });
     };
-    // ---------- 引擎：单候选尝试（与动态原型逐行一致） ----------
+    // ---------- 健康持久化节流：合并 2s 窗口内的写入，避免每个请求全量重写 settings ----------
+    let healthFlushHandle = null;
+    let healthDirty = false;
+    const flushHealthNow = async () => {
+        if (bus === null) return;
+        await bus.settings.update(NS_HEALTH, { records: clone(pullRecords()), speedResults: clone(pullSpeedResults()), runtime: await persistRuntime() });
+    };
+    const persistHealth = () => {
+        healthDirty = true;
+        if (healthFlushHandle === null) {
+            healthFlushHandle = ctx.timeout(() => {
+                healthFlushHandle = null;
+                if (!healthDirty) return;
+                healthDirty = false;
+                flushHealthNow().catch(() => { });
+            }, 2000);
+        }
+    };
+    ctx.effect(() => () => {
+        // 插件卸载时尽力冲刷最后一批健康数据（settings 服务仍在，失败静默）
+        if (healthFlushHandle !== null) {
+            healthFlushHandle();
+            healthFlushHandle = null;
+        }
+        if (healthDirty) {
+            healthDirty = false;
+            flushHealthNow().catch(() => { });
+        }
+    }, 'model-channel health flush');
+    // ---------- 引擎：单候选尝试 ----------
     async function* streamAttempt(cfg, cand, options, attemptStart) {
         if (cand.provider.startsWith(ROUTE_PREFIX))
             throw { code: 'INVALID_CANDIDATE', message: 'candidate provider must not be a virtual route' };
@@ -282,6 +309,7 @@ export function apply(ctx) {
         const timeoutMs = dynamicTimeoutMs(cfg, candKey(cand));
         let buffer = [];
         let started = false;
+        let ttftMs = null;
         let lastAt = Date.now();
         const closeInner = async () => { try {
             const c = inner.return ? inner.return() : null;
@@ -297,8 +325,14 @@ export function apply(ctx) {
                 if (remaining <= 0)
                     throw { code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' };
                 const guard = timed(Math.max(1, Math.min(remaining, 30000)), () => ({ code: 'TIMEOUT', message: 'channel candidate timed out after ' + timeoutMs + 'ms' }));
-                const next = await Promise.race([inner.next(), guard.promise]);
-                guard.dispose();
+                let next;
+                try {
+                    next = await Promise.race([inner.next(), guard.promise]);
+                }
+                finally {
+                    // 超时路径同样要 dispose：ctx.effect 的注册表条目只有显式调用 disposer 才会移除
+                    guard.dispose();
+                }
                 lastAt = Date.now();
                 const chunk = next.value;
                 if (chunk === undefined)
@@ -306,34 +340,50 @@ export function apply(ctx) {
                 if (!started) {
                     if (isContentChunk(chunk)) {
                         started = true;
+                        ttftMs = Date.now() - attemptStart;
                         for (const b of buffer)
                             yield b;
                         yield chunk;
                     }
                     else if (isTerminalChunk(chunk)) {
                         const reason = chunk.reason || {};
-                        if (isSuccessReason(reason))
+                        // 引擎提前终止的内层流不会被全局拦截器完整排水记账，这里自行记录
+                        if (isSuccessReason(reason)) {
+                            recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: 'EMPTY_RESPONSE' });
                             throw { code: 'EMPTY_RESPONSE', message: 'model returned a completed response with no content' };
-                        throw { code: (reason.failure && reason.failure.code) || 'STREAM_ERROR', message: (reason.failure && reason.failure.message) || 'candidate stream failed' };
+                        }
+                        const preCode = (reason.failure && reason.failure.code) || 'STREAM_ERROR';
+                        recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: preCode });
+                        throw { code: preCode, message: (reason.failure && reason.failure.message) || 'candidate stream failed' };
                     }
                     else {
                         buffer.push(chunk);
                     }
                 }
                 else {
-                    yield chunk;
                     if (isTerminalChunk(chunk)) {
                         const reason = chunk.reason || {};
                         if (isSuccessReason(reason)) {
+                            recordHealth(cand.provider, cand, { ok: true, ttftMs, latencyMs: Date.now() - attemptStart, code: null });
+                            yield chunk;
                             return;
                         }
-                        throw { code: (reason.failure && reason.failure.code) || 'STREAM_ERROR', message: (reason.failure && reason.failure.message) || 'candidate stream failed' };
+                        // 内容已向下游输出：绝不能再下发该失败终止块（否则出现 finish 后继续输出/双 finish），
+                        // 改为抛错并标记 emitted，由组层直接终结本次请求
+                        const midCode = (reason.failure && reason.failure.code) || 'STREAM_ERROR';
+                        recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: midCode });
+                        throw { code: midCode, message: (reason.failure && reason.failure.message) || 'candidate stream failed mid-stream' };
                     }
+                    yield chunk;
                 }
             }
         }
         catch (err) {
             await closeInner();
+            if (started && err && typeof err === 'object')
+                err.emitted = true;
+            if (err && err.code === 'TIMEOUT')
+                recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: 'TIMEOUT' });
             throw err;
         }
     }
@@ -400,6 +450,19 @@ export function apply(ctx) {
                     catch (err) {
                         const message = (err && err.message) || 'candidate failed';
                         lastFail = message;
+                        if (options.signal && options.signal.aborted) {
+                            yield abortedChunk('request aborted');
+                            return;
+                        }
+                        if (err && err.emitted) {
+                            // 内容已流出后失败：无法干净重放到下一候选（会拼接两个模型的输出/产生第二个 finish），
+                            // 置冷却并直接以失败终结本次请求
+                            rt.cooldowns.set(key, Date.now() + (cfg.cooldownMs || 0));
+                            failedKeys.push(key);
+                            pushEvent(cfg, 'midstream-fail', { candidate: key, reason: message });
+                            yield failChunk('channel candidate failed after content was already delivered: ' + message, (err && err.code) || 'CHANNEL_MIDSTREAM_FAIL');
+                            return;
+                        }
                         if (r < (cfg.maxRetriesPerCandidate || 0)) {
                             pushEvent(cfg, 'retry', { candidate: key, attempt: r + 1, reason: message });
                             await ctx.timeout(Math.min(4000, 250 * Math.pow(2, r)));
@@ -446,8 +509,13 @@ export function apply(ctx) {
         try {
             while (true) {
                 const guard = timed(Math.max(1, st.timeoutMs), () => ({ code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms' }));
-                const next = await Promise.race([inner.next(), guard.promise]);
-                guard.dispose();
+                let next;
+                try {
+                    next = await Promise.race([inner.next(), guard.promise]);
+                }
+                finally {
+                    guard.dispose();
+                }
                 const chunk = next.value;
                 if (chunk === undefined)
                     throw { code: 'STREAM_CLOSED', message: 'speedtest stream ended early' };
@@ -569,8 +637,13 @@ export function apply(ctx) {
         try {
             while (true) {
                 const guard = timed(60000, () => ({ code: 'TIMEOUT', message: 'model test timed out after 60000ms' }));
-                const next = await Promise.race([inner.next(), guard.promise]);
-                guard.dispose();
+                let next;
+                try {
+                    next = await Promise.race([inner.next(), guard.promise]);
+                }
+                finally {
+                    guard.dispose();
+                }
                 const chunk = next.value;
                 if (chunk === undefined)
                     throw { code: 'STREAM_CLOSED', message: 'model test stream ended early' };
@@ -602,23 +675,25 @@ export function apply(ctx) {
         if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || typeof req.nonce !== 'number' || req.nonce === last)
             return;
         settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch(() => { });
+        // 读写都以 healthScope.get()（settings 已提交的最新值）为准，而不是 watcher 同步的 state 快照：
+        // 连续两个测试请求时 state 可能滞后，读到旧 testResults 会互相覆盖结果
+        const readResults = () => ((bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {});
         const done = async (r) => {
-            const prev = pullHealthSnapshot().testResults || {};
-            const all = Object.assign({}, prev, { [req.nonce]: Object.assign({}, r, { nonce: req.nonce, provider: req.provider, model: req.model, finishedAt: Date.now() }) });
-            // 只保留最近 50 条测试结果，避免 testResults 无限增长
-            const pruned = Object.fromEntries(Object.entries(all).sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50));
-            await settings.update(NS_HEALTH, { testResults: pruned });
+            try {
+                const all = Object.assign({}, readResults(), { [req.nonce]: Object.assign({}, r, { nonce: req.nonce, provider: req.provider, model: req.model, finishedAt: Date.now() }) });
+                // 只保留最近 50 条测试结果，避免 testResults 无限增长
+                const pruned = Object.fromEntries(Object.entries(all).sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50));
+                await settings.update(NS_HEALTH, { testResults: pruned });
+            }
+            catch (_e) { }
         };
-        const running = Object.assign({}, pullHealthSnapshot().testResults || {}, { [req.nonce]: { status: 'running', nonce: req.nonce, provider: req.provider, model: req.model, startedAt: Date.now() } });
+        const running = Object.assign({}, readResults(), { [req.nonce]: { status: 'running', nonce: req.nonce, provider: req.provider, model: req.model, startedAt: Date.now() } });
         settings.update(NS_HEALTH, { testResults: running }).catch(() => { });
         runModelTest(req.provider, req.model, req.prompt, req.maxTokens).then(async (r) => {
             await done(Object.assign({ status: 'ok' }, r));
         }).catch(async (e) => {
             await done({ status: 'error', code: (e && e.code) || 'STREAM_ERROR', error: (e && e.message) || String(e) });
         });
-    }
-    function pullHealthSnapshot() {
-        return state;
     }
     function rewireRoutes() {
         const llm = ctx.llm;
@@ -637,30 +712,34 @@ export function apply(ctx) {
     }
     // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
     let bus = null;
-    const persistHealth = async (extra) => {
-        if (bus === null) return;
-        await bus.settings.update(NS_HEALTH, Object.assign({ records: clone(pullRecords()), speedResults: clone(pullSpeedResults()), runtime: await persistRuntime() }, extra || {}));
-    };
     ctx.inject(['settings'], (sctx) => {
         const settings = sctx.settings;
         bus = { settings };
         const cfgScope = settings.register(NS_CONFIG, CONFIG_SCHEMA, { base: {} });
         const healthScope = settings.register(NS_HEALTH, HEALTH_SCHEMA, { base: {} });
         bus.cfgScope = cfgScope;
+        bus.healthScope = healthScope;
         state.config = clone(cfgScope.get() || { groups: [] });
         state.records = clone(healthScope.get().records || {});
         state.speedResults = clone(healthScope.get().speedResults || {});
+        state.testResults = clone(healthScope.get().testResults || {});
         restoreRuntime(healthScope.get().runtime || {});
         cfgScope.watch(() => {
             state.config = clone(cfgScope.get() || { groups: [] });
-            for (const g of pullConfig().groups)
+            const live = pullConfig().groups;
+            for (const g of live)
                 groupRuntime(g.id);
+            // 清理已删除组的运行时残留，避免 runtime 持久化无限累积
+            for (const id of Array.from(runtime.keys()))
+                if (!live.some((g) => g.id === id))
+                    runtime.delete(id);
             rewireRoutes();
             console.log('[model-channel-manager] config hot-reloaded, routes:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
         });
         healthScope.watch((next) => {
             state.records = clone(next.records || {});
             state.speedResults = clone(next.speedResults || {});
+            state.testResults = clone(next.testResults || {});
             const req = next.speedRequest;
             const last = next.lastHandledNonce || 0;
             if (req && typeof req.group === 'string' && typeof req.nonce === 'number' && req.nonce !== last) {
@@ -709,7 +788,7 @@ export function apply(ctx) {
                     ttftMs: isSuccess ? ttft : null,
                     latencyMs: isSuccess ? latency : null,
                     code: isSuccess ? null : (lastError || 'UNKNOWN_TERMINAL'),
-                }).catch(() => {});
+                });
             }
         } catch (err) {
             if (options && options.provider && options.model) {
@@ -717,7 +796,7 @@ export function apply(ctx) {
                 recordHealth(p, { provider: p, model: options.model }, {
                     ok: false,
                     code: (err && err.code) || (err && err.message) || 'EXCEPTION',
-                }).catch(() => {});
+                });
             }
             throw err;
         }
@@ -725,9 +804,28 @@ export function apply(ctx) {
 
     // ---------- 启动 ----------
     async function boot() {
-        // 动态原型迁移：工作区 .channel-manager/config.json -> settings 命名空间（一次性）
+        // 动态原型迁移异步进行，不阻塞路由注册（迁移落盘后 cfg watcher 会热重建路由）
+        void migrateLegacyConfig();
+        rewireRoutes();
+        for (const g of pullConfig().groups) {
+            if (g.speedTest.enabled && g.speedTest.onFirstUse) {
+                const rt = groupRuntime(g.id);
+                if ((state.speedResults[g.id] || []).length === 0)
+                    runSpeedTest(g).catch(() => { });
+            }
+        }
+        console.log('[model-channel-manager] booted, groups:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
+    }
+    // 工作区 .channel-manager/config.json -> settings 命名空间（一次性）。
+    // 完成后写 legacyMigrated 哨兵，防止「用户清空全部组 → 重启 → 旧配置复活」；
+    // fs/sandboxPolicy 未就绪时短暂重试，而不是静默放弃直到下次重启。
+    async function migrateLegacyConfig() {
         const settings = bus && bus.settings;
-        if (settings !== undefined && pullConfig().groups.length === 0) {
+        if (settings === undefined || pullConfig().groups.length !== 0)
+            return;
+        if ((bus && bus.healthScope ? bus.healthScope.get().legacyMigrated : false) === true)
+            return;
+        for (let attempt = 0; attempt < 6; attempt++) {
             const fsSvc = ctx.get('fs');
             const sp = ctx.get('sandboxPolicy');
             const root = sp ? sp.workspaceRoot : null;
@@ -744,16 +842,15 @@ export function apply(ctx) {
                     }
                 }
                 catch (_e) { /* 无遗留配置，忽略 */ }
+                settings.update(NS_HEALTH, { legacyMigrated: true }).catch(() => { });
+                return;
+            }
+            try {
+                await ctx.timeout(5000);
+            }
+            catch (_e) {
+                return; // 插件已卸载，停止重试
             }
         }
-        rewireRoutes();
-        for (const g of pullConfig().groups) {
-            if (g.speedTest.enabled && g.speedTest.onFirstUse) {
-                const rt = groupRuntime(g.id);
-                if ((state.speedResults[g.id] || []).length === 0)
-                    runSpeedTest(g).catch(() => { });
-            }
-        }
-        console.log('[model-channel-manager] booted, groups:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
     }
 }

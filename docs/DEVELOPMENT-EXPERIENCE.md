@@ -43,6 +43,7 @@
 - 通过 `llm.registerAdapter(['roundrobin/<组id>'])` 注册虚拟路由，引擎内嵌套 `ctx.llm.stream({provider: 候选})` 转发。
 - 三策略：`sticky`（成功锁定）/ `round-robin`（成功指向下一候选）/ `primary`（永远回首选）。
 - 单候选原地重试（指数退避）耗尽才进冷却换下一个；整轮全炸清冷却回溯一轮。
+- **内容已输出后的中流失败不可故障转移**：失败终止块绝不下发（否则 finish 后又有内容 + 双 finish + 两模型输出拼接），`streamAttempt` 标 `err.emitted` 上抛，组层以 `CHANNEL_MIDSTREAM_FAIL` 直接终结本次请求。
 - 动态超时 = `max(timeoutMs, min(120s, 实测 ttft × 2))`，同时守护「首响应」与「流中空闲」两处。
 - 测速排序四键：`ttft / latency / hybrid / smart`，smart 用贝叶斯平滑可靠性 `(success+2.5)/(total+5)` 参与归一化。
 - 防自引用：候选 provider 不允许以 `roundrobin/` 开头。
@@ -78,7 +79,9 @@ ctx.on('llm/stream', async function* (options, next) {
 | --- | --- |
 | `global: true` | 挂到 Cordis 根 Realm，否则主会话 Agent Loop 的流量穿透拦截器 |
 | `prepend: true` | 排在瀑布流最顶层，保证每个请求都经过 |
-| `.catch(() => {})` 包裹持久化 | 健康采集绝不能因写盘失败反噬主请求流 |
+| 持久化不入请求热路径 | `recordHealth` 同步改内存 + 2s 节流落盘（卸载时冲刷），写盘失败绝不反噬主请求流 |
+
+**记账盲区**：引擎提前终止的内层流（组层超时关闭、收到终止块即停）不会被拦截器完整排水——拦截器只对流完整走完的请求写记录。因此 `streamAttempt` 侧对超时/首响应前失败/成功自行 `recordHealth`，轮询组流量才能完整进健康统计。
 
 ### 2.4 测试通道（哨兵模式）
 
@@ -87,10 +90,13 @@ Client 写 `testRequest: {nonce, provider, model, prompt, maxTokens}` → Host w
 - **必须先保存配置再测试**：DSH 适配器对未配置模型直接抛 `UNKNOWN_MODEL`（源码 `dsh-llm-pi-ai/lib/index.js:1648`），与「拉取成功」与否无关——拉取只是前端草稿态。
 - 测试结果同时收集 `reasoning-delta` 与 `text-delta`，思考模型测试才看得到完整输出。
 - 无凭据引用的渠道定义为「原生认证」，跳过凭据检查直接测试。
+- **testResults 读写统一走 `healthScope.get()`**：watcher 同步进 `state` 的快照滞后于 settings 写队列，连续两个测试时读旧快照会整体覆盖对方结果 → client 无限「测试中」。client `pollTest` 另加 55 次上限（约 66s，覆盖 host 60s 测试超时），超时报 `POLL_TIMEOUT`。
 
 ### 2.5 持久化与重启
 
 健康流水保存在 DSH settings 后端（`~/.dsh/settings.yaml` 的 `model-channel-health` 段），**重启 DSH 不丢**。`state.records` 按 provider 分组，7 天截止 `Date.now() - 7*24*3600*1000`，单组最多 2000 条。
+
+**持久化节流**：`recordHealth` 只同步改内存，落盘按 2s 窗口合并（`ctx.timeout` 单飞行 + `healthDirty` 标记），插件卸载 effect 冲刷尾批——否则每个真实请求都全量 clone + 重写整段 settings（MB 级 YAML 写放大）。配套地，client 健康轮询只在健康页签激活时跑（`useEffect` 依赖 `[tab]`，切走即停）。
 
 ---
 
@@ -168,7 +174,7 @@ stale      = 本地已配但端点已下线    → 默认不勾，提交清理
 
 - 剔除空 id 的占位模型行、空字符串字段、非法 0 值超时；
 - `apiKeyEnv` 走 `normalizeCredentialRef` 归一化（见 [3.8](#38-凭据引用归一化)）；
-- `headers` 无条件合并 `DEFAULT_HEADERS`（见 [3.9](#39-默认请求头)）；
+- `headers` 原样保存（默认头仅在新增供应商时注入一次，见 [3.9](#39-默认请求头)；仅剔空键与 UA）；
 - `compat` / `reasoningEfforts` 仅保留非空对象。
 
 **提交**（llm-pi-ai 专用路径，源码 `dsh-settings/lib/index.js` 实证）：
@@ -186,7 +192,7 @@ for (const k of order) ops.push({ op: 'set', path: ['providers', k], value: clea
 await apiRef.settings.mutate({ ns: 'llm-pi-ai', ops });
 ```
 
-- `refresh()` 同步捕获 `ns.user.providers`（user 层键集）作为 unset 依据；
+- `refresh()` 同步捕获 `ns.user.providers`（user 层键集）作为 unset 依据（→ 已改为 resolved 键集：面板展示/编辑的正是 resolved 视图，user 层可能为空或与展示不一致，漏 unset 会导致删除/改名失效）；
 - `model-channels` 的 groups 是数组，merge 下数组整体替换，删除天然生效，仍用 `update` 即可。
 
 ### 3.7 供应商拖动排序
@@ -194,8 +200,8 @@ await apiRef.settings.mutate({ ns: 'llm-pi-ai', ops });
 - 实现：原生 HTML5 DnD（静态 bundle 只有 react 可用，不可引入 react-dnd）。
 - **手势隔离**：`draggable` 只放在左侧 ⠿ 手柄上（`onClick stopPropagation`），卡片头点击展开不受影响；`onDragOver/onDrop` 挂在整卡接收。
 - 视觉反馈：源卡片 `opacity: 0.45`，悬停目标品牌色描边 + 光晕。
-- 排序 = 保序重建字典：`const [item] = entries.splice(from,1); entries.splice(to,0,item)`，对象键插入序即 YAML/JSON 持久化序。
-- **持久化必须走 mutate 路径**（见 3.6），否则刷新即还原。
+- 排序 = 保序重建字典：`const [item] = entries.splice(from,1); entries.splice(to,0,item)`，对象键插入序即内存序。
+- **持久化必须走 mutate 路径**（见 3.6），否则刷新即还原——但这只覆盖运行中会话。
 
 ### 3.8 凭据引用归一化
 
@@ -216,7 +222,7 @@ export const credentialRefNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*
 
 | Header | 值 |
 | --- | --- |
-| `User-Agent` | Chrome 131 / Windows 桌面 UA |
+| `User-Agent` | （不注入——pi-ai 强制用 deepseek-harness 归属 UA 覆盖，自定义是死数据；见踩坑 #22） |
 | `Accept` | `text/event-stream, text/html, application/json, */*` |
 | `Accept-Language` | `en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7` |
 | `Accept-Encoding` | `gzip, deflate, br` |
@@ -224,7 +230,7 @@ export const credentialRefNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*
 | `Connection` | `keep-alive` |
 | `Origin` / `Referer` | `https://chat.openai.com` |
 
-三个注入点：**新增供应商**初始化带上；**刷新加载**草稿合并（用户值优先，只补缺失）；**保存清洗**无条件合并。保存成功后同步 draft/state，界面立即可见。
+注入时机（现行）：**仅新增供应商**时一次性注入（7 项，无 UA）；刷新加载与保存清洗不再合并——编辑器里删除即真实生效。保存成功后同步 draft/state，界面立即可见。（旧版曾为「新增/加载/保存三处无条件合并」，导致踩坑 #22，已废弃。）
 
 - 轮询组无需任何请求头：引擎 `llm.stream({provider: 候选})` 走候选供应商 profile，全部 headers/凭据/compat/cache 由候选自身配置决定并继承。
 
@@ -249,6 +255,14 @@ export const credentialRefNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*
 | 13 | 拖动供应商排序后刷新顺序还原 | `settings.update` 是 merge 语义：已存在键保序（对象 spread 旧键位置不动），字典键序无法靠 patch 改写 | 改用 `settings.mutate` path-ops：先 unset 全部键，再按目标顺序 set 重插 |
 | 14 | 保存失败 credential ref 必须匹配 `/^[A-Za-z_][A-Za-z0-9_]*$/` | 生成 `apiKeyEnv` 时 `toUpperCase()` 保留连字符（`PROVIDER-22_API_KEY`）；该正则 = POSIX 环境变量名契约，宿主端不可放宽 | `normalizeCredentialRef` 归一化，创建 + 保存双保险 |
 | 15 | 删除供应商刷新后复活 | 同 #13 的 merge 保序：旧键留在 user 层 | mutate 的 unset 真实卸载被删键 |
+| 16 | 中流失败后下游收到 finish + 再输出 / 双 finish | `streamAttempt` started 分支先 yield 失败终止块再 throw，组层切下一候选继续输出 | 失败终止块不下发；`err.emitted` 标记，组层 `CHANNEL_MIDSTREAM_FAIL` 直接终结（见 2.1） |
+| 17 | 连续两个 ⚡测试互相覆盖结果、client 永久「测试中」 | watcher 同步的 `state.testResults` 滞后于 settings 写队列，`done()` 读旧快照整体覆盖 | testResults 读写统一 `healthScope.get()`；client `pollTest` 加 55 次上限（`POLL_TIMEOUT`） |
+| 18 | 升级新宿主后轮询组保存/健康/测速/测试全链路静默失效 | apiproxy（2026-07 起）`exposedNamespaces()` 白名单过滤 describe、写报 `settings-not-exposed`，插件自建 ns 不在列 | harness 打 `PLUGIN_SETTINGS_NAMESPACES` 补丁放行 `model-channels` / `model-channel-health` |
+| 19 | 按超时次数泄漏 effect 注册条目 | `Promise.race` 超时路径跳过其后的 `guard.dispose()`；`ctx.effect` 条目只有显式 disposer 才移除（`vendor/cordis/src/fiber.ts:520`） | race 包 try/finally dispose（streamAttempt / 测速 / 单模型测试三处） |
+| 20 | 删除中间 provider 后新增，草稿覆盖同名项 / 组无声消失 | `'provider-' + (length+1)` 撞已有键；组被 host `normalizeConfig` seen-set 静默去重 | `uniqueSuffixName` 取第一个未占用后缀 |
+| 21 | 用户清空全部轮询组后重启，旧配置复活 | 遗留迁移条件是「当前组数为空」且不写迁移标记 | `legacyMigrated` 哨兵 + fs 未就绪 5s×6 重试 |
+| 22 | 编辑器删掉的默认请求头保存后又回来 | 加载/保存两处无条件 `Object.assign({}, DEFAULT_HEADERS, p.headers)` | 默认头只在新增供应商注入一次；保存原样保留用户 headers（仅剔空键与 UA） |
+| 23 | 轮询组流量几乎不进健康统计 | 引擎提前终止的内层流不被全局拦截器完整排水 | `streamAttempt` 侧对超时/首响应前失败/成功自行 `recordHealth` |
 
 ---
 
@@ -283,7 +297,7 @@ DSH `llm-pi-ai` 官方三协议（`PROTOCOLS` 定义）：
 | `apiKeyEnv` | 凭据引用 = **POSIX 环境变量名**（`/^[A-Za-z_][A-Za-z0-9_]*$/`，连字符非法，面板自动归一化）；不明文存 key | 基础 |
 | `models[]` | 模型列表（可按顺序自定义） | 模型列表区 |
 | `defaultContextWindow` / `defaultMaxTokens` / `defaultInput` | 未配模型时的兜底 | 高级选项 |
-| `headers` | 自定义 HTTP 头；**默认自动合并 8 项浏览器伪装头**（User-Agent/Accept/…/Origin/Referer） | 高级选项 |
+| `headers` | 自定义 HTTP 头；新建供应商时预填 7 项浏览器伪装头（无 User-Agent，会被归属 UA 覆盖），编辑器删除即真实生效 | 高级选项 |
 | `reasoning` / `thinkingBudgets` | 供应商默认思考档/预算 | 高级选项 |
 | `transport` | `sse / websocket / websocket-cached / auto` | 高级选项 |
 | `cacheRetention` | `none / short / long` —— **省钱核心** | 高级选项 |
@@ -359,8 +373,9 @@ lucky-gemini:
 | 新模型 `input` | `['text','image']` | 多模态开箱即用 |
 | 新模型 `reasoningEfforts` | `{off:null, low:'low', medium:'medium', high:'high', xhigh:'xhigh', max:'max'}` | 全档位思考映射 |
 | 新轮询组虚拟模型 | 1M / 128K | 与模型默认一致 |
-| 全部供应商 `headers` | 自动合并 8 项 `DEFAULT_HEADERS` 浏览器伪装头 | 用户自定义值优先 |
+| 新增供应商 `headers` | 初始化注入 7 项 `DEFAULT_HEADERS` 伪装头（无 UA，编辑器可删） | 用户自定义值优先 |
 | 新增供应商 `apiKeyEnv` | `normalizeCredentialRef` 归一化（`provider-22` → `PROVIDER_22_API_KEY`） | POSIX 环境变量名契约 |
+| 新增供应商/轮询组命名 | 第一个未占用后缀（`uniqueSuffixName`） | 防删除中间项后 length+1 撞键 |
 | 测速 | 默认关闭，prompt「欧拉函数的意义？」，ttft 键，3 并发 | 开启后 smart 键融入贝叶斯可靠性 |
 | 单候选重试 | 2 次，指数退避 250ms×2ⁿ 封顶 4s | 与冷却 60s 配合 |
 | 健康窗口 | 默认「近 30 分钟」，前台 5s 自动刷新 | 可切 24h / 7d |

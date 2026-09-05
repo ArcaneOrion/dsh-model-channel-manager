@@ -37,6 +37,8 @@ DSH 原生模型渠道管理。两半结构：
 - 单模型测试 = `settings.update({ns:'model-channel-health', patch:{testRequest:{nonce,provider,model,prompt,maxTokens}}})`；host 执行真实 `llm.stream` 后把结果写回 `testResults[nonce]`；client 轮询 describe 直到 ok/error
 - `apiRef` 获取：`ctx.get('connection').api`（static client 必须在 `inject` 里声明 `connection`，apply 时捕获进闭包）
 
+> **宿主边界（重要）**：DSH apiproxy 对 settings RPC 有暴露白名单（`exposedNamespaces()` = LLM provider ns + `WEB_/PRODUCT_SETTINGS_NAMESPACES`，2026-07 起生效）。含该边界的宿主必须放行 `model-channels` / `model-channel-health`（本仓已在 harness `dsh-host-apiproxy` 打 `PLUGIN_SETTINGS_NAMESPACES` 补丁），否则 describe 会过滤掉这两个命名空间、写入报 `settings-not-exposed`——轮询组保存/健康面板/测速/测试全链路静默失效。
+
 ## 响应信封（重要）
 
 所有 `connection.api.*` 调用返回 `{result: {ok, value}}` 包裹（`dsh-client-connection` 的 `callUnary` + zod 校验）。
@@ -55,7 +57,7 @@ DSH 原生模型渠道管理。两半结构：
 - 结果：`status:'ok'`（ttftMs/latencyMs/text）或 `status:'error'`（code/error）
 - 模型行内显示 ⏳→✓/✗ 状态标签（hover 见详情）
 
-> 注意：此通道依赖 host 半新代码。**旧 host（未重启）无 testRequest 处理器**，测试会永久「请求中」——症状与「链路没设计」一致，实际是 host 未热更。
+> 注意：此通道依赖 host 半新代码。**旧 host（未重启）无 testRequest 处理器**，测试会一直「请求中」——client 现在约 66s 后超时报 `POLL_TIMEOUT` 并提示 host 未处理（不再无限轮询）。
 
 ## 拉取上游（模型选择）
 
@@ -83,13 +85,13 @@ DSH 原生模型渠道管理。两半结构：
 - settings 接入用 **`ctx.inject(['settings'], (sctx) => {...})`**（settings 服务异步初始化，apply 时 `ctx.get('settings')` 为 undefined——曾经整个引擎静默失效，命名空间从未注册）
 - 配置 schema（schemastery）：`model-channels` 的虚模型/candidates/strategy/timeoutMs/cooldownMs/maxRetriesPerCandidate/speedTest；`model-channel-health` 的 records 7 天切片（单组 ≤2000 条）/speedResults/runtime/speedRequest+lastHandledNonce/testRequest+testResults+lastTestHandledNonce
 - 引擎：sticky/round-robin/primary 三策略；首响应超时 + 流中空闲超时（动态 = max(timeoutMs, min(120s, ttft×2))）；单候选原地重试（指数退避）耗尽才换；全炸清冷却重试一轮；测速 ttft/latency/hybrid/smart 四键（smart = 0.5×ttft_norm + 0.3×(1−reliability) + 0.2×latency_norm，reliability 贝叶斯平滑 `(success+2.5)/(total+5)`）；测速失败进冷却；请求隔离按组
-- 迁移：startup 时从工作区 `.channel-manager/config.json` 一次性迁入 `model-channels`（无遗留则忽略）
+- 迁移：startup 时从工作区 `.channel-manager/config.json` 一次性迁入 `model-channels`（无遗留则忽略）；完成后写 `legacyMigrated` 哨兵防止「清空组后重启复活」；fs 未就绪时 5s×6 重试
 - 遗留 `.channel-manager/` 目录不再使用
 
 ## 客户端装载协议
 
 `window.__ModuleLoader__.load({ id: '@arcaneorion/dsh-model-channel-manager', factory: (require) => ({ name, inject:['slots','connection'], apply }) })`；
-react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {inject:[], platform:'web'}` + `exports['./client']` 使 client-modules 自动扫描挂载。
+react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {inject:['slots','connection'], platform:'web'}`（与 client.js 返回的 inject 一致）+ `exports['./client']` 使 client-modules 自动扫描挂载。
 
 **client bundle 按内容 hash 服务且 `no-cache`**：改 client.js 后**刷新浏览器即可生效**，无需重启 DSH。host 改动才需重启。
 
@@ -111,3 +113,9 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 6. **动态 vs 静态重复注册**：动态 `chm-3` 与静态包都注册 `conversation.view` id `models` 会出两个同名页签；静态化后停掉动态插件。
 7. **profile bundles 变更需 pnpm install**：改 `profiles/web/package.json` 的 dependencies/bundles 后必须 `pnpm install` + 重启（symlink 需重建）。
 8. **主实例 vs 临时实例**：诊断 host 问题时用 `dsh --profile web --no-open --port 3081` 起临时实例读日志/settings；主实例 3080 是用户进程，改动 host 后**必须用户重启**。
+9. **中流失败不可故障转移**：候选已向下游输出内容后失败（终止块报错/流中超时），继续切候选会「finish 后又有内容 + 双 finish」并拼接两个模型输出。正确做法：失败终止块不下发，标 `emitted` 上抛，组层以 `CHANNEL_MIDSTREAM_FAIL` 直接终结。
+10. **testResults 读写走已提交值**：watcher 同步的 state 快照滞后于 settings 写队列，连续测试会互相覆盖结果 → client 无限轮询。读写统一 `healthScope.get()`，client 轮询加 55 次上限。
+11. **apiproxy settings 暴露白名单**：新宿主只放行 LLM provider ns + 静态白名单，插件自建 ns 被 describe 过滤/写入 `settings-not-exposed`——升级宿主前先打 `PLUGIN_SETTINGS_NAMESPACES` 补丁（见「数据通道」）。
+12. **新增项命名 N+1 撞键**：`Object.keys().length + 1` 在删除中间项后撞已有键（provider 覆盖草稿、group 被 host seen-set 静默去重消失）。用 `uniqueSuffixName` 取第一个未占用后缀。
+13. **超时 guard 必须 finally dispose**：`ctx.effect` 注册条目只有显式 disposer 才移除；`Promise.race` 超时路径跳过后面的 `guard.dispose()` 会按超时次数泄漏。race 包 try/finally。
+14. **引擎提前终止的内层流拦截器记不到账**：全局拦截器只有流被完整排水才写记录；引擎超时关闭/收到终止块即停的请求要在 `streamAttempt` 侧自行 `recordHealth`，否则轮询组流量几乎不进健康统计。

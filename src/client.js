@@ -73,6 +73,8 @@ window.__ModuleLoader__.load({
 `
 
     const clone = (v) => JSON.parse(JSON.stringify(v))
+    // 生成第一个未占用的 prefix-N 名字，避免「删除中间项后 length+1 撞已有键」导致覆盖/静默去重
+    const uniqueSuffixName = (prefix, taken) => { let i = 1; while (taken(prefix + i)) i++; return prefix + i }
     const APIS = ['openai-completions', 'openai-responses', 'anthropic-messages']
     const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
     const TF = ['openai', 'deepseek', 'openrouter', 'together', 'zai', 'qwen', 'chat-template', 'qwen-chat-template', 'string-thinking', 'ant-ling']
@@ -91,9 +93,9 @@ window.__ModuleLoader__.load({
       if (!isLegalCredentialRef(s)) s = '_' + s
       return s
     }
-    // 参考 pi-provider-manager 的默认请求头（浏览器伪装，降低被上游风控的概率）
-    // 不注入 User-Agent：pi-ai 的 requestHeaders 会强制用 deepseek-harness 归属 UA 覆盖，
-    // 自定义 UA 是死数据（被过滤），故不写入；其余 7 个伪装头仍生效。
+    // 参考 pi-provider-manager 的默认请求头（浏览器伪装，降低被上游风控的概率）。
+    // 只在「新增供应商」时注入一次；加载与保存不再强制合并——编辑器里删除即真实生效。
+    // 不含 User-Agent：pi-ai 的 requestHeaders 会强制用 deepseek-harness 归属 UA 覆盖，自定义是死数据。
     const DEFAULT_HEADERS = {
       'Accept': 'text/event-stream, text/html, application/json, */*',
       'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
@@ -289,7 +291,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function fetchModal(name, p, disc, setDisc, onApply) {
+    function fetchModal(name, p, disc, setDisc, getTypedKey, onApply) {
       if (!disc || disc.provider !== name) return null
       let body
       if (disc.loading) {
@@ -300,7 +302,7 @@ window.__ModuleLoader__.load({
       } else if (disc.error) {
         body = el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', padding: 16, textAlign: 'center', fontSize: 13 } },
           el('div', { style: { marginBottom: 12 } }, '拉取失败: ' + disc.error),
-          btn('重新尝试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, keyInput[name]) }, 'primary')
+          btn('重新尝试', () => { setDisc({ provider: name, loading: true }); doFetch(name, p, setDisc, getTypedKey()) }, 'primary')
         )
       } else {
         const d = disc
@@ -430,21 +432,28 @@ window.__ModuleLoader__.load({
         return {}
       }
 
-      const pollTest = (nonce, provider, model) => {
+      const pollTest = (nonce, provider, model, attempt = 0) => {
         if (!apiRef) return
+        const key = provider + '::' + model
+        // host 侧测试超时 60s，约 55 次 × 1.2s ≈ 66s 后放弃，避免结果被覆盖时无限轮询
+        const giveUp = () => setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 可能未处理该请求（host 半更新后需重启 DSH）' } }))
         apiRef.settings.describe({}).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           const d = r && r.value !== undefined ? r.value : r
           const ns = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
           const tr = (ns && ns.value && ns.value.testResults) || {}
           const e = tr[nonce]
-          const key = provider + '::' + model
           if (e && (e.status === 'ok' || e.status === 'error')) {
             setTestStates((s) => Object.assign({}, s, { [key]: e }))
+          } else if (attempt >= 55) {
+            giveUp()
           } else {
-            setTimeout(() => pollTest(nonce, provider, model), 1200)
+            setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1200)
           }
-        }).catch(() => setTimeout(() => pollTest(nonce, provider, model), 1500))
+        }).catch(() => {
+          if (attempt >= 55) giveUp()
+          else setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1500)
+        })
       }
 
       const fireTest = (provider, model) => {
@@ -611,7 +620,7 @@ window.__ModuleLoader__.load({
                   btn('＋添加模型', () => updateP(name, { models: models.concat([{ id: '', name: '', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } }]) }))
                 )
               ),
-              fetchModal(name, p, disc, setDisc, (ids) => {
+              fetchModal(name, p, disc, setDisc, () => keyInput[name], (ids) => {
                 const cs = new Set(ids)
                 const kept = models.filter((m) => cs.has(m.id))
                 const ex = new Set(kept.map((m) => m.id))
@@ -705,7 +714,7 @@ window.__ModuleLoader__.load({
         ),
         ...cards,
         btn('＋新增提供商 (Provider)', () => {
-          const nm = 'provider-' + (Object.keys(providers).length + 1)
+          const nm = uniqueSuffixName('provider-', (n) => Object.prototype.hasOwnProperty.call(providers, n))
           const keyRef = normalizeCredentialRef(nm + '_api_key')
           setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: keyRef, displayName: nm, models: [], headers: Object.assign({}, DEFAULT_HEADERS) } }))
           setExp((e) => Object.assign({}, e, { [nm]: true }))
@@ -755,16 +764,20 @@ window.__ModuleLoader__.load({
       const [speedState, setSpeedState] = useState({})
       const [expanded, setExpanded] = useState({})
 
-      const addGroup = () => props.setChannelsDraft((d) => (d || []).concat([{
-        id: 'group-' + ((d || []).length + 1),
-        virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
-        candidates: [],
-        strategy: 'sticky',
-        timeoutMs: 30000,
-        cooldownMs: 60000,
-        maxRetriesPerCandidate: 2,
-        speedTest: { enabled: false, sortKey: 'ttft', prompt: '欧拉函数的意义？', maxTokens: 2048, timeoutMs: 60000, concurrency: 3, minIntervalMs: 60000, retries: 2 }
-      }]))
+      const addGroup = () => props.setChannelsDraft((d) => {
+        const base = d || []
+        const id = uniqueSuffixName('group-', (n) => base.some((g) => g && g.id === n))
+        return base.concat([{
+          id,
+          virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
+          candidates: [],
+          strategy: 'sticky',
+          timeoutMs: 30000,
+          cooldownMs: 60000,
+          maxRetriesPerCandidate: 2,
+          speedTest: { enabled: false, sortKey: 'ttft', prompt: '欧拉函数的意义？', maxTokens: 2048, timeoutMs: 60000, concurrency: 3, retries: 2 }
+        }])
+      })
 
       const patchGroup = (i, patch) => props.setChannelsDraft((d) => d.map((g, gi) => gi === i ? Object.assign({}, g, patch) : g))
       const patchGroupPath = (i, path, value) => props.setChannelsDraft((d) => d.map((g, gi) => {
@@ -814,6 +827,7 @@ window.__ModuleLoader__.load({
                 tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id || '', (v) => patchGroup(i, { id: v }), true),
                 tf('虚拟模型呈现名', '对话侧栏显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))
               ),
+              (g.id && !/^[a-z0-9][a-z0-9-]*$/.test(g.id)) ? el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 } }, '⚠ 组 ID 仅允许小写字母/数字/连字符，且以字母或数字开头；不合法的组保存后会被 host 静默丢弃') : null,
               field('候选渠道池 (按序故障转移)', '首选失败后自动原地重试或切入下一候选', false,
                 el('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
                   (g.candidates || []).map((c, ci) => el('div', { key: 'cand_' + ci, style: { display: 'flex', gap: 8, alignItems: 'center' } },
@@ -1091,12 +1105,6 @@ window.__ModuleLoader__.load({
           const findNs = (name) => nss.find((n) => n && n.ns === name)
           const ns = findNs('llm-pi-ai')
           const providers = (ns && ns.value && ns.value.providers) || {}
-          // 为每个供应商合并默认请求头（用户自定义值优先，未配置的补默认）
-          for (const [k, p] of Object.entries(providers)) {
-            if (p && typeof p === 'object') {
-              p.headers = Object.assign({}, DEFAULT_HEADERS, p.headers || {})
-            }
-          }
           // user 层 = 仅用户手工声明的路由（用于真正删除与重排序的 mutate 依据）
           const userProviders = (ns && ns.user && ns.user.providers) || {}
           setState({ providers, userProviders })
@@ -1112,24 +1120,28 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         refresh()
-        // 前台 5 秒静默自动轮询，保持数据完全实时流动
-        const timer = setInterval(() => {
-          if (apiRef) {
-            apiRef.settings.describe({}).then((resp) => {
-              const d = unwrap(resp)
-              const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
-              if (hn && hn.value) {
-                setHealth({
-                  records: hn.value.records || {},
-                  speedResults: hn.value.speedResults || {},
-                  runtime: hn.value.runtime || {}
-                })
-              }
-            }).catch(() => {})
-          }
-        }, 5000)
-        return () => clearInterval(timer)
       }, [])
+      // 健康页签激活时才 5s 静默轮询（仅拉健康命名空间），切走即停，避免后台常驻全量 describe
+      useEffect(() => {
+        if (tab !== 'health') return
+        const pull = () => {
+          if (!apiRef) return
+          apiRef.settings.describe({}).then((resp) => {
+            const d = unwrap(resp)
+            const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
+            if (hn && hn.value) {
+              setHealth({
+                records: hn.value.records || {},
+                speedResults: hn.value.speedResults || {},
+                runtime: hn.value.runtime || {}
+              })
+            }
+          }).catch(() => {})
+        }
+        pull()
+        const timer = setInterval(pull, 5000)
+        return () => clearInterval(timer)
+      }, [tab])
 
       const save = () => {
         if (!apiRef) return
@@ -1158,9 +1170,15 @@ window.__ModuleLoader__.load({
             if (pVal.displayName && String(pVal.displayName).trim()) pObj.displayName = String(pVal.displayName).trim()
             const apiKeyEnvVal = normalizeCredentialRef(pVal.apiKeyEnv || '')
             if (apiKeyEnvVal) pObj.apiKeyEnv = apiKeyEnvVal
-            pObj.headers = Object.assign({}, DEFAULT_HEADERS, (pVal.headers && typeof pVal.headers === 'object') ? pVal.headers : {})
-            delete pObj.headers['User-Agent']
-            delete pObj.headers['user-agent']
+            // 请求头原样保存（默认头仅在新建供应商时注入一次），编辑器里删除即真实生效；
+            // 仅剔除空键与 User-Agent（pi-ai 会用 deepseek-harness 归属 UA 强制覆盖，自定义是死数据）
+            const hdrs = {}
+            for (const [hk, hv] of Object.entries((pVal.headers && typeof pVal.headers === 'object') ? pVal.headers : {})) {
+              const hk2 = String(hk).trim()
+              if (!hk2 || hk2.toLowerCase() === 'user-agent') continue
+              hdrs[hk2] = String(hv)
+            }
+            if (Object.keys(hdrs).length > 0) pObj.headers = hdrs
             if (pVal.compat && typeof pVal.compat === 'object' && Object.keys(pVal.compat).length > 0) pObj.compat = Object.assign({}, pVal.compat)
             if (pVal.transport) pObj.transport = pVal.transport
             if (pVal.cacheRetention) pObj.cacheRetention = pVal.cacheRetention
