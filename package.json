@@ -30,6 +30,9 @@
     "cordis.patch.yml",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "peerDependencies": {
     "@deepseek-ai/schemastery": ">=3.18.2"
   },
