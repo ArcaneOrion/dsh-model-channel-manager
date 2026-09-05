@@ -781,7 +781,9 @@ window.__ModuleLoader__.load({
         const id = uniqueSuffixName('group-', (n) => base.some((g) => g && g.id === n))
         return base.concat([{
           id,
-          virtualModel: { name: 'RoundRobin', reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
+          // 默认呈现名 = 组 id：多个轮询组在目录/选择器里靠名字区分（固定
+          // 'RoundRobin' 会全部撞名，实测反馈），需要别的名字在「虚拟模型呈现名」改
+          virtualModel: { name: id, reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
           candidates: [],
           strategy: 'sticky',
           timeoutMs: 30000,
