@@ -3,7 +3,7 @@
 DSH 原生模型渠道管理。两半结构：
 
 - **host 半** `src/index.js`：轮询故障转移引擎（`llm.registerAdapter` 虚拟路由 `roundrobin/<组id>`）+ 7 天健康流水 + 测速排序 + 单模型真实请求测试通道。
-- **client 半** `src/client.js`：`conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试、供应商搜索过滤）、**轮询渠道**（groups 编辑 + ⚡测速；新建组默认呈现名 = 组 id，避免多个组在目录里全部撞名「RoundRobin」）、**健康统计**（7 天聚合）。
+- **client 半** `src/client.js`：`conversation.view` 顶级页签「模型配置」，内含三个子页：**模型配置**（llm-pi-ai providers 全字段编辑、拉取上游、单模型 ⚡ 测试、供应商搜索过滤）、**轮询渠道**（groups 编辑 + ⚡测速 + 输入模态编辑；新建组默认呈现名 = 组 id、模态含图片——host 对当前会话模型做 resolveModelInfo，缺 image 时附加图片直接被拒）、**健康统计**（7 天聚合）。
 - **会话模型选择器已拆出**为独立 cordis client 插件 [`@arcaneorion/dsh-model-selector-search`](../model-selector-search/)（一个占座者一个插件单元，可独立启停/替换；座位遮蔽 + 搜索 + 近 7 天置顶 + 菜单向上展开都在该仓）。
 
 语义参考 pi 的 `pi-provider-manager`，但完全走 DSH 原生 seam（无独立 HTTP 服务/端口/token）：

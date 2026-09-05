@@ -812,8 +812,10 @@ window.__ModuleLoader__.load({
         return base.concat([{
           id,
           // 默认呈现名 = 组 id：多个轮询组在目录/选择器里靠名字区分（固定
-          // 'RoundRobin' 会全部撞名，实测反馈），需要别的名字在「虚拟模型呈现名」改
-          virtualModel: { name: id, reasoning: true, input: ['text'], contextWindow: 1048576, maxTokens: 131072 },
+          // 'RoundRobin' 会全部撞名，实测反馈），需要别的名字在「虚拟模型呈现名」改；
+          // 默认模态含 image：host 对当前会话模型做 resolveModelInfo，缺 image 时
+          // 附加图片直接被拒（MODEL_DOES_NOT_SUPPORT_IMAGES），按直觉默认放开
+          virtualModel: { name: id, reasoning: true, input: ['text', 'image'], contextWindow: 1048576, maxTokens: 131072 },
           candidates: [],
           strategy: 'sticky',
           timeoutMs: 30000,
@@ -870,6 +872,18 @@ window.__ModuleLoader__.load({
               el('div', { className: 'mcm-row' },
                 tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id || '', (v) => patchGroup(i, { id: v }), true),
                 tf('虚拟模型呈现名', '对话侧栏显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))
+              ),
+              field('输入模态', '声明虚拟模型接受的输入；不含图片时附加图片会被 host 直接拒绝（MODEL_DOES_NOT_SUPPORT_IMAGES）', false,
+                el('div', { style: { display: 'flex', gap: 16, alignItems: 'center', height: 32 } },
+                  el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, opacity: 0.7 } },
+                    el('input', { type: 'checkbox', checked: true, disabled: true }),
+                    el('span', { style: { fontSize: 12 } }, 'text（固定）')
+                  ),
+                  el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
+                    el('input', { type: 'checkbox', checked: (vm.input || ['text']).includes('image'), onChange: (e) => patchGroupPath(i, ['virtualModel', 'input'], e.target.checked ? ['text', 'image'] : ['text']) }),
+                    el('span', { style: { fontSize: 12 } }, 'image（图片/视觉）')
+                  )
+                )
               ),
               (g.id && !/^[a-z0-9][a-z0-9-]*$/.test(g.id)) ? el('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 11 } }, '⚠ 组 ID 仅允许小写字母/数字/连字符，且以字母或数字开头；不合法的组保存后会被 host 静默丢弃') : null,
               field('候选渠道池 (按序故障转移)', '首选失败后自动原地重试或切入下一候选', false,
