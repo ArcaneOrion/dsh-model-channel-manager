@@ -603,7 +603,10 @@ export function apply(ctx) {
             context: { contextWindow: cfg.virtualModel.contextWindow },
             defaultMaxTokens: cfg.virtualModel.maxTokens,
             inputModalities: cfg.virtualModel.input.slice(),
-            reasoning: levels.length > 0 ? { efforts: levels.map((l) => ({ id: l, name: l })), defaultEffort: 'medium' } : undefined,
+            // defaultEffort=max：原生 /model 弹窗对新模型自动填与列表展示都跟随该声明
+            // （此前 medium 导致新会话选组即 medium）；会话内显式档位由 selector 插件的
+            // 档位记忆层（modelDirectories 拦截）恢复
+            reasoning: levels.length > 0 ? { efforts: levels.map((l) => ({ id: l, name: l })), defaultEffort: 'max' } : undefined,
         };
     }
     const adapter = {
