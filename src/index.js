@@ -268,7 +268,9 @@ export function apply(ctx) {
         const list = state.records[key] || (state.records[key] = []);
         list.push({ ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null });
         const cutoff = now - 7 * 24 * 3600 * 1000;
-        state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-2000);
+        // 每键保留 300 条：健康页签 30m/24h 视图与选择器置顶绰绰有余，同时把
+        // settings.yaml 的体量压到可读（2000 条/键时该文件一度膨胀到 2 万行）
+        state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-300);
         persistHealth();
     };
     const persistSpeedResults = async (r) => {
