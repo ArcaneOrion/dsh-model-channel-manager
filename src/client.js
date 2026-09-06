@@ -823,10 +823,9 @@ window.__ModuleLoader__.load({
         const id = uniqueSuffixName('group-', (n) => base.some((g) => g && g.id === n))
         return base.concat([{
           id,
-          // 默认呈现名 = 组 id：多个轮询组在目录/选择器里靠名字区分（固定
-          // 'RoundRobin' 会全部撞名，实测反馈），需要别的名字在「虚拟模型呈现名」改；
-          // 默认模态含 image：host 对当前会话模型做 resolveModelInfo，缺 image 时
-          // 附加图片直接被拒（MODEL_DOES_NOT_SUPPORT_IMAGES），按直觉默认放开
+          // 单一身份：显示名 = 组唯一 ID（save 时统一归一化 virtualModel.name = id，
+          // 不会漂移）。默认模态含 image：host 对当前会话模型做 resolveModelInfo，
+          // 缺 image 时附加图片直接被拒（MODEL_DOES_NOT_SUPPORT_IMAGES），按直觉默认放开
           virtualModel: { name: id, reasoning: true, input: ['text', 'image'], contextWindow: 1048576, maxTokens: 131072 },
           candidates: [],
           strategy: 'sticky',
@@ -871,7 +870,7 @@ window.__ModuleLoader__.load({
           return el('div', { className: 'mcm-card', key: 'rr_card_' + i },
             el('div', { className: 'mcm-card-h', onClick: () => setExpanded((e) => Object.assign({}, e, { [i]: !e[i] })) },
               el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
-              el('div', { className: 'mcm-card-title' }, el('span', null, vm.name || g.id), el('span', { className: 'mcm-badge brand' }, 'roundrobin/' + g.id)),
+              el('div', { className: 'mcm-card-title' }, el('span', null, g.id), el('span', { className: 'mcm-badge brand' }, 'roundrobin/' + g.id)),
               el('span', { className: 'mcm-badge' }, (g.candidates || []).length + ' 候选'),
               el('span', { className: 'mcm-badge' }, g.strategy || 'sticky'),
               el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
@@ -882,8 +881,7 @@ window.__ModuleLoader__.load({
             ),
             isOpen ? el('div', { className: 'mcm-editor' },
               el('div', { className: 'mcm-row' },
-                tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>', g.id || '', (v) => patchGroup(i, { id: v }), true),
-                tf('虚拟模型呈现名', '对话侧栏显示的名字', vm.name || '', (v) => patchGroupPath(i, ['virtualModel', 'name'], v))
+                tf('组唯一 ID', '对应虚拟路由 roundrobin/<id>，也是模型选择器里显示的名字（改这里即改名）', g.id || '', (v) => patchGroup(i, { id: v }), true)
               ),
               field('输入模态', '声明虚拟模型接受的输入；不含图片时附加图片会被 host 直接拒绝（MODEL_DOES_NOT_SUPPORT_IMAGES）', false,
                 el('div', { style: { display: 'flex', gap: 16, alignItems: 'center', height: 32 } },
@@ -1350,7 +1348,9 @@ window.__ModuleLoader__.load({
         const orderPatch = draft ? { providerOrder: Object.keys(cleanProviders) } : {}
         const p2 = apiRef.settings.update({
           ns: 'model-channels',
-          patch: Object.assign({ groups: channelsDraft || [] }, orderPatch)
+          // 命名单一身份：写入时统一 virtualModel.name = 组 id——旧的独立呈现名
+          // （如遗留的 group-1）在下一次保存时自动归一，无需迁移
+          patch: Object.assign({ groups: (channelsDraft || []).map((g) => Object.assign({}, g, { virtualModel: Object.assign({}, g.virtualModel, { name: g.id }) })) }, orderPatch)
         }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'model-channels save failed')
