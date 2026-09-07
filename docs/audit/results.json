@@ -1,0 +1,427 @@
+{
+  "auditDate": "2026-09-06",
+  "scope": "model-channel-manager 插件及必要 DSH/Cordis 接口；未审计整个上层 harness",
+  "gitCommit": "19ed51df8a171884264714d775339778a9176b24",
+  "nodeVersion": "v24.14.0",
+  "runtimeVersions": {
+    "cordis": "4.0.2",
+    "schemastery": "3.18.2",
+    "cordis-plugin-timer": "1.1.4",
+    "dsh-llm": "0.1.1-rc.2",
+    "dsh-settings": "0.1.1-rc.2",
+    "dsh-llm-pi-ai": "0.1.1-rc.2",
+    "dsh-host-apiproxy": "0.1.1-rc.2"
+  },
+  "runtimePaths": {
+    "cordis": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+cordis@4.0.2_@deepseek-ai+cordis-plugin-include@1.0.7_@deepseek-ai+cordis-plugin-loader@1.0.3/node_modules/@deepseek-ai/cordis",
+    "schemastery": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+schemastery@3.18.2/node_modules/@deepseek-ai/schemastery",
+    "cordis-plugin-timer": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+cordis-plugin-timer@1.1.4_@deepseek-ai+cordis@4.0.2/node_modules/@deepseek-ai/cordis-plugin-timer",
+    "dsh-llm": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+dsh-llm@0.1.1-rc.2_@deepseek-ai+cordis@4.0.2_@deepseek-ai+dsh-attachment@0_adfff0ab5e51fb5ba9dfb83c0abb8a62/node_modules/@deepseek-ai/dsh-llm",
+    "dsh-settings": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+dsh-settings@0.1.1-rc.2_@deepseek-ai+cordis@4.0.2_@deepseek-ai+dsh-brand@0_2dd31f709f91e7b96c62a2afe9d4c22c/node_modules/@deepseek-ai/dsh-settings",
+    "dsh-llm-pi-ai": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+dsh-llm-pi-ai@0.1.1-rc.2_8995a79e40beea38be4e214975f20da3/node_modules/@deepseek-ai/dsh-llm-pi-ai",
+    "dsh-host-apiproxy": "/home/arcaneorion/AI/Agent-workerspace/pnpm-packages/node_modules/.pnpm/@deepseek-ai+dsh-host-apiproxy@0.1.1-rc.2_2f8245d72ee681fee985f72a084d8a81/node_modules/@deepseek-ai/dsh-host-apiproxy"
+  },
+  "sourceFiles": {
+    "src/index.js": {
+      "sha256": "f98c461e2aa48258d2b5cd43ddb1cc12a59a45b49d0fa20cff59c35cadb5a741",
+      "lines": 931
+    },
+    "src/client.js": {
+      "sha256": "70ce59eecfe9f209b5675727c9b20e3481cb3e043f7c63125bccc81bb0c53e31",
+      "lines": 1414
+    },
+    "package.json": {
+      "sha256": "e41dfe4447c2dfac3748484564da593d6a7dd9cc8dffb2636c0adfe682c16546",
+      "lines": 48
+    },
+    "README.md": {
+      "sha256": "e6df248d0f7008ee367a1c02ecae8a1a1bd0c542e017c729c235f35cadd99b31",
+      "lines": 131
+    }
+  },
+  "baseline": {
+    "existingTestFilesPassed": 7,
+    "existingTestFilesFailed": 0,
+    "syntaxChecks": [
+      "src/index.js",
+      "src/client.js"
+    ],
+    "liveNetworkCalls": 0,
+    "businessFilesModified": 0,
+    "latestTestCommit": "19ed51df8a171884264714d775339778a9176b24"
+  },
+  "evidenceMethod": {
+    "host": "原始 host 源码（仅重定位 schemastery import）+ 已安装 Cordis/LLM/settings/timer + 假模型与内存存储",
+    "client": "原始 client.js 的 ModuleLoader/slots/组件函数/事件回调 + hook/DOM/API 替身；不是浏览器 E2E"
+  },
+  "totals": {
+    "probes": 31,
+    "issueObservations": 25,
+    "positiveControls": 6
+  },
+  "evidence": [
+    {
+      "id": "C01_drag_handler_reference_error",
+      "error": "ReferenceError: idx is not defined",
+      "issue": true
+    },
+    {
+      "id": "C02_save_removes_explicit_reasoning_false",
+      "before": false,
+      "savedModel": {
+        "id": "m"
+      },
+      "issue": true
+    },
+    {
+      "id": "C03_refresh_keeps_stale_draft_and_save_overwrites",
+      "refreshedState": "new elsewhere",
+      "retainedDraft": "old",
+      "submittedName": "old",
+      "expectedRevisionPresent": false,
+      "issue": true
+    },
+    {
+      "id": "C04_save_before_initial_load_clears_groups",
+      "loadingSaveButtonDisabled": false,
+      "submittedGroups": [],
+      "issue": true
+    },
+    {
+      "id": "C05_rename_does_not_update_active_preset",
+      "mainCandidateProvider": "renamed",
+      "activePresetProvider": "p",
+      "issue": true
+    },
+    {
+      "id": "C06_test_write_error_envelope_ignored",
+      "serverRejected": true,
+      "displayedStatus": "running",
+      "pollingTimers": 1,
+      "issue": true
+    },
+    {
+      "id": "C07_speed_write_error_envelope_ignored",
+      "serverRejected": true,
+      "displayedStatus": "sent",
+      "issue": true
+    },
+    {
+      "id": "C08_catalog_provider_silently_changes_wire_protocol",
+      "before": {
+        "apiKeyEnv": "ANTHROPIC_API_KEY"
+      },
+      "submitted": {
+        "apiKeyEnv": "ANTHROPIC_API_KEY",
+        "api": "openai-completions",
+        "models": []
+      },
+      "issue": true
+    },
+    {
+      "id": "C09_seven_day_window_includes_older_records",
+      "recordAgeDays": 30,
+      "displayedSevenDayRequests": 1,
+      "issue": true
+    },
+    {
+      "id": "C10_save_partially_commits_references_after_provider_rejection",
+      "committedNamespaces": [
+        "model-channels"
+      ],
+      "requestsSent": [
+        "llm-pi-ai",
+        "model-channels"
+      ],
+      "notice": "保存失败: audit: write rejected",
+      "issue": true
+    },
+    {
+      "id": "H01_success_stream_cleanup",
+      "closedAfterDirect": 1,
+      "closedAfterVirtual": 1,
+      "virtualFinishCount": 1,
+      "issue": true
+    },
+    {
+      "id": "H02_timeout_waits_for_unfinished_next",
+      "configuredTimeoutMs": 15,
+      "observationAfterMs": 80,
+      "beforeRelease": {
+        "settled": false,
+        "providersCalled": [
+          "first"
+        ],
+        "signalProvided": false
+      },
+      "finalProviders": [
+        "first",
+        "second"
+      ],
+      "finalReason": "stop",
+      "issue": true
+    },
+    {
+      "id": "H03_pending_health_overwritten_by_settings",
+      "successfulModelCalls": 1,
+      "persistedRecords": 0,
+      "issue": true
+    },
+    {
+      "id": "H04_aborted_virtual_call_counts_as_failure",
+      "finalReason": "aborted",
+      "records": [
+        {
+          "ts": 1788682864191,
+          "provider": "first",
+          "model": "m",
+          "ok": false,
+          "ttftMs": null,
+          "latencyMs": null,
+          "code": "ABORTED"
+        }
+      ],
+      "issue": true
+    },
+    {
+      "id": "H05_concurrent_test_request_duplicate_dispatch",
+      "submittedRequests": 2,
+      "dispatches": 5,
+      "callCounts": {
+        "one": 1,
+        "two": 4
+      },
+      "resultKeys": [
+        "101",
+        "102"
+      ],
+      "issue": true
+    },
+    {
+      "id": "H06_default_reasoning_rejects_nonreasoning_candidate",
+      "directReason": "stop",
+      "virtualReason": {
+        "kind": "error",
+        "failure": {
+          "message": "all channel candidates failed: provider \"first\" model \"m\" does not support reasoning effort \"max\"",
+          "code": "CHANNEL_FULL_FAIL"
+        }
+      },
+      "underlyingDispatches": 1,
+      "issue": true
+    },
+    {
+      "id": "H07_auto_speed_toggle_does_not_trigger_probe",
+      "callsAfterBoot": 0,
+      "callsAfterFirstRequest": 1,
+      "speedRows": {},
+      "issue": true
+    },
+    {
+      "id": "H08_invalid_config_is_accepted_but_routes_disappear",
+      "writeAccepted": true,
+      "storedIds": [
+        "INVALID NAME",
+        "duplicate",
+        "duplicate"
+      ],
+      "routes": [
+        "roundrobin/duplicate"
+      ],
+      "issue": true
+    },
+    {
+      "id": "H09_virtual_route_loses_adapter_replay_state",
+      "directRetains": true,
+      "virtualRetains": false,
+      "issue": true
+    },
+    {
+      "id": "H10_speed_runtime_persisted_before_completion",
+      "failedSpeedRows": 2,
+      "persistedRuntime": {
+        "currentIndex": 0,
+        "cooldowns": [],
+        "events": [
+          {
+            "ts": 1788682866550,
+            "group": "audit",
+            "kind": "speedtest-start"
+          }
+        ],
+        "lastSpeedTestAt": 0
+      },
+      "issue": true
+    },
+    {
+      "id": "H11_plugin_disposal_does_not_cancel_running_test",
+      "calls": 1,
+      "closedAtDisposal": 0,
+      "routesAfterDisposal": [
+        "first",
+        "second"
+      ],
+      "namespacesAfterDisposal": [],
+      "issue": true
+    },
+    {
+      "id": "H12_speed_timeout_is_idle_not_total",
+      "configuredTimeoutMs": 40,
+      "measuredLatencyMs": 84,
+      "success": true,
+      "issue": true
+    },
+    {
+      "id": "H13_round_robin_concurrent_requests_choose_same_candidate",
+      "selectedProviders": [
+        "first",
+        "first"
+      ],
+      "issue": true
+    },
+    {
+      "id": "H14_image_request_succeeds_after_image_was_removed",
+      "candidatesCalled": [
+        "first"
+      ],
+      "actualModelContent": [
+        {
+          "type": "text",
+          "text": "Describe this image"
+        },
+        {
+          "type": "text",
+          "text": "[image omitted because this model accepts text only; attachment sha256:auditima]"
+        }
+      ],
+      "finalReason": {
+        "kind": "stop"
+      },
+      "issue": true
+    },
+    {
+      "id": "H15_legacy_migration_overwrites_new_user_configuration",
+      "beforeIds": [
+        "new-user-group"
+      ],
+      "afterIds": [
+        "legacy"
+      ],
+      "beforeOrder": [
+        "second",
+        "first"
+      ],
+      "afterOrder": [],
+      "issue": true
+    },
+    {
+      "id": "V01_sequential_routing_strategies",
+      "results": {
+        "sticky": [
+          "first",
+          "first",
+          "first"
+        ],
+        "primary": [
+          "first",
+          "first",
+          "first"
+        ],
+        "round-robin": [
+          "first",
+          "second",
+          "first"
+        ]
+      },
+      "passed": true
+    },
+    {
+      "id": "V02_precontent_failure_fails_over_cleanly",
+      "providers": [
+        "first",
+        "second"
+      ],
+      "chunks": [
+        {
+          "type": "text-delta",
+          "text": "fallback"
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "stop"
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "V03_midstream_failure_does_not_mix_candidates",
+      "providers": [
+        "first"
+      ],
+      "chunks": [
+        {
+          "type": "text-delta",
+          "text": "partial"
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "error",
+            "failure": {
+              "message": "channel candidate failed after content was already delivered: fixture",
+              "code": "FIXTURE_ERROR"
+            }
+          }
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "V04_prepared_call_preserves_group_snapshot",
+      "providerDispatched": "first",
+      "preparedContext": {
+        "contextWindow": 8192
+      },
+      "passed": true
+    },
+    {
+      "id": "V05_route_rewire_and_registration_disposal",
+      "afterEmpty": [
+        "first",
+        "second"
+      ],
+      "afterAdd": [
+        "first",
+        "second",
+        "roundrobin/new-group"
+      ],
+      "afterDispose": [
+        "first",
+        "second"
+      ],
+      "namespacesAfterDispose": [],
+      "passed": true
+    },
+    {
+      "id": "V06_health_flush_without_interleaved_write",
+      "successfulCalls": 1,
+      "records": 1,
+      "passed": true
+    }
+  ],
+  "auditStartCommit": "7b83c3104e3ca7c0ae25f8d45c79945e5ccffdfb",
+  "auditStartHostSha256": "a21dd20a0b18a0a09fb94dcbdada623e8dc26e4a633810798108ef4f7306aa43",
+  "concurrentChange": {
+    "commit": "19ed51df8a171884264714d775339778a9176b24",
+    "change": "外部提交将 defaultEffort medium 改为 max，并新增 README 说明",
+    "verification": "核对业务差分，其余逻辑未变化；重新执行 H06、原有 7 个测试文件、host 语法检查"
+  },
+  "findings": {
+    "total": 19,
+    "P1": 9,
+    "P2": 10,
+    "observationsAreGroupedByRootCause": true
+  }
+}
