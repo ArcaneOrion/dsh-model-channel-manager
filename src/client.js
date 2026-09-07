@@ -549,7 +549,8 @@ window.__ModuleLoader__.load({
       const saveKey = (name) => {
         const ref = (providers[name] || {}).apiKeyEnv || ''
         const val = (keyInput[name] || '').trim()
-        if (!ref || !val || !apiRef) return
+        if (!val || !apiRef) return
+        if (!ref) { setLive((l) => Object.assign({}, l, { [name + '_key']: 'err: 缺少凭据引用名（见高级选项）' })); return }
         savedKeys[name] = val
         apiRef.credentials.set({ ref, value: val }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
@@ -570,6 +571,13 @@ window.__ModuleLoader__.load({
           if (p.displayName && String(p.displayName).toLowerCase().includes(pqLower)) return true
           return (p.models || []).some((m) => m && ((m.id || '').toLowerCase().includes(pqLower) || (m.name || '').toLowerCase().includes(pqLower)))
         })
+      // 凭据引用占用计数：同一 apiKeyEnv 被多个供应商引用 = 共用同一把 key（任一处
+      // 「写入存储」覆盖共享引用，全部共引供应商随之同 key）——用于卡片 ⚠ 警示
+      const refUsage = new Map()
+      for (const p of Object.values(providers || {})) {
+        const ref = p && typeof p.apiKeyEnv === 'string' ? p.apiKeyEnv.trim() : ''
+        if (ref) refUsage.set(ref, (refUsage.get(ref) || 0) + 1)
+      }
       const cards = visibleEntries.map(({ name, p, realIdx }) => {
         const isOpen = pqLower ? true : !!exp[name]
         const models = p.models || []
@@ -619,21 +627,23 @@ window.__ModuleLoader__.load({
               sel('协议架构 (API)', '当前支持的请求格式', p.api || 'openai-completions', APIS, (v) => updateP(name, { api: v }))
             ),
             el('div', { className: 'mcm-row' },
-              tf('Base URL', 'API 端点基础地址', p.baseURL || '', (v) => updateP(name, { baseURL: v }), true),
-              tf('API Key 环境变量名', '凭据存储引用名', p.apiKeyEnv || '', (v) => updateP(name, { apiKeyEnv: v }), true)
+              tf('Base URL', 'API 端点基础地址', p.baseURL || '', (v) => updateP(name, { baseURL: v }), true)
             ),
-            field('快速写入密钥', '将 API Key 安全存入 DSH 凭据存储', false,
+            field('API Key', '粘贴或输入后失焦即自动写入 DSH 凭据存储（~/.dsh/.credentials.yaml，0600，write-only 读不回）；清空输入框不会删除已存 key；启动环境若有同名变量则其只读优先', false,
               el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
-                el('input', { type: 'password', className: 'mcm-in mono', style: { flex: 1 }, placeholder: '输入并覆盖 API Key (sk-...)', value: keyInput[name] || '', onChange: (e) => setKeyInput((k) => Object.assign({}, k, { [name]: e.target.value })) }),
-                btn('写入存储', () => saveKey(name)),
-                live[name + '_key'] === 'saved' ? el('span', { style: { color: 'var(--dsw-alias-state-success-primary)', fontSize: 12 } }, '✓ 已保存') : null
+                el('input', { type: 'password', className: 'mcm-in mono', style: { flex: 1 }, placeholder: '粘贴 API Key (sk-...)，失焦自动保存', value: keyInput[name] || '', onChange: (e) => setKeyInput((k) => Object.assign({}, k, { [name]: e.target.value })), onBlur: () => { const v = (keyInput[name] || '').trim(); if (v && v !== savedKeys[name]) saveKey(name) } }),
+                live[name + '_key'] === 'saved' ? el('span', { style: { color: 'var(--dsw-alias-state-success-primary)', fontSize: 12 } }, '✓ 已保存') : (live[name + '_key'] && String(live[name + '_key']).indexOf('err') === 0 ? el('span', { style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, live[name + '_key']) : null)
               )
             ),
+            (p.apiKeyEnv && (refUsage.get(p.apiKeyEnv) || 0) > 1) ? el('div', { style: { color: 'var(--dsw-alias-state-warn-primary)', fontSize: 11, lineHeight: 1.6 } }, '⚠ 该引用被 ' + refUsage.get(p.apiKeyEnv) + ' 个供应商共用 = 共用同一把 Key，任一处写入会同时覆盖所有供应商；若非有意，请在高级选项中修改其中一个「凭据引用名」并重新写入') : null,
             el('div', { style: { borderTop: '1px dashed var(--dsw-alias-border-l2)', paddingTop: 10 } },
               el('div', { style: { cursor: 'pointer', fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-secondary)', display: 'flex', alignItems: 'center', gap: 6 }, onClick: () => setSa((s) => Object.assign({}, s, { [name]: !s[name] })) },
                 el('span', null, sa[name] ? '▼' : '▶'), '供应商高级选项 (Headers, 传输, 超时, 图片预算, 重试策略, Compat)'
               ),
               sa[name] ? el('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, marginTop: 10 } },
+                el('div', { className: 'mcm-row' },
+                  tf('凭据引用名 (apiKeyEnv)', 'key 在凭据存储（~/.dsh/.credentials.yaml）中的引用名，write-only 读不回已存值；启动环境同名变量只读优先；修改后需重新写入 key', p.apiKeyEnv || '', (v) => updateP(name, { apiKeyEnv: v }), true)
+                ),
                 el('div', { className: 'mcm-row' },
                   nf('默认 Context Window', '未单独配置模型时的默认窗口', p.defaultContextWindow || 0, (v) => updateP(name, { defaultContextWindow: v })),
                   nf('默认 Max Tokens', '未单独配置模型时的最大输出', p.defaultMaxTokens || 0, (v) => updateP(name, { defaultMaxTokens: v }))
@@ -768,7 +778,14 @@ window.__ModuleLoader__.load({
         ...cards,
         visibleEntries.length === 0 && pqLower ? el('div', { className: 'mcm-empty' }, '无匹配「' + pq.trim() + '」的供应商或模型') : null,
         btn('＋新增提供商 (Provider)', () => {
-          const nm = uniqueSuffixName('provider-', (n) => Object.prototype.hasOwnProperty.call(providers, n))
+          // 双重去重：provider ID 与凭据引用都不得与现有草稿冲突。改名供应商会保留旧
+          // 引用（write-only 无法搬移），只按 ID 去重会复活 provider-1 并继承已被占用
+          // 的 PROVIDER_1_API_KEY——两个供应商同引用 = 共用同一把 key（写入互相覆盖）
+          const idsTaken = new Set(Object.keys(providers || {}))
+          const refsTaken = new Set(Object.values(providers || {}).map((p) => p && p.apiKeyEnv).filter(Boolean))
+          let i = 1
+          while (idsTaken.has('provider-' + i) || refsTaken.has(normalizeCredentialRef('provider-' + i + '_api_key'))) i++
+          const nm = 'provider-' + i
           const keyRef = normalizeCredentialRef(nm + '_api_key')
           setDraft((d) => Object.assign({}, d || {}, { [nm]: { api: 'openai-completions', baseURL: '', apiKeyEnv: keyRef, displayName: nm, models: [], headers: Object.assign({}, DEFAULT_HEADERS) } }))
           setExp((e) => Object.assign({}, e, { [nm]: true }))

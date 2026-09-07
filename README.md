@@ -79,6 +79,12 @@ DSH 原生模型渠道管理。两半结构：
 - 历史健康流水保留在原 ID 名下（历史存档不受影响）
 - 改名后仍需点击右上「保存全部变更」落盘
 
+## 密钥写入（凭据引用虚拟化）
+
+- 面板主视图只出现「API Key」输入框：**粘贴或输入后失焦即自动写入** DSH 凭据存储（`~/.dsh/.credentials.yaml`，0600，write-only 读不回），无手动按钮；清空输入框不会删除已存 key。上游 llm-pi-ai 的供应商 profile 只有 `apiKeyEnv` 一个密钥字段（凭据引用名），不存在内联 key 的选项——secrets 不进 settings.yaml、不随 `settings.describe` 下发，是有意的安全设计。
+- 「API Key 环境变量名」已收进供应商高级选项、更名「凭据引用名 (apiKeyEnv)」：新增供应商时自动生成（`normalizeCredentialRef`），并对 **ID + 引用双重去重**——改名供应商会保留旧引用（write-only 无法搬移），只按 ID 去重会复活 `provider-1` 并继承已被占用的 `PROVIDER_1_API_KEY`（两个供应商同引用 = 共用同一把 key，写入互相覆盖）。此坑已由双重去重修复，存量撞引用靠 ⚠ 警示提示手动处理（改其中一个引用 → 重新写入）。
+- 环境优先级：启动 shell 同名变量（只读、优先）> 存储的 key > 项目 `.env` > 用户 `.env`（credentials-local 分层）；想用环境注入直接在启动环境 export 即可。
+
 **曾踩坑**：`selected` 曾初始化为 `missing`（只含"可加"），而 configured 项 checkbox 显示 `checked:true` 却不在 selected 里——应用时 `kept = models.filter(m => cs.has(m.id))` 把已配置模型全部丢弃 → **已有模型消失**。修复 = selected 初始化为 `configured ∩ 端点`。
 
 ## host 半内部接口
