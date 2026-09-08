@@ -994,11 +994,17 @@ window.__ModuleLoader__.load({
               lastTs: 0,
               lastOk: null,
               lastCode: null,
-              recentErrors: 0
+              recentErrors: 0,
+              tokSum: 0
             })
           }
         }
       }
+
+      // 窗口级 token 聚合（计费口径 = input + cacheRead + cacheWrite + output，与 dsh-token-meter 一致）
+      let totalTokIn = 0
+      let totalTokOut = 0
+      let totalTokCache = 0
 
       // 累加时间窗口内的真实流水记录
       for (const e of allEvents) {
@@ -1019,11 +1025,19 @@ window.__ModuleLoader__.load({
             lastTs: 0,
             lastOk: null,
             lastCode: null,
-            recentErrors: 0
+            recentErrors: 0,
+            tokSum: 0
           }
           pMap.set(e.model, a)
         }
         a.total++
+        const tokIn = (e && e.inputTokens) || 0
+        const tokOut = (e && e.outputTokens) || 0
+        const tokCache = ((e && e.cacheReadTokens) || 0) + ((e && e.cacheWriteTokens) || 0)
+        totalTokIn += tokIn
+        totalTokOut += tokOut
+        totalTokCache += tokCache
+        a.tokSum += tokIn + tokOut + tokCache
         if (e.ok) {
           a.success++
           if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs
@@ -1104,6 +1118,14 @@ window.__ModuleLoader__.load({
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '真实上游交互捕获')
           ),
           el('div', { className: 'mcm-metric-card' },
+            el('span', { className: 'mcm-metric-label' }, '总 Token 用量'),
+            el('span', { className: 'mcm-metric-value' }, (totalTokIn + totalTokOut + totalTokCache).toLocaleString('zh-CN')),
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
+              '输入 ' + totalTokIn.toLocaleString('zh-CN') + ' · 输出 ' + totalTokOut.toLocaleString('zh-CN') +
+              (totalTokCache > 0 ? ' · 缓存 ' + totalTokCache.toLocaleString('zh-CN') : '')
+            )
+          ),
+          el('div', { className: 'mcm-metric-card' },
             el('span', { className: 'mcm-metric-label' }, '窗口可用率'),
             el('span', { className: 'mcm-metric-value', style: { color: totalSuccess === totalRequests ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-label-primary)' } }, globalRate),
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, totalSuccess + ' 成功 / ' + (totalRequests - totalSuccess) + ' 异常')
@@ -1150,7 +1172,7 @@ window.__ModuleLoader__.load({
                 )
               ),
               el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 8 } },
-                el('span', null, 'TTFT: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgTtft)),
+                el('span', null, 'TTFT: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, m.avgTtft), ' · Tokens: ', el('strong', { style: { color: 'var(--dsw-alias-label-primary)' } }, (m.tokSum || 0).toLocaleString('zh-CN'))),
                 el('span', null, '最近: ', el('span', { style: { color: 'var(--dsw-alias-label-secondary)' } }, m.lastTimeStr))
               )
             ))

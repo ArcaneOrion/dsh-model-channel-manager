@@ -50,6 +50,14 @@ DSH 原生模型渠道管理。两半结构：
 
 **不要把 `result.value` 当 `result` 读**——曾因少解一层导致整个面板静默空数据（describe 返回 namespaces 但全面板 0 provider，无任何错误提示）。
 
+## Token 用量统计（健康面板）
+
+- 健康记录条目在既有字段（ts/provider/model/ok/ttftMs/latencyMs/code）上**增量附带**上游真实 token 用量：`inputTokens` / `outputTokens` / `cacheReadTokens` / `cacheWriteTokens` / `reasoningTokens`——来自适配器在 `finish` 前发出的 `usage` StreamChunk（rc.2 运行时 `StreamChunk` 契约，pi-ai `done`/`error` 事件都带）；无 usage 则这些字段不写。
+- **计费口径与 DSH `tokenMeter` 一致**：input + cacheRead + cacheWrite + output（互斥计数，`inputTokens` 不含缓存命中）。面板「总 Token 用量」卡按统计窗口求和，副行显示 输入/输出/缓存 拆分；每模型卡底部显示该模型窗口 Tokens。
+- 采集点与健康记录**同址**（保证 token 与请求数同记录同窗口）：全局 `llm/stream` 拦截器 + 轮询引擎 `streamAttempt`（成功/失败/超时路径都尽量携带；pi-ai 的 error 事件同样上报部分 usage）。
+- 测速（⚡测速）/ 单模型测试（⚡测试）消耗的 token **不计入**——与「测速结果不入健康流水」的既有口径一致。
+- 记录 schema 无需改动（`records` 为 `z.array(z.any())`），无新 RPC / settings 字段；client 5s 轮询自动刷新。
+
 ## 测试通道（模型可用性）
 
 - 模型行「⚡测试」→ 弹窗输入自定义问题 + maxTokens → 发送
@@ -107,6 +115,7 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 
 - 动态超时实现了首响应 + 流中空闲；全炸后「清冷却重试一轮」回溯，未实现「等待最早冷却」的睡眠分支
 - 测速结果不入健康流水（pi 记）；smart 键只统计真实请求
+- **Token 字段只在新记录上出现**：host 升级重启前的存量健康记录无 token 字段，7 天视图对重启前的调用会低估 token（请求数/可用率不受影响）；数据自重启后开始累积
 - 配置里 provider 必须非虚拟路由（防自引用）
 - 轮询渠道/健康统计面板需要 host 新代码（重启后生效）；健康流水的数据在**实际请求过轮询组**后才出现
 - `reasoningEfforts` 缺失（undefined）的 model 正确渲染（`|| {}` 兜底）

@@ -266,7 +266,18 @@ export function apply(ctx) {
         const now = Date.now();
         const key = gid || 'global';
         const list = state.records[key] || (state.records[key] = []);
-        list.push({ ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null });
+        const rec = { ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null };
+        // 上游真实 token 用量（来自 usage StreamChunk，计费口径与 dsh-token-meter 一致）：
+        // 展平写入记录条目；缺失/非法字段不写，旧记录按 0 处理（向后兼容）。
+        const u = entry.usage;
+        if (u && typeof u === 'object') {
+            if (Number.isFinite(u.inputTokens)) rec.inputTokens = u.inputTokens;
+            if (Number.isFinite(u.outputTokens)) rec.outputTokens = u.outputTokens;
+            if (Number.isFinite(u.cacheReadTokens)) rec.cacheReadTokens = u.cacheReadTokens;
+            if (Number.isFinite(u.cacheWriteTokens)) rec.cacheWriteTokens = u.cacheWriteTokens;
+            if (Number.isFinite(u.reasoningTokens)) rec.reasoningTokens = u.reasoningTokens;
+        }
+        list.push(rec);
         const cutoff = now - 7 * 24 * 3600 * 1000;
         // 每键保留 300 条：健康页签 30m/24h 视图与选择器置顶绰绰有余，同时把
         // settings.yaml 的体量压到可读（2000 条/键时该文件一度膨胀到 2 万行）
@@ -317,6 +328,7 @@ export function apply(ctx) {
         let started = false;
         let ttftMs = null;
         let lastAt = Date.now();
+        let lastUsage = null;
         const closeInner = async () => { try {
             const c = inner.return ? inner.return() : null;
             if (c && c.then)
@@ -343,6 +355,10 @@ export function apply(ctx) {
                 }
                 lastAt = Date.now();
                 const chunk = next.value;
+                // 适配器在 finish 前发 usage 块（pi-ai done/error 都带）；捕获后随记录写入，
+                // 与请求/健康计数保持同一记录、同一窗口口径
+                if (chunk && chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object')
+                    lastUsage = chunk.usage;
                 if (chunk === undefined)
                     throw { code: 'STREAM_CLOSED', message: 'channel stream ended without a terminal chunk' };
                 if (!started) {
@@ -357,11 +373,11 @@ export function apply(ctx) {
                         const reason = chunk.reason || {};
                         // 引擎提前终止的内层流不会被全局拦截器完整排水记账，这里自行记录
                         if (isSuccessReason(reason)) {
-                            recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: 'EMPTY_RESPONSE' });
+                            recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: 'EMPTY_RESPONSE', usage: lastUsage });
                             throw { code: 'EMPTY_RESPONSE', message: 'model returned a completed response with no content' };
                         }
                         const preCode = (reason.failure && reason.failure.code) || 'STREAM_ERROR';
-                        recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: preCode });
+                        recordHealth(cand.provider, cand, { ok: false, ttftMs: null, latencyMs: null, code: preCode, usage: lastUsage });
                         throw { code: preCode, message: (reason.failure && reason.failure.message) || 'candidate stream failed' };
                     }
                     else {
@@ -372,14 +388,14 @@ export function apply(ctx) {
                     if (isTerminalChunk(chunk)) {
                         const reason = chunk.reason || {};
                         if (isSuccessReason(reason)) {
-                            recordHealth(cand.provider, cand, { ok: true, ttftMs, latencyMs: Date.now() - attemptStart, code: null });
+                            recordHealth(cand.provider, cand, { ok: true, ttftMs, latencyMs: Date.now() - attemptStart, code: null, usage: lastUsage });
                             yield chunk;
                             return;
                         }
                         // 内容已向下游输出：绝不能再下发该失败终止块（否则出现 finish 后继续输出/双 finish），
                         // 改为抛错并标记 emitted，由组层直接终结本次请求
                         const midCode = (reason.failure && reason.failure.code) || 'STREAM_ERROR';
-                        recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: midCode });
+                        recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: midCode, usage: lastUsage });
                         throw { code: midCode, message: (reason.failure && reason.failure.message) || 'candidate stream failed mid-stream' };
                     }
                     yield chunk;
@@ -391,7 +407,7 @@ export function apply(ctx) {
             if (started && err && typeof err === 'object')
                 err.emitted = true;
             if (err && err.code === 'TIMEOUT')
-                recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: 'TIMEOUT' });
+                recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: 'TIMEOUT', usage: lastUsage });
             throw err;
         }
     }
@@ -505,7 +521,7 @@ export function apply(ctx) {
     // ---------- 测速 ----------
     async function measureCandidate(cfg, cand, st) {
         const llm = ctx.llm;
-        const inner = llm.stream({ provider: cand.provider, model: cand.model, messages: [{ role: 'user', content: [{ type: 'text', text: st.prompt }] }], maxTokens: st.maxTokens });
+        const inner = llm.stream({ provider: cand.provider, model: cand.model, messages: [{ role: 'user', content: [{ type: 'text', text: st.prompt }] }], maxTokens: st.maxTokens, sessionId: 'mcm-speedtest-' + (st.nonce ?? Date.now()) });
         const start = Date.now();
         let ttft = null;
         const closeInner = async () => { try {
@@ -654,7 +670,7 @@ export function apply(ctx) {
     // ---------- 单模型真实请求测试（client 经 settings 总线下发，走 DSH 真实 llm.stream 链路） ----------
     async function runModelTest(provider, model, prompt, maxTokens) {
         const llm = ctx.llm;
-        const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512 });
+        const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512, sessionId: 'mcm-modeltest-' + Date.now() });
         const start = Date.now();
         let ttft = null;
         let text = '';
@@ -828,6 +844,7 @@ export function apply(ctx) {
         let ttft = null;
         let lastError = null;
         let isSuccess = false;
+        let usage = null;
         // 用户主动中止不是渠道故障：AbortError / code ABORTED / signal 已 aborted
         // 三种形态都不进健康流水，否则污染成功率与 smart 键的 reliability 权重
         const isAbortLike = (err) => {
@@ -841,6 +858,9 @@ export function apply(ctx) {
         };
         try {
             for await (const chunk of next()) {
+                // 适配器在 finish 前发 usage 块（done/error 都带）；捕获后随记录写入
+                if (chunk && chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object')
+                    usage = chunk.usage;
                 if (ttft === null && isContentChunk(chunk)) {
                     ttft = Date.now() - startTs;
                 }
@@ -863,6 +883,7 @@ export function apply(ctx) {
                     ttftMs: isSuccess ? ttft : null,
                     latencyMs: isSuccess ? latency : null,
                     code: isSuccess ? null : (lastError || 'UNKNOWN_TERMINAL'),
+                    usage,
                 });
             }
         } catch (err) {
@@ -871,6 +892,7 @@ export function apply(ctx) {
                 recordHealth(p, { provider: p, model: options.model }, {
                     ok: false,
                     code: (err && err.code) || (err && err.message) || 'EXCEPTION',
+                    usage,
                 });
             }
             throw err;
