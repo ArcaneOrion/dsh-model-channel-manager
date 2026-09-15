@@ -19,7 +19,14 @@ DSH 原生模型渠道管理。两半结构：
 
 ## 挂载
 
-`profiles/web/package.json`：
+从 npm 装（发布版）：
+
+```bash
+dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
+# 然后重启 dsh --profile web 并刷新页面
+```
+
+本地开发用 `link:`（改源码即时生效）——`profiles/web/package.json`：
 - `dependencies` 加 `"@arcaneorion/dsh-model-channel-manager": "link:/home/arcaneorion/AI/AI-DSH/plugin/model-channel-manager"`
 - `dsh.profile.bundles` 加 `"@arcaneorion/dsh-model-channel-manager"`
 - `pnpm install` 后重启 `dsh --profile web`
@@ -28,6 +35,22 @@ DSH 原生模型渠道管理。两半结构：
 - host 日志出现 `[model-channel-manager] booted, groups: ...`
 - `llm.providers` 出现 `roundrobin/<组id>`
 - settings describe 含 `model-channels` / `model-channel-health` 命名空间
+
+## 兼容性（DSH 版本）
+
+本包在 **DSH `0.1.1-rc.2`**（`dsh --version`）上开发与实测，宿主侧依赖按该版本**精确钉住**：
+
+| 宿主包 | 声明 | 用途 |
+|---|---|---|
+| `@deepseek-ai/dsh-llm` | `0.1.1-rc.2` | `llm.registerAdapter` / `llm.stream`（轮询引擎与健康采集） |
+| `@deepseek-ai/dsh-settings` | `0.1.1-rc.2` | `model-channels` / `model-channel-health` 命名空间读写 |
+| `@deepseek-ai/dsh-client-connection` | `0.1.1-rc.2` | client 半的 `connection.api` 调用 |
+| `@deepseek-ai/dsh-client-ui-conversation` | `0.1.1-rc.2` | `conversation.view` 页签座位 |
+| `@deepseek-ai/cordis` | `^4.0.2` | 插件生命周期 |
+| `@deepseek-ai/schemastery` | `>=3.18.2` | 配置 schema |
+
+**换 DSH 版本（例如 `0.1.2-rc.1`）必须先重新验证、再放宽 peer**：宿主服务与座位契约跨版本会变，
+精确钉住的 peer 会在安装时报冲突——这正是它存在的意义，好过装上去静默失效。
 
 ## 数据通道（全走公共 seam，无私有 RPC）
 

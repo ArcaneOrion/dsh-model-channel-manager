@@ -1,6 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -34,7 +34,13 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@deepseek-ai/schemastery": ">=3.18.2"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-settings": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.1-rc.2",
+    "@deepseek-ai/schemastery": ">=3.18.2",
+    "react": "^18.3.1"
   },
   "dsh": {
     "bundle": {
