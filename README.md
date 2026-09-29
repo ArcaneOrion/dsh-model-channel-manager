@@ -38,7 +38,11 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 
 ## 兼容性（DSH 版本）
 
-本包在 **DSH `0.1.1-rc.2`**（`dsh --version`）上开发与实测，宿主侧依赖按该版本**精确钉住**：
+> **当前工作树已移植到 DSH `0.2.0-rc.1`**（peer 按 `0.2.0-rc.1` 声明；settings 寻址从「自建命名空间」改为「本行实例配置」——
+> 原先的 `model-channels` + `model-channel-health` 两个命名空间合并为本行 Config 的
+> `groups` / `providerOrder` / `effortMemory` / `health`）。下面这段 `0.1.1-rc.2` 的记录仅作历史基线参考。
+
+本包原在 **DSH `0.1.1-rc.2`**（`dsh --version`）上开发与实测，宿主侧依赖按该版本**精确钉住**：
 
 | 宿主包 | 声明 | 用途 |
 |---|---|---|
@@ -59,13 +63,17 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 - 保存轮询组 = `api.settings.update({ns:'model-channels', patch:{groups}})`
 - ⚡测速 = `api.settings.update({ns:'model-channel-health', patch:{speedRequest:{group,nonce}}})`（host watcher 消费）
 - 单模型测试 = `settings.update({ns:'model-channel-health', patch:{testRequest:{nonce,provider,model,prompt,maxTokens}}})`；host 执行真实 `llm.stream` 后把结果写回 `testResults[nonce]`；client 轮询 describe 直到 ok/error
-- `apiRef` 获取：`ctx.get('connection').api`（static client 必须在 `inject` 里声明 `connection`，apply 时捕获进闭包）
+- `apiRef` 获取：**0.2 为 `ctx.remote`**（插件级 `inject` 声明 `remote` / `remote.settings` / `remote.credentials` / `remote.llm`，apply 时经 `ctx.inject(['remote'])` 捕获）；0.1 的 `ctx.get('connection').api` 已不存在。
+- 上述调用形状仍保留 0.1 的样子：client 半内建门面 `makeLegacyApi` 把 0.2 的**位置参数 + RemoteResult** 适配回旧的**对象入参 + `{result:{ok,value}}`**，并把 `model-channels` / `model-channel-health` 合成回旧命名空间视图（真实承载是本插件行 id `model-channel-manager` 的实例配置）。
 
-> **宿主边界（重要）**：DSH apiproxy 对 settings RPC 有暴露白名单（`exposedNamespaces()` = LLM provider ns + `WEB_/PRODUCT_SETTINGS_NAMESPACES`，2026-07 起生效）。含该边界的宿主必须放行 `model-channels` / `model-channel-health`（本仓已在 harness `dsh-host-apiproxy` 打 `PLUGIN_SETTINGS_NAMESPACES` 补丁），否则 describe 会过滤掉这两个命名空间、写入报 `settings-not-exposed`——轮询组保存/健康面板/测速/测试全链路静默失效。
+> **宿主边界（0.1 历史，0.2 已不适用）**：0.1 的 settings RPC 走 apiproxy 暴露白名单（`exposedNamespaces()` = LLM provider ns + `WEB_/PRODUCT_SETTINGS_NAMESPACES`），当时含该边界的宿主必须放行 `model-channels` / `model-channel-health`（本仓曾在 harness `dsh-host-apiproxy` 打 `PLUGIN_SETTINGS_NAMESPACES` 补丁）。
+> **0.2 的 settings 命名空间就是 profile 行 id**，由 `@deepseek-ai/dsh-api-settings-controller` 的 `describe` 直接投影本行实例配置，没有该白名单环节；对应地，本插件的数据落在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `model-channel-manager` 行 `config` 下。
 
 ## 响应信封（重要）
 
-所有 `connection.api.*` 调用返回 `{result: {ok, value}}` 包裹（`dsh-client-connection` 的 `callUnary` + zod 校验）。
+0.1 的 `connection.api.*` 返回 `{result: {ok, value}}` 包裹（`dsh-client-connection` 的 `callUnary` + zod 校验）。
+**0.2 的原生远程调用直接返回 `RemoteResult`（`{ok, value} | {ok:false, error}`）**，不再有 `result` 外层；
+本插件 client 的门面把它重新包回旧形状，因此下面这层解包逻辑在 0.2 上依然成立：
 - 成功：`resp.result.value.{...}`
 - 失败：`resp.result.ok === false`，错误在 `resp.result.error.message`
 - `settings.describe` 的 value = `{writable, hasDocument, namespaces:[{ns, value, base, user, revision, ...}]}`
@@ -167,3 +175,6 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 19. **single slot 换占必须传负 priority**：`conversation.input.model` 是单占位 seat，cell = slot 本身；原生无 priority（= 0），插件同名注册同不传 → **exact-priority 撞格直接抛错**（「already has a registration at priority 0」→ apply 失败 → 整个插件含模型配置页签加载失败，面板全白）。规则：同 cell 多 entry 按 priority **升序、数值最小者渲染**，遮蔽原生传 `priority: -1`。注意 slot-catalog 的「Do NOT pass priority」只适用于**动态包**（guard 自动分配）；静态 bundle 必须自己传。另：mock 验证 slots.register 不会暴露 occupancy 检查（mock 不抛）——验证座位替换必须复刻真实 SlotCore 撞格语义。选择器拆出后，回归测试随代码迁至 `../model-selector-search/tests/slot-priority.test.cjs`。
 20. **诊断临时实例必须独立 home（`DSH_HOME=/tmp/dsh-diag dsh ...`）**：临时实例与主实例共用 `~/.dsh` 会并发写同一会话日志与 `session_projcache.json`——两进程各自的 seq 计数器交错追加，日志出现重复 seq → `corrupt session log: seq gap in committed region` → 会话 resume 直接拒绝，表现为该会话内模型目录加载失败（选择器「暂无可用模型」）。修复：解压 jsonl 删掉多余事件即可（后续 seq 连续则天然对齐），用 `session-persistence-jsonl` 的 `scanLog` 校验后压缩回写；杀进程前务必备份。
 21. **适配器契约以安装运行时的 d.ts 为准，不能照抄源码仓快照**：源码仓较新、rc.2 运行时的 `LlmAdapter` 多一个必需的 `prepareCall(provider, model, signal) → Promise<{model, stream}>`（主分发路径 llm.stream/llm.prepareCall 都先走它再 `adapterCall.stream(options)`；`adapter.stream` 在 rc.2 服务层从不直调）。缺它的症状极具迷惑性：注册/目录/菜单全正常，**真实发对话**才报 `registration.adapter.prepareCall is not a function`。实现对齐 llm-pi-ai 的快照模式：prepare 时捕获一份配置快照，元数据与 dispatch 都出自同一代。回归：`tests/adapter-contract.test.cjs`（T3 直接解析安装版 d.ts 的 LlmAdapter 方法集做契约同步）。
+22. **0.2 配置写入是 HMR 独占事务**：`settings.update` → `configEditor.edit()` → `hmr.runExclusive()`；在 `loader/volatile-update` 回调里回写会抛 `HMR transactions cannot be nested`（实测一段会话内 15 次，面板“测试”结果永远落不了盘）。事务内创建的**任何**异步资源（`AsyncResource` / `setTimeout` / `setInterval`）都继承事务上下文，**只有 `AsyncLocalStorage.exit()` 能切出**：`ctx.get('hmr').executing.exit(fn)`（仅当 `getStore()` 为真时切）。写入会被 `runExclusive` 排进队列、在本次事务结束后执行；**监听器保持同步、不要在外层事务里 await 它**（队列串行，互等即死锁）。
+23. **整字段落盘 + 内存态被配置快照覆盖**：`settings.update` 是整字段替换；`reloadFromConfig()` 每次 volatile-update 都用配置快照整体覆盖 `state.records`，而健康 flush 有 2s 防抖 → **刚记下的一笔在落盘前就被内存覆盖**（症状：面板“测试”成功不入账，失败反被全局拦截器的 catch 记上）。修法：`pendingRecords` 缓冲，快照覆盖后把未落盘的补回，flush 成功后再清账。
+24. **nonce 落盘时机与启动竞态**：`lastTestHandledNonce` / `lastHandledNonce` 必须在**得出结果之后**写（提前写会让“未就绪”的重试被自己的持久值挡掉）；启动瞬间凭据服务尚未就绪时测试/测速会以 `MISSING_CREDENTIAL` 失败（凭据其实已在 `.credentials.yaml` 里），应识别为「还没就绪」→ 释放认领 + 5s 延时重试（上限 24 次），**不要**写成渠道故障；测速还必须在整组候选都因未就绪失败时**不落盘、不冷却**，否则一次启动重放就把所有渠道误判成故障。

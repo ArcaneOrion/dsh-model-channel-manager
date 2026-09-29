@@ -1,6 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -34,12 +34,13 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-settings": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-connection": "0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-conversation": "0.1.1-rc.2",
-    "@deepseek-ai/schemastery": ">=3.18.2",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.1",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-connection": "0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.0-rc.1",
+    "@deepseek-ai/dsh-api-remotes": "0.2.0-rc.1",
+    "@deepseek-ai/schemastery": ">=3.18.4",
     "react": "^18.3.1"
   },
   "dsh": {
@@ -47,7 +48,7 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": ["slots", "connection"],
+      "inject": ["slots"],
       "platform": "web"
     }
   }

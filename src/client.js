@@ -12,6 +12,103 @@ window.__ModuleLoader__.load({
     let apiRef = null
     const savedKeys = {}
 
+    // dsh 0.2：客户端远程面由 connection.api 改为 ctx.remote；参数改为位置参数，结果统一为
+    // RemoteResult。本适配层把两者还原成 0.1 的调用形状（对象入参 + {result:{ok,value}}）。
+    // 另：0.2 的 settings 命名空间恒等于「插件行 id」，本插件的两套旧命名空间
+    // （model-channels / model-channel-health）现由其实例配置的字段承载，在此合成回旧视图。
+    const NS_MCM = 'model-channel-manager'
+    const makeLegacyApi = (remote) => {
+      const wrap = (res) => ({ result: res || { ok: false } });
+      const readMcm = async () => {
+        const res = await remote.settings.describe()
+        if (!res || res.ok !== true) return null
+        return ((res.value && res.value.namespaces) || []).find((n) => n && n.ns === NS_MCM) || null
+      }
+      return {
+        settings: {
+          describe: async () => {
+            const res = await remote.settings.describe()
+            if (!res || res.ok !== true) return wrap(res)
+            const namespaces = (res.value && res.value.namespaces) || []
+            const mcm = namespaces.find((n) => n && n.ns === NS_MCM)
+            const value = (mcm && mcm.value) || {}
+            const user = (mcm && mcm.user) || {}
+            return { result: { ok: true, value: { namespaces: [...namespaces,
+              { ns: 'model-channels', value: { groups: value.groups || [], providerOrder: value.providerOrder || [], effortMemory: value.effortMemory || {} }, user: { groups: user.groups, providerOrder: user.providerOrder }, revision: (mcm && mcm.revision) || 0 },
+              { ns: 'model-channel-health', value: value.health || {}, user: (user && user.health) || {}, revision: (mcm && mcm.revision) || 0 },
+            ] } } }
+          },
+          // 旧签名：update({ ns, patch })
+          update: async (args) => {
+            const ns = (args && args.ns) || NS_MCM
+            const patch = (args && args.patch) || {}
+            if (ns === 'model-channels') return wrap(await remote.settings.update(NS_MCM, patch, undefined))
+            const row = await readMcm()
+            const health = (row && row.value && row.value.health) || {}
+            return wrap(await remote.settings.update(NS_MCM, { health: Object.assign({}, health, patch) }, undefined))
+          },
+          // 旧签名：mutate({ ns, ops })——0.2 只对真实行命名空间提供 path-ops；
+          // 本插件自身的健康子树用合并写实现等价语义。
+          mutate: async (args) => {
+            const ns = (args && args.ns) || NS_MCM
+            const ops = (args && args.ops) || []
+            if (ns !== 'model-channels' && ns !== 'model-channel-health' && ns !== NS_MCM) {
+              return wrap(await remote.settings.mutate(ns, ops, undefined))
+            }
+            const row = await readMcm()
+            const health = Object.assign({}, (row && row.value && row.value.health) || {})
+            const top = {
+              groups: (row && row.value && row.value.groups) || [],
+              providerOrder: (row && row.value && row.value.providerOrder) || [],
+            }
+            for (const op of ops) {
+              const path = (op && op.path) || []
+              const root = (ns === 'model-channels') ? (path[0] === 'groups' ? top : (path[0] === 'providerOrder' ? top : health)) : health
+              if (path.length === 0) continue
+              const key = path[0]
+              const rest = path.slice(1)
+              if (rest.length === 0) {
+                if (op.op === 'set') root[key] = op.value
+                else delete root[key]
+              } else if (rest.length === 1) {
+                const child = Object.assign({}, root[key] || {})
+                if (op.op === 'set') child[rest[0]] = op.value
+                else delete child[rest[0]]
+                root[key] = child
+              }
+            }
+            if (ns === 'model-channels') {
+              return wrap(await remote.settings.update(NS_MCM, { groups: top.groups, providerOrder: top.providerOrder }, undefined))
+            }
+            return wrap(await remote.settings.update(NS_MCM, { health }, undefined))
+          },
+        },
+        credentials: {
+          // 旧签名：set({ ref, value })
+          set: async (args) => wrap(await remote.credentials.set((args && args.ref) || '', (args && args.value) || '')),
+          // 旧签名：describe({ refs: [...] }) → value.credentials[ref]
+          describe: async (args) => {
+            const refs = (args && args.refs) || []
+            const res = await remote.credentials.describe(refs)
+            if (!res || res.ok !== true) return wrap(res)
+            return { result: { ok: true, value: { credentials: res.value || {} } } }
+          },
+        },
+        llm: {
+          // 旧签名：discoverModels({ settingsNs, ...request }) → value.models
+          discoverModels: async (args) => {
+            const settingsNs = (args && args.settingsNs) || 'llm-pi-ai'
+            const request = Object.assign({}, args)
+            delete request.settingsNs
+            const res = await remote.llm.discoverModels(settingsNs, request)
+            if (!res || res.ok !== true) return wrap(res)
+            const value = res.value
+            return { result: { ok: true, value: Array.isArray(value) ? { models: value } : value } }
+          },
+        },
+      }
+    }
+
     const CSS = `
 .mcm-root { display:flex; flex-direction:column; height:100%; overflow:hidden; font-size:13px; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-base); }
 .mcm-header { display:flex; align-items:center; justify-content:space-between; padding:12px 24px; border-bottom:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); flex-shrink:0; }
@@ -1428,8 +1525,9 @@ window.__ModuleLoader__.load({
 
 
     function apply(ctx) {
-      const connection = ctx.get('connection')
-      apiRef = connection && connection.api ? connection.api : null
+      // dsh 0.2：远程调用面为 ctx.remote（connection.api 已移除）。保留 0.1 的调用形状，
+      // 由下面的适配层把位置参数/RemoteResult 还原成旧的 {result:{ok,value}} 与对象入参。
+      ctx.inject(['remote'], (scope) => { apiRef = makeLegacyApi(scope.remote) })
       ctx.effect(() => {
         const tag = document.createElement('style')
         tag.dataset.mcmStyle = ''
@@ -1448,6 +1546,6 @@ window.__ModuleLoader__.load({
       ))
     }
 
-    return { name: 'model-channel-manager', inject: ['slots', 'connection'], apply }
+    return { name: 'model-channel-manager', inject: ['slots', 'remote', 'remote.settings', 'remote.credentials', 'remote.llm'], apply }
   },
 })

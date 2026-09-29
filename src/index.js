@@ -5,15 +5,9 @@ const ROUTE_PREFIX = 'roundrobin/';
 const GROUP_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 const NS_CONFIG = 'model-channels';
 const NS_HEALTH = 'model-channel-health';
-const CONFIG_SCHEMA = z.object({
-    groups: z.array(z.object({
-        id: z.string(),
-    }).loose(true)).default([]),
-    // 面板供应商顺序的持久化载体：settings-file 的 patchNode 对 map 键序是盲的
-    // （纯重排 = 零 diff），但数组是 deepEqual 不等即整值 setIn（原位、保序）。
-    // 顺序存成数组数据而不是对象键序元数据，重启后从文件真实还原。引擎不消费它。
-    providerOrder: z.array(z.string()).default([]),
-}).loose(true);
+// dsh 0.2：settings 不再是可动态注册的命名空间总线，而是「插件行实例配置」的表单投影。
+// 因此原先的 model-channels / model-channel-health 两个命名空间合并为本插件的 Config
+// （字段 groups / providerOrder / effortMemory / health），命名空间 id 即本行 id。
 const HEALTH_SCHEMA = z.object({
     records: z.dict(z.array(z.any())).default({}),
     speedResults: z.dict(z.array(z.any())).default({}),
@@ -25,7 +19,34 @@ const HEALTH_SCHEMA = z.object({
     lastTestHandledNonce: z.number().default(0),
     legacyMigrated: z.any(),
 }).loose(true);
-export function apply(ctx) {
+export const Config = z.object({
+    groups: z.array(z.any()).default([]).volatile(),
+    providerOrder: z.array(z.string()).default([]).volatile(),
+    effortMemory: z.dict(z.string()).default({}).volatile(),
+    health: HEALTH_SCHEMA.volatile(),
+}).loose(true);
+export function apply(ctx, config) {
+    // 本行在 profile 中的 entry id 就是 settings 命名空间；缺失时回落到包名。
+    const SELF_NS = (ctx.fiber && ctx.fiber.entry && ctx.fiber.entry.options && ctx.fiber.entry.options.id) || 'model-channel-manager';
+    const refOf = (key, fallback) => {
+        const field = config && config[key];
+        if (field && typeof field.get === 'function') {
+            try {
+                return field.get();
+            }
+            catch (_e) {
+                return fallback;
+            }
+        }
+        return fallback;
+    };
+    const healthOf = () => refOf('health', null) || {};
+    const cfgOf = () => ({
+        groups: refOf('groups', []) || [],
+        providerOrder: refOf('providerOrder', []) || [],
+        effortMemory: refOf('effortMemory', {}) || {},
+    });
+
     const isContentChunk = (c) => {
         if (!c) return false;
         if (c.type === 'text-delta' || c.type === 'reasoning-delta') return c.text !== '';
@@ -282,18 +303,25 @@ export function apply(ctx) {
         // 每键保留 300 条：健康页签 30m/24h 视图与选择器置顶绰绰有余，同时把
         // settings.yaml 的体量压到可读（2000 条/键时该文件一度膨胀到 2 万行）
         state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-300);
+        pendingRecords.push({ key, rec });
         persistHealth();
     };
     const persistSpeedResults = async (r) => {
         if (bus === null) return;
-        await bus.settings.update(NS_HEALTH, { speedResults: clone(r), runtime: await persistRuntime() });
+        await bus.writeHealth({ speedResults: clone(r), runtime: await persistRuntime() });
     };
     // ---------- 健康持久化节流：合并 2s 窗口内的写入，避免每个请求全量重写 settings ----------
     let healthFlushHandle = null;
     let healthDirty = false;
+    // 尚未落盘的流水：reloadFromConfig 每次 volatile-update 都用配置快照整体覆盖 state.records，
+    // 而 flush 有 2s 防抖——不缓冲的话，刚记下的一笔会在落盘前被内存覆盖（实测「测试成功不入账」就是这个）。
+    let pendingRecords = [];
     const flushHealthNow = async () => {
         if (bus === null) return;
-        await bus.settings.update(NS_HEALTH, { records: clone(pullRecords()), speedResults: clone(pullSpeedResults()), runtime: await persistRuntime() });
+        const flushed = pendingRecords.slice();
+        await bus.writeHealth({ records: clone(pullRecords()), speedResults: clone(pullSpeedResults()), runtime: await persistRuntime() });
+        // 写入成功后才清账；失败就留着，等下一次 flush 重试
+        pendingRecords = pendingRecords.filter((p) => !flushed.includes(p));
     };
     const persistHealth = () => {
         healthDirty = true;
@@ -585,11 +613,15 @@ export function apply(ctx) {
                                 await ctx.timeout(1500);
                         }
                     }
-                    return { provider: cand.provider, model: cand.model, ok: false, ttft: null, latency: null, failure: (lastErr && lastErr.message) || 'speedtest failed' };
+                    return { provider: cand.provider, model: cand.model, ok: false, ttft: null, latency: null, failure: (lastErr && lastErr.message) || 'speedtest failed', code: (lastErr && lastErr.code) || null };
                 }));
                 results.push(...measured);
             }
             const rows = results.map((r) => ({ provider: r.provider, model: r.model, ok: r.ok, ttft: r.ttft, latency: r.latency, at: Date.now(), failure: r.failure || null }));
+            // 整组候选都因「环境未就绪」（凭据服务尚未加载等）失败时，不落盘 speedResults、不冷却候选，
+            // 交给调用方延后重试——否则启动瞬间的一次重放会把所有渠道误判成故障并冷却。
+            if (rows.length > 0 && rows.every((r, i) => !r.ok && notReady({ code: results[i] && results[i].code, message: r.failure })))
+                return { ok: false, deferred: true };
             state.speedResults[cfg.id] = rows;
             await persistSpeedResults(state.speedResults);
             const now = Date.now();
@@ -675,6 +707,7 @@ export function apply(ctx) {
         let ttft = null;
         let text = '';
         let reasoning = '';
+        let lastUsage = null;
         const closeInner = async () => { try {
             const c = inner.return ? inner.return() : null;
             if (c && c.then)
@@ -697,6 +730,8 @@ export function apply(ctx) {
                 if (ttft === null && isContentChunk(chunk)) {
                     ttft = Date.now() - start;
                 }
+                if (chunk && chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object')
+                    lastUsage = chunk.usage;
                 if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
                     text += chunk.text;
                 }
@@ -705,8 +740,12 @@ export function apply(ctx) {
                 }
                 if (isTerminalChunk(chunk)) {
                     const reason = chunk.reason || {};
-                    if (isSuccessReason(reason))
+                    if (isSuccessReason(reason)) {
+                        // 命中 finish 就 return，内层流不会被全局拦截器完整排干，成功这一笔要自己补记
+                        // （失败那笔由拦截器的 catch 分支记，所以此前只有失败会进健康流水）
+                        recordHealth(provider, { provider, model }, { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, code: null, usage: lastUsage });
                         return { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, text: text.slice(0, 2000), reasoning: reasoning.slice(0, 2000) };
+                    }
                     throw { code: (reason.failure && reason.failure.code) || 'STREAM_ERROR', message: (reason.failure && reason.failure.message) || 'model test failed' };
                 }
             }
@@ -716,61 +755,56 @@ export function apply(ctx) {
             throw err;
         }
     }
-    function handleTestRequest(settings, next) {
+    function handleTestRequest(next) {
         const req = next.testRequest;
-        const last = next.lastTestHandledNonce || 0;
+        const last = Math.max(next.lastTestHandledNonce || 0, claimedTestNonce);
         if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || typeof req.nonce !== 'number' || req.nonce === last)
             return;
-        settings.update(NS_HEALTH, { lastTestHandledNonce: req.nonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
-        // 结果写入：首选 mutate path-ops 原子设置单 nonce（并发测试互不覆盖）。
-        // 实测踩坑（#21 同源）：部分运行时（rc.2 file provider）会静默拒绝 mutate——
-        // promise 正常 resolve 但条目未落盘。故写后回读校验，未落上则回退 update
-        // 合并写（现势整段 + 本条目），保证结果必然可被 client 轮询读到。
-        let mutateWorks = null;
+        claimedTestNonce = req.nonce;
+        // nonce 的落盘推迟到本次测试得出结论之后：只有「真跑过」才算 handled。
+        // 启动早于凭据服务就绪时会以 MISSING_CREDENTIAL 失败，那要释放认领重试；
+        // 若提前写了 nonce，重试会被自己的持久值挡掉。
+        const settle = (entry) => {
+            if (bus !== null)
+                bus.writeHealth({ lastTestHandledNonce: req.nonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
+            return setResult(entry);
+        };
+        // 0.2 的配置写入是「整字段落盘」，不再有 path-ops；结果集按当前值合并后整段写回。
         const setResult = async (entry) => {
             const key = String(req.nonce);
             const value = Object.assign({}, entry, { nonce: req.nonce, provider: req.provider, model: req.model });
-            const cur = (bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {};
-            if (mutateWorks !== false) {
-                try {
-                    await settings.mutate(NS_HEALTH, [{ op: 'set', path: ['testResults', key], value }]);
-                    const landed = ((bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {})[key];
-                    if (landed) { mutateWorks = true; return; }
-                    mutateWorks = false;
-                    console.error('[model-channel-manager] testResults mutate 未生效，回退 update 合并写');
-                } catch (e) {
-                    mutateWorks = false;
-                    console.error('[model-channel-manager] testResults mutate 失败，回退 update 合并写:', e);
-                }
-            }
-            await settings.update(NS_HEALTH, { testResults: Object.assign({}, cur, { [key]: value }) }).catch((e) => console.error('[model-channel-manager] testResults update 兜底写入失败:', e));
+            const cur = healthOf().testResults || {};
+            if (bus !== null)
+                await bus.writeHealth({ testResults: Object.assign({}, cur, { [key]: value }) }).catch((e) => console.error('[model-channel-manager] testResults 写入失败:', e));
         };
         // 修剪低频执行：只在条目数超限时砍到 50（不在每次写入时整包重写）
         const maybePrune = () => {
-            const all = (bus && bus.healthScope ? bus.healthScope.get().testResults : null) || {};
+            const all = healthOf().testResults || {};
             const entries = Object.entries(all);
             if (entries.length <= 50) return;
-            const drop = entries.sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(50).map(([k]) => ({ op: 'unset', path: ['testResults', String(k)] }));
-            if (drop.length === 0) return;
-            if (mutateWorks === false) {
-                const kept = {};
-                for (const [k, v] of entries.slice(0, 50)) kept[k] = v;
-                settings.update(NS_HEALTH, { testResults: kept }).catch((e) => console.error('[model-channel-manager] testResults 修剪 update 失败:', e));
-                return;
-            }
-            settings.mutate(NS_HEALTH, drop).catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
+            const kept = {};
+            for (const [k, v] of entries.sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50)) kept[k] = v;
+            if (bus !== null)
+                bus.writeHealth({ testResults: kept }).catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
         };
         const done = async (r) => {
             try {
-                await setResult(Object.assign({}, r, { finishedAt: Date.now() }));
+                await settle(Object.assign({}, r, { finishedAt: Date.now() }));
                 maybePrune();
             }
             catch (_e) { }
         };
         void setResult({ status: 'running', startedAt: Date.now() });
         runModelTest(req.provider, req.model, req.prompt, req.maxTokens).then(async (r) => {
+            replayAttempts.delete('test');
             await done(Object.assign({ status: 'ok' }, r));
         }).catch(async (e) => {
+            if (notReady(e)) {
+                // 凭据服务尚未就绪（典型是启动瞬间的重放）：不写成假 error，释放认领并延后重试
+                claimedTestNonce = 0;
+                scheduleReplay('test', () => reloadFromConfig(false));
+                return;
+            }
             await done({ status: 'error', code: (e && e.code) || 'STREAM_ERROR', error: (e && e.message) || String(e) });
         });
     }
@@ -791,43 +825,125 @@ export function apply(ctx) {
     }
     // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
     let bus = null;
+    let runtimeRestored = false;
+    // 非持久去重：回写要等当前 HMR 事务结束才落盘，这中间 volatile-update 可能带着同一个 nonce 再来，
+    // 内存里先认领，避免同一请求被重复执行（并顺带消掉重复的回写风暴）。
+    let claimedTestNonce = 0;
+    let claimedSpeedNonce = 0;
+    // 启动早于凭据服务就绪：此时重放测试/测速会以 MISSING_CREDENTIAL 失败。
+    // 这类错误是「环境还没准备好」而不是「渠道故障」，必须释放认领、延后重试，不能写成假 error。
+    const notReady = (e) => {
+        const code = (e && e.code) || '';
+        const msg = String((e && (e.message || e.error)) || '');
+        return code === 'MISSING_CREDENTIAL' || code === 'INVALID_CREDENTIAL' || /no credential|credential .*not set|is not set — store/i.test(msg);
+    };
+    const replayAttempts = new Map();
+    const scheduleReplay = (key, fn, ms = 5000) => {
+        const n = (replayAttempts.get(key) || 0) + 1;
+        if (n > 24)
+            return;
+        replayAttempts.set(key, n);
+        ctx.timeout(() => { fn(); }, ms);
+    };
+    // 从实例配置读取全部状态；volatile 提交后由 loader/volatile-update 触发重载。
+    function reloadFromConfig(initial) {
+        const cfg = cfgOf();
+        state.config = clone(cfg) || { groups: [] };
+        const health = healthOf();
+        state.records = clone(health.records || {});
+        // 配置快照覆盖后，把尚未落盘的流水补回来（ts+provider+model 相同视为同一笔，不重复）
+        for (const p of pendingRecords) {
+            const list = state.records[p.key] || (state.records[p.key] = []);
+            if (!list.some((e) => e.ts === p.rec.ts && e.provider === p.rec.provider && e.model === p.rec.model))
+                list.push(p.rec);
+        }
+        state.speedResults = clone(health.speedResults || {});
+        state.testResults = clone(health.testResults || {});
+        if (initial && !runtimeRestored) {
+            restoreRuntime(health.runtime || {});
+            runtimeRestored = true;
+        }
+        const live = pullConfig().groups;
+        for (const g of live)
+            groupRuntime(g.id);
+        // 清理已删除组的运行时残留，避免 runtime 持久化无限累积
+        for (const id of Array.from(runtime.keys()))
+            if (!live.some((g) => g.id === id))
+                runtime.delete(id);
+        rewireRoutes();
+        const req = health.speedRequest;
+        const last = Math.max(health.lastHandledNonce || 0, claimedSpeedNonce);
+        if (req && typeof req.group === 'string' && typeof req.nonce === 'number' && req.nonce !== last) {
+            claimedSpeedNonce = req.nonce;
+            const cfgRow = pullConfig().groups.find((g) => g.id === req.group);
+            // nonce 落盘推迟到本次测速得出结论之后（同 handleTestRequest 的理由）：
+            // 提前写会把「没就绪」的重试用自己的持久值挡掉。
+            const settleSpeed = () => {
+                if (bus !== null)
+                    bus.writeHealth({ lastHandledNonce: req.nonce }).catch(() => { });
+            };
+            if (cfgRow)
+                runSpeedTest(cfgRow).then((r) => {
+                    if (r && r.deferred) {
+                        claimedSpeedNonce = 0;
+                        scheduleReplay('speed', () => reloadFromConfig(false));
+                        return;
+                    }
+                    replayAttempts.delete('speed');
+                    settleSpeed();
+                }).catch((e) => {
+                    if (notReady(e)) {
+                        claimedSpeedNonce = 0;
+                        scheduleReplay('speed', () => reloadFromConfig(false));
+                        return;
+                    }
+                    settleSpeed();
+                    console.error('[model-channel-manager] speedtest error:', e);
+                });
+            else
+                settleSpeed();
+        }
+        handleTestRequest(health);
+    }
     ctx.inject(['settings'], (sctx) => {
         const settings = sctx.settings;
-        bus = { settings };
-        const cfgScope = settings.register(NS_CONFIG, CONFIG_SCHEMA, { base: {} });
-        const healthScope = settings.register(NS_HEALTH, HEALTH_SCHEMA, { base: {} });
-        bus.cfgScope = cfgScope;
-        bus.healthScope = healthScope;
-        state.config = clone(cfgScope.get() || { groups: [] });
-        state.records = clone(healthScope.get().records || {});
-        state.speedResults = clone(healthScope.get().speedResults || {});
-        state.testResults = clone(healthScope.get().testResults || {});
-        restoreRuntime(healthScope.get().runtime || {});
-        cfgScope.watch(() => {
-            state.config = clone(cfgScope.get() || { groups: [] });
-            const live = pullConfig().groups;
-            for (const g of live)
-                groupRuntime(g.id);
-            // 清理已删除组的运行时残留，避免 runtime 持久化无限累积
-            for (const id of Array.from(runtime.keys()))
-                if (!live.some((g) => g.id === id))
-                    runtime.delete(id);
-            rewireRoutes();
+        // 0.2 只暴露「按行 id 定位的实例配置」；健康字段是同一 Config 里的 health 子树，
+        // 写入为整字段合并写（旧的 path-ops mutate 在 0.2 不存在）。
+        // 0.2 的配置写入走 configEditor.edit() → hmr.runExclusive()，而 runExclusive 一旦发现已在
+        // 事务内就直接拒绝（"HMR transactions cannot be nested"）。loader/volatile-update 回调本身
+        // 就运行在该事务里，所以回写必须先切出事务上下文：事务内创建的异步资源（AsyncResource、
+        // setTimeout）都会继承事务上下文，只有 AsyncLocalStorage.exit() 能干净地切出去，
+        // 写入再由 runExclusive 排进队列、在本次事务结束后执行。
+        const outsideTransaction = (fn) => {
+            const hmr = ctx.get('hmr');
+            const als = hmr && hmr.executing;
+            if (als && typeof als.exit === 'function' && als.getStore()) return als.exit(fn);
+            return fn();
+        };
+        // 0.2 是「整字段落盘」，并发调用会各自基于同一份旧快照做 read-modify-write，
+        // 后写的直接覆盖先写的（实测 lastTestHandledNonce 与 records 就这样丢过）。
+        // 所以写入串行化：排队后逐个重新读当前值再合并，不让两次写入互相覆写。
+        let healthWrites = Promise.resolve();
+        const writeHealth = (patch) => {
+            const run = async () => {
+                const cur = healthOf();
+                const next = Object.assign({}, cur, patch);
+                return outsideTransaction(() => settings.update(SELF_NS, { health: next }));
+            };
+            const queued = healthWrites.then(run, run);
+            healthWrites = queued.catch(() => { });
+            return queued;
+        };
+        bus = {
+            settings,
+            writeHealth,
+            cfgScope: { get: () => cfgOf() },
+            healthScope: { get: () => healthOf() },
+        };
+        reloadFromConfig(true);
+        ctx.on('loader/volatile-update', () => {
+            reloadFromConfig(false);
             console.log('[model-channel-manager] config hot-reloaded, routes:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
-        });
-        healthScope.watch((next) => {
-            state.records = clone(next.records || {});
-            state.speedResults = clone(next.speedResults || {});
-            state.testResults = clone(next.testResults || {});
-            const req = next.speedRequest;
-            const last = next.lastHandledNonce || 0;
-            if (req && typeof req.group === 'string' && typeof req.nonce === 'number' && req.nonce !== last) {
-                settings.update(NS_HEALTH, { lastHandledNonce: req.nonce }).catch(() => { });
-                const cfg = pullConfig().groups.find((g) => g.id === req.group);
-                if (cfg)
-                    runSpeedTest(cfg).catch((e) => console.error('[model-channel-manager] speedtest error:', e));
-            }
-            handleTestRequest(settings, next);
         });
         boot();
     });
@@ -913,14 +1029,13 @@ export function apply(ctx) {
         }
         console.log('[model-channel-manager] booted, groups:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
     }
-    // 工作区 .channel-manager/config.json -> settings 命名空间（一次性）。
+    // 工作区 .channel-manager/config.json -> 本行实例配置（一次性）。
     // 完成后写 legacyMigrated 哨兵，防止「用户清空全部组 → 重启 → 旧配置复活」；
     // fs/sandboxPolicy 未就绪时短暂重试，而不是静默放弃直到下次重启。
     async function migrateLegacyConfig() {
-        const settings = bus && bus.settings;
-        if (settings === undefined || pullConfig().groups.length !== 0)
+        if (bus === null || pullConfig().groups.length !== 0)
             return;
-        if ((bus && bus.healthScope ? bus.healthScope.get().legacyMigrated : false) === true)
+        if (healthOf().legacyMigrated === true)
             return;
         for (let attempt = 0; attempt < 6; attempt++) {
             const fsSvc = ctx.get('fs');
@@ -933,13 +1048,13 @@ export function apply(ctx) {
                     const legacy = JSON.parse(text);
                     const migrated = normalizeConfig(legacy);
                     if (migrated.groups.length > 0) {
-                        await settings.replace(NS_CONFIG, { groups: migrated.groups });
+                        await bus.settings.update(SELF_NS, { groups: migrated.groups });
                         state.config = { groups: migrated.groups };
                         console.log('[model-channel-manager] migrated legacy config from workspace .channel-manager/config.json');
                     }
                 }
                 catch (_e) { /* 无遗留配置，忽略 */ }
-                settings.update(NS_HEALTH, { legacyMigrated: true }).catch(() => { });
+                bus.writeHealth({ legacyMigrated: true }).catch(() => { });
                 return;
             }
             try {
