@@ -31,6 +31,13 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 - `dsh.profile.bundles` 加 `"@arcaneorion/dsh-model-channel-manager"`
 - `pnpm install` 后重启 `dsh --profile web`
 
+> **link: 方式的模块解析坑（0.3.8 实测）**：pnpm 对 link: 包不安装其依赖；且 Node ESM
+> import 会把 symlink **realpath 化**——host 从 profile 路径加载插件时，`import 'zod'`
+> 实际从**工作区真实路径**向上解析，工作区没有 node_modules 就报
+> `Cannot find package 'zod'`。解法：工作区 `node_modules/` 里软链宿主侧已有实体
+> （`zod` ← profile 顶层；`@deepseek-ai/dsh-storage-domain` ← pnpm `.pnpm` 实体；
+> `.gitignore` 已含 `node_modules/`）。npm 安装方式（dependencies 正常解析）无此问题。
+
 验证：
 - host 日志出现 `[model-channel-manager] booted, groups: ...`
 - `llm.providers` 出现 `roundrobin/<组id>`
