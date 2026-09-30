@@ -170,9 +170,6 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
   effort 后 dispatch 前被拒（H06）。完整修复需异步候选能力解析（`resolveModelInfo` 的
   `inputModalities` 缺失=未知，只有显式排除才是负能力）+ 缓存 + 未知态策略，属设计级
   改动，待专项处理
-- **超时不中止上游（审计 F01/F02）**：`Promise.race` 超时后 `inner.return()` 排在挂起的
-  `next()` 之后，慢请求占住 failover 流程；成功/提前退出路径缺统一 finally。需 per-attempt
-  AbortController + 总预算，属引擎级改动
 - 动态超时实现了首响应 + 流中空闲；全炸后「清冷却重试一轮」回溯，未实现「等待最早冷却」的睡眠分支
 - 测速结果不入健康流水（pi 记）；smart 键只统计真实请求
 - **Token 字段只在新记录上出现**：host 升级重启前的存量健康记录无 token 字段，7 天视图对重启前的调用会低估 token（请求数/可用率不受影响）；数据自重启后开始累积
@@ -184,6 +181,22 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
   信封，待 0.3.2 真实环境验证后再决定
 - 30m/24h 健康视图是近似口径（按最近活跃过滤，数值为 7 天累计，UI 已标注）；精确分窗口
   需 host 出多份 digest
+
+## 引擎超时与生命周期（0.3.3 重构：审计 F01/F02/F15 已修）
+
+- **per-attempt AbortController**：每次候选尝试独立 signal，用户取消转发（`relayAbort`，
+  finally 移除防泄漏）+ 超时 abort（`attemptController.abort(raceErr)`）。pi-ai 适配器把
+  `options.signal` 经 `AbortSignal.any` 融进 watchdog 并传给上游 HTTP——abort 即真正
+  取消网络请求，不再有「return() 排在挂起的 next() 之后拖住 failover」（H02 复现的根因）
+- **统一 finally 有界关闭**：streamAttempt / measureCandidate / runModelTest 三处流消费
+  路径，成功 return / 失败 / 消费者提前退出都走 `closeInner`（closed 防重入 + 3s 关闭
+  预算 race，预算超时补一发 abort）
+- **组级总预算 `totalBudgetMs`**（默认 10 分钟，组配置可调）：超预算不开新尝试，以
+  `CHANNEL_BUDGET_EXCEEDED` 终结——旧实现最坏 `2×N×(R+1)` 次尝试（默认 R=2 → 6N）
+- **测速/测试改总时限**（F15）：旧实现每 chunk 重置 guard（H12：timeoutMs=40 流每
+  20ms 输出，84ms 后仍成功），现在 `deadline` 固定总时限，超时 abort
+- 回归：`tests/timeout-abort.test.cjs`（契约断言 + 挂起流行为级验证——3s 关闭预算内
+  完成，不等满 5s 挂起）
 
 ## 踩坑速记（本项目，按严重程度）
 

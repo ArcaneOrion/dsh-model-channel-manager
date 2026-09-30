@@ -125,6 +125,10 @@ export function apply(ctx, config) {
                 timeoutMs: Number.isFinite(rg.timeoutMs) && rg.timeoutMs > 0 ? rg.timeoutMs : 30000,
                 cooldownMs: Number.isFinite(rg.cooldownMs) && rg.cooldownMs >= 0 ? rg.cooldownMs : 60000,
                 maxRetriesPerCandidate: Number.isSafeInteger(rg.maxRetriesPerCandidate) && rg.maxRetriesPerCandidate >= 0 ? rg.maxRetriesPerCandidate : 2,
+                // F01 配套（审计 §5.3）：整次请求的总预算。旧实现最坏 2×N×(R+1) 次尝试
+                // （默认 R=2 → 6N 次），4 候选组可拖数分钟。默认 10 分钟；超预算
+                // 后不再开新尝试，直接 CHANNEL_FULL_FAIL 终结。
+                totalBudgetMs: Number.isFinite(rg.totalBudgetMs) && rg.totalBudgetMs > 0 ? rg.totalBudgetMs : 600000,
                 speedTest: {
                     enabled: st.enabled !== false,
                     sortKey: ['ttft', 'latency', 'hybrid', 'smart'].includes(st.sortKey) ? st.sortKey : 'ttft',
@@ -331,26 +335,56 @@ export function apply(ctx, config) {
         }
     };
     // ---------- 引擎：单候选尝试 ----------
+    // F01/F02（审计）：超时必须能真正结束一次尝试。
+    //  - 旧行为：Promise.race 超时后 await inner.return()，但 return() 排在挂起的
+    //    next() 之后——上游挂着时 failover 被拖住（H02：15ms 超时 80ms 后仍未切换）。
+    //  - 新行为：每次尝试独立 AbortController。pi-ai 适配器把 options.signal 经
+    //    AbortSignal.any 融进 watchdog 并传给上游 HTTP（signal: watchdog.signal），
+    //    abort 即真正取消网络请求。超时路径：先 abort → 有界等待（3s）排干 → 放弃
+    //    等待继续 failover（放弃的迭代器由适配器的 finally 自行清理）。
+    //  - 生命周期（F02）：成功 return / 失败 / 消费者提前退出统一走 finally 的
+    //    有界 closeInner，不再只在 catch 里清理。
+    const ATTEMPT_CLOSE_BUDGET_MS = 3000;
     async function* streamAttempt(cfg, cand, options, attemptStart) {
         if (cand.provider.startsWith(ROUTE_PREFIX))
             throw { code: 'INVALID_CANDIDATE', message: 'candidate provider must not be a virtual route' };
         const llm = ctx.llm;
-        const inner = llm.stream(Object.assign({}, options, { provider: cand.provider, model: cand.model }));
+        // 用户取消信号透传 + 尝试自身的超时中止，二者融合为本次尝试的 signal
+        const attemptController = new AbortController();
+        const outerSignal = options.signal;
+        const relayAbort = () => { try { attemptController.abort(outerSignal.reason); } catch (_e) { } };
+        if (outerSignal) {
+            if (outerSignal.aborted)
+                relayAbort();
+            else
+                outerSignal.addEventListener('abort', relayAbort, { once: true });
+        }
+        const inner = llm.stream(Object.assign({}, options, { provider: cand.provider, model: cand.model, signal: attemptController.signal }));
         const timeoutMs = dynamicTimeoutMs(cfg, candKey(cand));
         let buffer = [];
         let started = false;
         let ttftMs = null;
         let lastAt = Date.now();
         let lastUsage = null;
-        const closeInner = async () => { try {
-            const c = inner.return ? inner.return() : null;
-            if (c && c.then)
-                await c;
-        }
-        catch (_e) { } };
+        let closed = false;
+        const closeInner = async () => {
+            if (closed)
+                return;
+            closed = true;
+            try {
+                const c = inner.return ? inner.return() : null;
+                if (c && c.then) {
+                    await Promise.race([
+                        c,
+                        ctx.timeout(ATTEMPT_CLOSE_BUDGET_MS).then(() => { attemptController.abort({ code: 'TIMEOUT', message: 'attempt close budget exceeded' }); }, () => { }),
+                    ]);
+                }
+            }
+            catch (_e) { }
+        };
         try {
             while (true) {
-                if (options.signal && options.signal.aborted)
+                if (outerSignal && outerSignal.aborted)
                     throw { code: 'ABORTED', message: 'request aborted' };
                 const remaining = Math.max(0, timeoutMs - (Date.now() - (started ? lastAt : attemptStart)));
                 if (remaining <= 0)
@@ -361,6 +395,13 @@ export function apply(ctx, config) {
                 let next;
                 try {
                     next = await Promise.race([inner.next(), guard.promise]);
+                }
+                catch (raceErr) {
+                    // 超时（或任何 next 失败）：先中止本次尝试的上游请求再上抛——
+                    // 这是 F01 的核心：abort 信号会穿透 pi-ai 取消真实 HTTP 请求
+                    if (raceErr && raceErr.code === 'TIMEOUT')
+                        attemptController.abort(raceErr);
+                    throw raceErr;
                 }
                 finally {
                     // 超时路径同样要 dispose：ctx.effect 的注册表条目只有显式调用 disposer 才会移除
@@ -416,12 +457,18 @@ export function apply(ctx, config) {
             }
         }
         catch (err) {
-            await closeInner();
             if (started && err && typeof err === 'object')
                 err.emitted = true;
             if (err && err.code === 'TIMEOUT')
                 recordHealth(cand.provider, cand, { ok: false, ttftMs, latencyMs: null, code: 'TIMEOUT', usage: lastUsage });
             throw err;
+        }
+        finally {
+            // F02：所有出口（成功 return / 失败 / 消费者提前 return）统一有界关闭；
+            // relayAbort 监听器随本次尝试终结移除（防泄漏：outerSignal 可能长命）
+            if (outerSignal)
+                outerSignal.removeEventListener('abort', relayAbort);
+            await closeInner();
         }
     }
     // ---------- 引擎：组级故障转移循环 ----------
@@ -438,9 +485,18 @@ export function apply(ctx, config) {
         let fullRounds = 0;
         let lastFail = null;
         const failedKeys = [];
+        // 总请求预算（F01 配套）：组级起点。超预算不再开新尝试。
+        const groupStart = Date.now();
+        const budgetMs = cfg.totalBudgetMs || 600000;
+        const budgetLeft = () => budgetMs - (Date.now() - groupStart);
         while (true) {
             if (options.signal && options.signal.aborted) {
                 yield abortedChunk('request aborted');
+                return;
+            }
+            if (budgetLeft() <= 0) {
+                pushEvent(cfg, 'budget-exhausted', { budgetMs, failures: failedKeys.slice() });
+                yield failChunk('channel group "' + cfg.id + '" exhausted its total budget of ' + budgetMs + 'ms: ' + (lastFail || 'multiple failures'), 'CHANNEL_BUDGET_EXCEEDED');
                 return;
             }
             const round = [];
@@ -465,6 +521,8 @@ export function apply(ctx, config) {
                         yield abortedChunk('request aborted');
                         return;
                     }
+                    if (budgetLeft() <= 0)
+                        break; // 预算耗尽：不开新尝试，交给组层终结
                     const attemptStart = Date.now();
                     try {
                         const attempt = streamAttempt(cfg, cand, options, attemptStart);
@@ -532,23 +590,46 @@ export function apply(ctx, config) {
         }
     }
     // ---------- 测速 ----------
+    // F15 修复：旧行为每 chunk 重置 guard（单次等待上限而非总时限，H12：timeoutMs=40
+    // 流每 20ms 输出，84ms 后仍成功）+ 超时不中止上游。现在：总时限 deadline +
+    // 超时 abort 上游（与 streamAttempt 同一模式）+ 统一 finally 关闭。
     async function measureCandidate(cfg, cand, st) {
         const llm = ctx.llm;
-        const inner = llm.stream({ provider: cand.provider, model: cand.model, messages: [{ role: 'user', content: [{ type: 'text', text: st.prompt }] }], maxTokens: st.maxTokens, sessionId: 'mcm-speedtest-' + (st.nonce ?? Date.now()) });
+        const controller = new AbortController();
+        const deadline = Date.now() + (st.timeoutMs || 60000);
+        const inner = llm.stream({ provider: cand.provider, model: cand.model, messages: [{ role: 'user', content: [{ type: 'text', text: st.prompt }] }], maxTokens: st.maxTokens, sessionId: 'mcm-speedtest-' + (st.nonce ?? Date.now()), signal: controller.signal });
         const start = Date.now();
         let ttft = null;
-        const closeInner = async () => { try {
-            const c = inner.return ? inner.return() : null;
-            if (c && c.then)
-                await c;
-        }
-        catch (_e) { } };
+        let closed = false;
+        const closeInner = async () => {
+            if (closed)
+                return;
+            closed = true;
+            try {
+                const c = inner.return ? inner.return() : null;
+                if (c && c.then) {
+                    await Promise.race([
+                        c,
+                        ctx.timeout(ATTEMPT_CLOSE_BUDGET_MS).then(() => { try { controller.abort({ code: 'TIMEOUT', message: 'speedtest close budget exceeded' }); } catch (_e) { } }, () => { }),
+                    ]);
+                }
+            }
+            catch (_e) { }
+        };
         try {
             while (true) {
-                const guard = timed(Math.max(1, st.timeoutMs), () => ({ code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms' }));
+                const remaining = deadline - Date.now();
+                if (remaining <= 0)
+                    throw { code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms (total)' };
+                const guard = timed(Math.max(1, remaining), () => ({ code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms (total)' }));
                 let next;
                 try {
                     next = await Promise.race([inner.next(), guard.promise]);
+                }
+                catch (raceErr) {
+                    if (raceErr && raceErr.code === 'TIMEOUT')
+                        try { controller.abort(raceErr); } catch (_e) { }
+                    throw raceErr;
                 }
                 finally {
                     guard.dispose();
@@ -567,8 +648,10 @@ export function apply(ctx, config) {
             }
         }
         catch (err) {
-            await closeInner();
             throw { code: (err && err.code) || 'STREAM_ERROR', message: (err && err.message) || 'speedtest failed' };
+        }
+        finally {
+            await closeInner();
         }
     }
     async function runSpeedTest(cfg) {
@@ -687,24 +770,47 @@ export function apply(ctx, config) {
     // ---------- 单模型真实请求测试（client 经 settings 总线下发，走 DSH 真实 llm.stream 链路） ----------
     async function runModelTest(provider, model, prompt, maxTokens) {
         const llm = ctx.llm;
-        const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512, sessionId: 'mcm-modeltest-' + Date.now() });
+        // F15（与 measureCandidate 同一模式）：总时限 60s（旧行为每 chunk 重置 guard，
+        // 持续输出的请求永不超时而 client 已放弃）+ 超时 abort 上游 + 统一 finally 关闭。
+        const MODEL_TEST_TOTAL_MS = 60000;
+        const controller = new AbortController();
+        const deadline = Date.now() + MODEL_TEST_TOTAL_MS;
+        const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512, sessionId: 'mcm-modeltest-' + Date.now(), signal: controller.signal });
         const start = Date.now();
         let ttft = null;
         let text = '';
         let reasoning = '';
         let lastUsage = null;
-        const closeInner = async () => { try {
-            const c = inner.return ? inner.return() : null;
-            if (c && c.then)
-                await c;
-        }
-        catch (_e) { } };
+        let closed = false;
+        const closeInner = async () => {
+            if (closed)
+                return;
+            closed = true;
+            try {
+                const c = inner.return ? inner.return() : null;
+                if (c && c.then) {
+                    await Promise.race([
+                        c,
+                        ctx.timeout(ATTEMPT_CLOSE_BUDGET_MS).then(() => { try { controller.abort({ code: 'TIMEOUT', message: 'model test close budget exceeded' }); } catch (_e) { } }, () => { }),
+                    ]);
+                }
+            }
+            catch (_e) { }
+        };
         try {
             while (true) {
-                const guard = timed(60000, () => ({ code: 'TIMEOUT', message: 'model test timed out after 60000ms' }));
+                const remaining = deadline - Date.now();
+                if (remaining <= 0)
+                    throw { code: 'TIMEOUT', message: 'model test timed out after ' + MODEL_TEST_TOTAL_MS + 'ms (total)' };
+                const guard = timed(Math.max(1, remaining), () => ({ code: 'TIMEOUT', message: 'model test timed out after ' + MODEL_TEST_TOTAL_MS + 'ms (total)' }));
                 let next;
                 try {
                     next = await Promise.race([inner.next(), guard.promise]);
+                }
+                catch (raceErr) {
+                    if (raceErr && raceErr.code === 'TIMEOUT')
+                        try { controller.abort(raceErr); } catch (_e) { }
+                    throw raceErr;
                 }
                 finally {
                     guard.dispose();
@@ -736,8 +842,10 @@ export function apply(ctx, config) {
             }
         }
         catch (err) {
-            await closeInner();
             throw err;
+        }
+        finally {
+            await closeInner();
         }
     }
     function handleTestRequest(next) {
