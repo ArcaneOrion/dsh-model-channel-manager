@@ -1065,11 +1065,13 @@ window.__ModuleLoader__.load({
 
       const now = Date.now()
       const windowCutoff = windowMode === '30m' ? now - 30 * 60 * 1000 : windowMode === '24h' ? now - 24 * 3600 * 1000 : 0
-      const recsMap = health.records || {}
-      const rawEvents = Object.values(recsMap).flat()
-      // 时间窗口过滤
-      const allEvents = rawEvents.filter((e) => (e.ts || 0) >= windowCutoff)
 
+      // ---------- 聚合数据源 ----------
+      // 0.3.1 起优先用 host 下发的 digest 小投影（聚合已上移 host，client 不再拉原始流水）。
+      // digest 是 7 天全窗口聚合；30m/24h 视图按 lastTs 近似（lastTs 在窗口内才计入），
+      // 精细窗口统计属后续增强（需要 host 按窗口出多份 digest）。
+      // 旧 host 兼容：无 digest 字段时走原始 records 路径（升级窗口不断供）。
+      const digestRows = Array.isArray(health.digest) ? health.digest : null
       // 按 provider 分组
       const byProvider = new Map()
 
@@ -1092,7 +1094,10 @@ window.__ModuleLoader__.load({
               lastOk: null,
               lastCode: null,
               recentErrors: 0,
-              tokSum: 0
+              tokSum: 0,
+              tokIn: 0,
+              tokOut: 0,
+              tokCache: 0
             })
           }
         }
@@ -1103,57 +1108,134 @@ window.__ModuleLoader__.load({
       let totalTokOut = 0
       let totalTokCache = 0
 
-      // 累加时间窗口内的真实流水记录
-      for (const e of allEvents) {
-        if (!e || !e.provider || !e.model) continue
-        let pMap = byProvider.get(e.provider)
-        if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
-        let a = pMap.get(e.model)
-        if (!a) {
-          a = {
-            provider: e.provider,
-            model: e.model,
-            name: e.model,
-            total: 0,
-            success: 0,
-            fail: 0,
-            ttftSum: 0,
-            latSum: 0,
-            lastTs: 0,
-            lastOk: null,
-            lastCode: null,
-            recentErrors: 0,
-            tokSum: 0
+      if (digestRows !== null) {
+        // ---------- digest 投影路径 ----------
+        for (const row of digestRows) {
+          if (!row || !row.provider || !row.model) continue
+          // 窗口过滤：lastTs 不在窗口内的渠道不计入该窗口（近似口径，见上注）
+          if (windowCutoff > 0 && (row.lastTs || 0) < windowCutoff) continue
+          let pMap = byProvider.get(row.provider)
+          if (!pMap) { pMap = new Map(); byProvider.set(row.provider, pMap) }
+          let a = pMap.get(row.model)
+          if (!a) {
+            a = {
+              provider: row.provider,
+              model: row.model,
+              name: row.model,
+              total: 0,
+              success: 0,
+              fail: 0,
+              ttftSum: 0,
+              latSum: 0,
+              lastTs: 0,
+              lastOk: null,
+              lastCode: null,
+              recentErrors: 0,
+              tokSum: 0,
+              tokIn: 0,
+              tokOut: 0,
+              tokCache: 0
+            }
+            pMap.set(row.model, a)
           }
-          pMap.set(e.model, a)
+          a.total = row.total || 0
+          a.success = row.success || 0
+          a.fail = a.total - a.success
+          a.ttftSum = (row.ttftAvg || 0) * a.success
+          a.latSum = (row.latAvg || 0) * a.success
+          a.lastTs = row.lastTs || 0
+          a.lastOk = row.lastOk
+          a.lastCode = row.lastCode || null
+          a.tokIn = row.tokIn || 0
+          a.tokOut = row.tokOut || 0
+          a.tokCache = row.tokCache || 0
+          a.tokSum = a.tokIn + a.tokOut + a.tokCache
+          totalTokIn += a.tokIn
+          totalTokOut += a.tokOut
+          totalTokCache += a.tokCache
         }
-        a.total++
-        const tokIn = (e && e.inputTokens) || 0
-        const tokOut = (e && e.outputTokens) || 0
-        const tokCache = ((e && e.cacheReadTokens) || 0) + ((e && e.cacheWriteTokens) || 0)
-        totalTokIn += tokIn
-        totalTokOut += tokOut
-        totalTokCache += tokCache
-        a.tokSum += tokIn + tokOut + tokCache
-        if (e.ok) {
-          a.success++
-          if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs
-          if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs
-        } else {
-          a.fail++
-          if (e.code) a.lastCode = e.code
-        }
-        if ((e.ts || 0) > a.lastTs) {
-          a.lastTs = e.ts || 0
-          a.lastOk = e.ok
+      } else {
+        // ---------- 旧 host 原始流水路径（兼容） ----------
+        const recsMap = health.records || {}
+        const rawEvents = Object.values(recsMap).flat()
+        // 时间窗口过滤（赋给函数级 allEvents，供顶部指标卡使用）
+        allEvents = rawEvents.filter((e) => (e.ts || 0) >= windowCutoff)
+        // 累加时间窗口内的真实流水记录
+        for (const e of allEvents) {
+          if (!e || !e.provider || !e.model) continue
+          let pMap = byProvider.get(e.provider)
+          if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
+          let a = pMap.get(e.model)
+          if (!a) {
+            a = {
+              provider: e.provider,
+              model: e.model,
+              name: e.model,
+              total: 0,
+              success: 0,
+              fail: 0,
+              ttftSum: 0,
+              latSum: 0,
+              lastTs: 0,
+              lastOk: null,
+              lastCode: null,
+              recentErrors: 0,
+              tokSum: 0,
+              tokIn: 0,
+              tokOut: 0,
+              tokCache: 0
+            }
+            pMap.set(e.model, a)
+          }
+          a.total++
+          const tokIn = (e && e.inputTokens) || 0
+          const tokOut = (e && e.outputTokens) || 0
+          const tokCache = ((e && e.cacheReadTokens) || 0) + ((e && e.cacheWriteTokens) || 0)
+          totalTokIn += tokIn
+          totalTokOut += tokOut
+          totalTokCache += tokCache
+          a.tokIn += tokIn
+          a.tokOut += tokOut
+          a.tokCache += tokCache
+          a.tokSum += tokIn + tokOut + tokCache
+          if (e.ok) {
+            a.success++
+            if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs
+            if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs
+          } else {
+            a.fail++
+            if (e.code) a.lastCode = e.code
+          }
+          if ((e.ts || 0) > a.lastTs) {
+            a.lastTs = e.ts || 0
+            a.lastOk = e.ok
+          }
         }
       }
 
-      const totalRequests = allEvents.length
-      const totalSuccess = allEvents.filter((x) => x.ok).length
+      // 顶部指标卡：digest 路径用聚合值求和，旧路径用原始事件计数
+      // （allEvents 提升到函数级：旧 host 回落路径的 else 块在此作用域外定义它）
+      let allEvents = []
+      let totalRequests = 0
+      let totalSuccess = 0
+      let ttftWeightedSum = 0
+      if (digestRows !== null) {
+        for (const pMap of byProvider.values()) {
+          for (const a of pMap.values()) {
+            totalRequests += a.total
+            totalSuccess += a.success
+            ttftWeightedSum += a.ttftSum
+          }
+        }
+      } else {
+        totalRequests = allEvents.length
+        totalSuccess = allEvents.filter((x) => x.ok).length
+        for (const pMap of byProvider.values()) {
+          for (const a of pMap.values()) ttftWeightedSum += a.ttftSum
+        }
+      }
       const globalRate = totalRequests > 0 ? ((totalSuccess / totalRequests) * 100).toFixed(1) + '%' : '100%'
-      const validTtfts = allEvents.filter((x) => x.ok && x.ttftMs != null).map((x) => x.ttftMs)
-      const avgGlobalTtft = validTtfts.length > 0 ? (validTtfts.reduce((a, b) => a + b, 0) / validTtfts.length / 1000).toFixed(2) + 's' : '—'
+      const avgGlobalTtft = totalSuccess > 0 ? (ttftWeightedSum / totalSuccess / 1000).toFixed(2) + 's' : '—'
 
       const providerGroups = [...byProvider.entries()].map(([provName, modelMap]) => {
         const models = [...modelMap.values()].map((m) => {
@@ -1212,7 +1294,9 @@ window.__ModuleLoader__.load({
           el('div', { className: 'mcm-metric-card' },
             el('span', { className: 'mcm-metric-label' }, windowMode === '30m' ? '近 30 分钟请求' : windowMode === '24h' ? '近 24 小时请求' : '7 天全周期请求'),
             el('span', { className: 'mcm-metric-value' }, totalRequests),
-            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, '真实上游交互捕获')
+            // digest 聚合是 7 天窗口口径；30m/24h 只按「最近活跃」过滤渠道，数值为该渠道 7 天累计
+            el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
+              digestRows !== null && windowMode !== '7d' ? '窗口内活跃渠道的 7 天累计（聚合口径）' : '真实上游交互捕获')
           ),
           el('div', { className: 'mcm-metric-card' },
             el('span', { className: 'mcm-metric-label' }, '总 Token 用量'),
@@ -1334,7 +1418,12 @@ window.__ModuleLoader__.load({
           setChannels(ch)
           setChannelsDraft((prev) => prev || clone(ch))
           const hn = findNs('model-channel-health')
-          setHealth(hn ? { records: (hn.value && hn.value.records) || {}, speedResults: (hn.value && hn.value.speedResults) || {}, runtime: (hn.value && hn.value.runtime) || {} } : null)
+          // 0.3.1：健康权威数据在 host 的 storageDomain；client 只接收小投影 digest。
+          // 兼容旧 host（无 digest 字段）时回落到 records 原始视图，避免升级窗口白屏。
+          const hv = (hn && hn.value) || {}
+          setHealth(hv.digest || (hv.digestAt !== undefined)
+            ? { digest: hv.digest || [], digestAt: hv.digestAt || 0, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} }
+            : (hn ? { records: hv.records || {}, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} } : null))
         }).catch((e) => setNotice('加载失败: ' + String(e)))
       }
 
@@ -1350,11 +1439,10 @@ window.__ModuleLoader__.load({
             const d = unwrap(resp)
             const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
             if (hn && hn.value) {
-              setHealth({
-                records: hn.value.records || {},
-                speedResults: hn.value.speedResults || {},
-                runtime: hn.value.runtime || {}
-              })
+              const hv = hn.value
+              setHealth(hv.digest || (hv.digestAt !== undefined)
+                ? { digest: hv.digest || [], digestAt: hv.digestAt || 0, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} }
+                : { records: hv.records || {}, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} })
             }
           }).catch(() => {})
         }

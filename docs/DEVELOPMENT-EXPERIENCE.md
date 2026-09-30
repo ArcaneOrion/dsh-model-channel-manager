@@ -94,9 +94,13 @@ Client 写 `testRequest: {nonce, provider, model, prompt, maxTokens}` → Host w
 
 ### 2.5 持久化与重启
 
-健康流水保存在 DSH settings 后端（`~/.dsh/settings.yaml` 的 `model-channel-health` 段），**重启 DSH 不丢**。`state.records` 按 provider 分组，7 天截止 `Date.now() - 7*24*3600*1000`，单组最多 2000 条。
+> **0.3.1 起已重构**（见 README「健康数据存储」）：健康流水权威存储在 storageDomain 的
+> `model_channel_health` 单元（`~/.dsh/storages/`，per-record 布局）；settings 只存 digest
+> 小投影。下文是 0.3.0 及之前的历史设计，保留作演进记录。
 
-**持久化节流**：`recordHealth` 只同步改内存，落盘按 2s 窗口合并（`ctx.timeout` 单飞行 + `healthDirty` 标记），插件卸载 effect 冲刷尾批——否则每个真实请求都全量 clone + 重写整段 settings（MB 级 YAML 写放大）。配套地，client 健康轮询只在健康页签激活时跑（`useEffect` 依赖 `[tab]`，切走即停）。
+健康流水曾保存在 DSH settings 后端（`model-channel-health` 段），重启不丢。`state.records` 按 provider 分组，7 天截止，单组最多 2000 条（后收窄到每桶 300）。
+
+**持久化节流（已废弃）**：`recordHealth` 只同步改内存，落盘按 2s 窗口合并——否则每个真实请求都全量 clone + 重写整段 settings（MB 级 YAML 写放大）。这个设计最终被证明是错位的：2s 防抖与 volatile 快照覆盖互相踩（审计 F11/F23），profile 文件膨胀到 6000+ 行，2026-09-30 重构为 storageDomain 承载。client 健康轮询只在健康页签激活时跑（`useEffect` 依赖 `[tab]`，切走即停）——这一条仍然有效。
 
 ---
 

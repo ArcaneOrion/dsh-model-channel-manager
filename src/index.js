@@ -1,6 +1,9 @@
 import z from "@deepseek-ai/schemastery";
+import { HealthStore } from './health-store.js';
 export const name = 'model-channel-manager';
 export const inject = ['llm', 'timer'];
+// storageDomain 由 dsh-base 组合（json 后端，root=storages/）；不进 inject 硬依赖——
+// 缺栈的 profile 降级为「健康流水不持久化」而不是拒绝启动。
 const ROUTE_PREFIX = 'roundrobin/';
 const GROUP_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 const NS_CONFIG = 'model-channels';
@@ -9,6 +12,8 @@ const NS_HEALTH = 'model-channel-health';
 // 因此原先的 model-channels / model-channel-health 两个命名空间合并为本插件的 Config
 // （字段 groups / providerOrder / effortMemory / health），命名空间 id 即本行 id。
 const HEALTH_SCHEMA = z.object({
+    // records/speedResults 仅作旧版存量迁移的读取源（迁入 domain 后不再写入）；
+    // 权威数据在 storageDomain 的 model_channel_health 单元。
     records: z.dict(z.array(z.any())).default({}),
     speedResults: z.dict(z.array(z.any())).default({}),
     runtime: z.dict(z.any()).default({}),
@@ -18,6 +23,10 @@ const HEALTH_SCHEMA = z.object({
     testResults: z.dict(z.any()).default({}),
     lastTestHandledNonce: z.number().default(0),
     legacyMigrated: z.any(),
+    healthMigrated: z.any(),
+    // 小投影：host 聚合好的健康摘要（client 渲染用），digestAt 为生成时刻
+    digest: z.array(z.any()).default([]),
+    digestAt: z.number().default(0),
 }).loose(true);
 export const Config = z.object({
     groups: z.array(z.any()).default([]).volatile(),
@@ -286,7 +295,6 @@ export function apply(ctx, config) {
     const recordHealth = (gid, cand, entry) => {
         const now = Date.now();
         const key = gid || 'global';
-        const list = state.records[key] || (state.records[key] = []);
         const rec = { ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null };
         // 上游真实 token 用量（来自 usage StreamChunk，计费口径与 dsh-token-meter 一致）：
         // 展平写入记录条目；缺失/非法字段不写，旧记录按 0 处理（向后兼容）。
@@ -298,53 +306,30 @@ export function apply(ctx, config) {
             if (Number.isFinite(u.cacheWriteTokens)) rec.cacheWriteTokens = u.cacheWriteTokens;
             if (Number.isFinite(u.reasoningTokens)) rec.reasoningTokens = u.reasoningTokens;
         }
+        // 内存镜像（聚合与 smart 键读内存即可）+ domain 追加（事实持久化）。
+        // domain 写入走 per-record put（写一条只动一个渠道桶文档），
+        // 不再有 2s 防抖与 volatile 快照覆盖的竞态窗口。
+        const list = state.records[key] || (state.records[key] = []);
         list.push(rec);
         const cutoff = now - 7 * 24 * 3600 * 1000;
-        // 每键保留 300 条：健康页签 30m/24h 视图与选择器置顶绰绰有余，同时把
-        // settings.yaml 的体量压到可读（2000 条/键时该文件一度膨胀到 2 万行）
         state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-300);
-        pendingRecords.push({ key, rec });
-        persistHealth();
+        if (healthStore !== null) {
+            healthStore.appendEvent(key, rec).catch((e) => console.warn('[model-channel-manager] health event append failed:', e && e.message));
+        }
+        scheduleDigest();
     };
     const persistSpeedResults = async (r) => {
+        if (healthStore !== null) {
+            await healthStoreSpeed(r).catch(() => { });
+        }
         if (bus === null) return;
-        await bus.writeHealth({ speedResults: clone(r), runtime: await persistRuntime() });
+        await bus.writeHealth({ runtime: await persistRuntime() });
     };
-    // ---------- 健康持久化节流：合并 2s 窗口内的写入，避免每个请求全量重写 settings ----------
-    let healthFlushHandle = null;
-    let healthDirty = false;
-    // 尚未落盘的流水：reloadFromConfig 每次 volatile-update 都用配置快照整体覆盖 state.records，
-    // 而 flush 有 2s 防抖——不缓冲的话，刚记下的一笔会在落盘前被内存覆盖（实测「测试成功不入账」就是这个）。
-    let pendingRecords = [];
-    const flushHealthNow = async () => {
-        if (bus === null) return;
-        const flushed = pendingRecords.slice();
-        await bus.writeHealth({ records: clone(pullRecords()), speedResults: clone(pullSpeedResults()), runtime: await persistRuntime() });
-        // 写入成功后才清账；失败就留着，等下一次 flush 重试
-        pendingRecords = pendingRecords.filter((p) => !flushed.includes(p));
-    };
-    const persistHealth = () => {
-        healthDirty = true;
-        if (healthFlushHandle === null) {
-            healthFlushHandle = ctx.timeout(() => {
-                healthFlushHandle = null;
-                if (!healthDirty) return;
-                healthDirty = false;
-                flushHealthNow().catch(() => { });
-            }, 2000);
+    const healthStoreSpeed = async (r) => {
+        for (const [groupId, rows] of Object.entries(r || {})) {
+            await healthStore.putSpeedRows(groupId, rows);
         }
     };
-    ctx.effect(() => () => {
-        // 插件卸载时尽力冲刷最后一批健康数据（settings 服务仍在，失败静默）
-        if (healthFlushHandle !== null) {
-            healthFlushHandle();
-            healthFlushHandle = null;
-        }
-        if (healthDirty) {
-            healthDirty = false;
-            flushHealthNow().catch(() => { });
-        }
-    }, 'model-channel health flush');
     // ---------- 引擎：单候选尝试 ----------
     async function* streamAttempt(cfg, cand, options, attemptStart) {
         if (cand.provider.startsWith(ROUTE_PREFIX))
@@ -823,6 +808,89 @@ export function apply(ctx, config) {
         else if (JSON.stringify(current) !== JSON.stringify(next))
             adapterHandle.replace(next);
     }
+    // ---------- 健康数据 domain 存储 + 存量迁移 + 小投影 ----------
+    // healthStore：storageDomain 存在时启用（dsh-base 组合了 json 后端）。
+    // 启动序列：先开 domain → 迁移 settings 存量 → reloadFromConfig 从 domain 读权威数据。
+    let healthStore = null;
+    // digest：写进 settings health 子树的小投影（client 健康页渲染用）。
+    // 聚合上移 host，client 不再拉原始流水全量 describe——settings 里不再出现 records。
+    let digestTimer = null;
+    const DIGEST_INTERVAL = 5000;
+    const buildDigest = () => {
+        // 与旧 client HealthPanel 聚合口径一致：total/success/ttft/latency/token（计费口径
+        // = input + cacheRead + cacheWrite + output），外加 lastTs/lastOk/lastCode
+        const by = new Map();
+        for (const list of Object.values(state.records)) {
+            for (const e of list) {
+                const key = e.provider + '::' + e.model;
+                let a = by.get(key);
+                if (a === undefined) {
+                    a = { provider: e.provider, model: e.model, total: 0, success: 0, ttftSum: 0, latSum: 0, tokIn: 0, tokOut: 0, tokCache: 0, lastTs: 0, lastOk: null, lastCode: null };
+                    by.set(key, a);
+                }
+                a.total++;
+                const inTok = e.inputTokens || 0;
+                const outTok = e.outputTokens || 0;
+                const cacheTok = (e.cacheReadTokens || 0) + (e.cacheWriteTokens || 0);
+                a.tokIn += inTok;
+                a.tokOut += outTok;
+                a.tokCache += cacheTok;
+                if (e.ok) {
+                    a.success++;
+                    if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs;
+                    if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs;
+                }
+                if ((e.ts || 0) > a.lastTs) {
+                    a.lastTs = e.ts || 0;
+                    a.lastOk = e.ok;
+                    a.lastCode = e.ok ? null : (e.code || null); // lastCode 随 lastTs 对齐（不再按遍历序覆盖）
+                }
+            }
+        }
+        return [...by.values()].map((a) => ({
+            provider: a.provider, model: a.model, total: a.total, success: a.success,
+            ttftAvg: a.success > 0 ? Math.round(a.ttftSum / a.success) : null,
+            latAvg: a.success > 0 ? Math.round(a.latSum / a.success) : null,
+            tokIn: a.tokIn, tokOut: a.tokOut, tokCache: a.tokCache,
+            lastTs: a.lastTs, lastOk: a.lastOk, lastCode: a.lastCode,
+        }));
+    };
+    const flushDigest = () => {
+        digestTimer = null;
+        if (bus !== null) {
+            bus.writeHealth({ digest: buildDigest(), digestAt: Date.now() }).catch(() => { });
+        }
+    };
+    const scheduleDigest = () => {
+        if (digestTimer === null) {
+            digestTimer = ctx.timeout(flushDigest, DIGEST_INTERVAL);
+        }
+    };
+    ctx.effect(() => () => {
+        if (digestTimer !== null) {
+            digestTimer();
+            digestTimer = null;
+        }
+        flushDigest();
+    }, 'model-channel health digest');
+    // settings 存量 records/speedResults → domain 一次性迁移（桶已存在即跳过，domain 权威）。
+    const migrateHealthToDomain = async () => {
+        if (healthStore === null || bus === null) return;
+        const health = healthOf();
+        if (health.healthMigrated === true) return;
+        let ok = false;
+        try {
+            ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
+        }
+        catch (_e) {
+            ok = false; // 下次启动再试
+        }
+        if (!ok) return; // store 已关闭（卸载竞态）：不写标记，避免标记与数据永久不一致
+        // 同一次合并写：迁移标记 + 清空 settings 里的旧存量（否则 writeHealth 的
+        // Object.assign 会把 records/speedResults 永远带下去，profile 膨胀问题未真正解决）
+        bus.writeHealth({ healthMigrated: true, records: {}, speedResults: {} }).catch(() => { });
+    };
+
     // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
     let bus = null;
     let runtimeRestored = false;
@@ -846,18 +914,19 @@ export function apply(ctx, config) {
         ctx.timeout(() => { fn(); }, ms);
     };
     // 从实例配置读取全部状态；volatile 提交后由 loader/volatile-update 触发重载。
+    // 0.3.1 起 records/speedResults 的权威在 storageDomain（healthStore）；
+    // settings health 子树只承载小投影（digest 给 client 渲染）+ 运行态 + 任务哨，
+    // volatile 快照覆盖不再能抹掉任何流水（F11/F23 的根因消除）。
     function reloadFromConfig(initial) {
         const cfg = cfgOf();
         state.config = clone(cfg) || { groups: [] };
         const health = healthOf();
-        state.records = clone(health.records || {});
-        // 配置快照覆盖后，把尚未落盘的流水补回来（ts+provider+model 相同视为同一笔，不重复）
-        for (const p of pendingRecords) {
-            const list = state.records[p.key] || (state.records[p.key] = []);
-            if (!list.some((e) => e.ts === p.rec.ts && e.provider === p.rec.provider && e.model === p.rec.model))
-                list.push(p.rec);
-        }
-        state.speedResults = clone(health.speedResults || {});
+        state.records = healthStore !== null
+            ? clone(healthStore.allEventBuckets())
+            : clone(health.records || {});
+        state.speedResults = healthStore !== null
+            ? clone(healthStore.allSpeedBuckets())
+            : clone(health.speedResults || {});
         state.testResults = clone(health.testResults || {});
         if (initial && !runtimeRestored) {
             restoreRuntime(health.runtime || {});
@@ -940,12 +1009,54 @@ export function apply(ctx, config) {
             cfgScope: { get: () => cfgOf() },
             healthScope: { get: () => healthOf() },
         };
-        reloadFromConfig(true);
+        // healthStore 可用（dsh-base 的 storage 栈在场）时：开 domain → 迁移存量 →
+        // 用 domain 权威数据重建内存镜像 → boot；否则同步走旧路径。
+        // ctx.inject 回调不是 async 函数，domain 初始化用 promise 链表达。
+        // 卸载竞态防护：then 回调先验 fiber 活性，inactive 时回滚 healthStore 并跳过
+        // effect 注册（对 inactive fiber 注册 effect 会抛 INACTIVE_EFFECT，若被吞掉则
+        // domain 永不 close，facility 名字被占 → HMR 重载后 already-open 静默降级）。
+        // boot 也挪进链尾：domain 路径下 reloadFromConfig(true) 异步排队，若 boot 先跑，
+        // state.speedResults 尚为空 → onFirstUse 组每次启动都重测；且 state.config 为空
+        // 时 rewireRoutes 推迟，启动早期虚拟路由短暂不存在。
+        const domainFacility = ctx.get('storageDomain');
+        const fiberUid = ctx.fiber && ctx.fiber.uid;
+        const fiberAlive = () => ctx.fiber !== undefined && ctx.fiber.uid === fiberUid && ctx.fiber.state !== 4 /* disposed */;
+        if (domainFacility !== undefined) {
+            const store = new HealthStore(ctx);
+            Promise.resolve()
+                .then(() => store.open())
+                .then(() => {
+                if (!fiberAlive()) {
+                    // 已卸载：回滚赋值，由 closeAll 兜底回收 domain
+                    void store.close().catch(() => { });
+                    return;
+                }
+                healthStore = store;
+                ctx.effect(() => () => { void store.close(); }, 'model-channel health domain close');
+            })
+                .catch((e) => {
+                console.warn('[model-channel-manager] storageDomain open failed, health records stay in-memory only:', e && e.message);
+            })
+                .then(() => (healthStore !== null ? migrateHealthToDomain().catch(() => { }) : null))
+                .then(() => {
+                if (fiberAlive())
+                    reloadFromConfig(true);
+            })
+                .then(() => {
+                if (fiberAlive())
+                    boot();
+            })
+                .catch(() => { }); // 卸载竞态下 reload/boot 内部可能 throw，链尾兜底防 unhandled rejection
+        }
+        else {
+            reloadFromConfig(true);
+            boot();
+        }
         ctx.on('loader/volatile-update', () => {
             reloadFromConfig(false);
             console.log('[model-channel-manager] config hot-reloaded, routes:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
         });
-        boot();
+        // boot 已在 domain ready 链尾（或降级分支）调用，此处不再调
     });
     // ---------- 全局 LLM 请求健康拦截 (涵盖所有非虚拟路由的真实渠道模型调用) ----------
     ctx.on('llm/stream', async function* (options, next) {

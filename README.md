@@ -58,7 +58,7 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 
 ## 数据通道（全走公共 seam，无私有 RPC）
 
-- 读配置/健康/运行态 = `api.settings.describe()` 过滤命名空间
+- 读配置/运行态 = `api.settings.describe()` 过滤命名空间
 - 保存 provider = `api.settings.update({ns:'llm-pi-ai', patch:{providers}})`
 - 保存轮询组 = `api.settings.update({ns:'model-channels', patch:{groups}})`
 - ⚡测速 = `api.settings.update({ns:'model-channel-health', patch:{speedRequest:{group,nonce}}})`（host watcher 消费）
@@ -67,7 +67,28 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 - 上述调用形状仍保留 0.1 的样子：client 半内建门面 `makeLegacyApi` 把 0.2 的**位置参数 + RemoteResult** 适配回旧的**对象入参 + `{result:{ok,value}}`**，并把 `model-channels` / `model-channel-health` 合成回旧命名空间视图（真实承载是本插件行 id `model-channel-manager` 的实例配置）。
 
 > **宿主边界（0.1 历史，0.2 已不适用）**：0.1 的 settings RPC 走 apiproxy 暴露白名单（`exposedNamespaces()` = LLM provider ns + `WEB_/PRODUCT_SETTINGS_NAMESPACES`），当时含该边界的宿主必须放行 `model-channels` / `model-channel-health`（本仓曾在 harness `dsh-host-apiproxy` 打 `PLUGIN_SETTINGS_NAMESPACES` 补丁）。
-> **0.2 的 settings 命名空间就是 profile 行 id**，由 `@deepseek-ai/dsh-api-settings-controller` 的 `describe` 直接投影本行实例配置，没有该白名单环节；对应地，本插件的数据落在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `model-channel-manager` 行 `config` 下。
+> **0.2 的 settings 命名空间就是 profile 行 id**，由 `@deepseek-ai/dsh-api-settings-controller` 的 `describe` 直接投影本行实例配置，没有该白名单环节；对应地，本插件的配置落在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `model-channel-manager` 行 `config` 下。
+
+## 健康数据存储（0.3.1 重构：事实数据归位 storageDomain）
+
+> 背景：0.3.0 及之前，健康流水整字段存在 settings health 子树里，每 2s 防抖整段重写
+> profile patch（实测 6350 行中 health 约占 3000 行），且与 volatile 快照覆盖互相踩——
+> 刚记的账在落盘前被旧快照抹掉（审计 F11/F23，「测试成功不入账」的根因）。
+
+- **权威存储**：`storageDomain` 的 `model_channel_health` 单元（dsh-base 已组合 json 后端，
+  root=`~/.dsh/storages/`），`per-record` 布局——一条渠道一个桶文档，`backup-and-skip`
+  容错。host 侧 `src/health-store.js` 封装：追加走原子写链（并发 `recordHealth` 不丢更新）、
+  7 天窗口过期、每桶 300 条截断。
+- **settings 只存小投影**：`health.digest`（host 聚合好的摘要数组：total/success/ttft/latency/
+  token 三分项/lastTs）+ `digestAt`，client 健康页渲染用；不再下发原始流水。
+- **聚合上移 host**：`buildDigest` 在 host 折叠（口径同旧 client：计费 token = input +
+  cacheRead + cacheWrite + output），client 不再拉全量 describe 做原始事件折叠。
+- **存量迁移**：首次启动自动把 settings 里的 `records`/`speedResults` 搬入 domain（桶已存在
+  即跳过，幂等），同一次合并写里清空 settings 旧存量并落 `healthMigrated` 标记。
+- **降级**：storageDomain 缺席的 profile 退化为纯内存（不持久化流水），不拒绝启动。
+- **client 兼容**：旧 host（无 digest 字段）自动回落原始 records 路径，升级窗口不断供。
+- **已知近似**：30m/24h 视图按「最近活跃渠道」过滤，数值仍是 7 天累计（UI 已标注）；
+  精确分窗口需 host 出多份 digest，后续增强。
 
 ## 响应信封（重要）
 
@@ -129,7 +150,7 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 ## host 半内部接口
 
 - settings 接入用 **`ctx.inject(['settings'], (sctx) => {...})`**（settings 服务异步初始化，apply 时 `ctx.get('settings')` 为 undefined——曾经整个引擎静默失效，命名空间从未注册）
-- 配置 schema（schemastery）：`model-channels` 的虚模型/candidates/strategy/timeoutMs/cooldownMs/maxRetriesPerCandidate/speedTest；`model-channel-health` 的 records 7 天切片（单组 ≤2000 条）/speedResults/runtime/speedRequest+lastHandledNonce/testRequest+testResults+lastTestHandledNonce
+- 配置 schema（schemastery）：`model-channels` 的虚模型/candidates/strategy/timeoutMs/cooldownMs/maxRetriesPerCandidate/speedTest；`model-channel-health` 的 runtime/speedRequest+lastHandledNonce/testRequest+testResults+lastTestHandledNonce/digest 小投影（records/speedResults 仅作 0.3.1 迁移的读取源，权威在 storageDomain）
 - 引擎：sticky/round-robin/primary 三策略；首响应超时 + 流中空闲超时（动态 = max(timeoutMs, min(120s, ttft×2))）；单候选原地重试（指数退避）耗尽才换；全炸清冷却重试一轮；测速 ttft/latency/hybrid/smart 四键（smart = 0.5×ttft_norm + 0.3×(1−reliability) + 0.2×latency_norm，reliability 贝叶斯平滑 `(success+2.5)/(total+5)`）；测速失败进冷却；请求隔离按组
 - 虚拟模型元数据：`reasoning.efforts` 七档（off…max）、**defaultEffort=max**——原生 `/model` 弹窗对新模型的自动填档与展示跟随该声明；会话内显式档位的跨会话恢复由 selector 插件的档位记忆层负责（`modelDirectories` 拦截，存 `model-channels.effortMemory`）
 - 迁移：startup 时从工作区 `.channel-manager/config.json` 一次性迁入 `model-channels`（无遗留则忽略）；完成后写 `legacyMigrated` 哨兵防止「清空组后重启复活」；fs 未就绪时 5s×6 重试
@@ -176,5 +197,6 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 20. **诊断临时实例必须独立 home（`DSH_HOME=/tmp/dsh-diag dsh ...`）**：临时实例与主实例共用 `~/.dsh` 会并发写同一会话日志与 `session_projcache.json`——两进程各自的 seq 计数器交错追加，日志出现重复 seq → `corrupt session log: seq gap in committed region` → 会话 resume 直接拒绝，表现为该会话内模型目录加载失败（选择器「暂无可用模型」）。修复：解压 jsonl 删掉多余事件即可（后续 seq 连续则天然对齐），用 `session-persistence-jsonl` 的 `scanLog` 校验后压缩回写；杀进程前务必备份。
 21. **适配器契约以安装运行时的 d.ts 为准，不能照抄源码仓快照**：源码仓较新、rc.2 运行时的 `LlmAdapter` 多一个必需的 `prepareCall(provider, model, signal) → Promise<{model, stream}>`（主分发路径 llm.stream/llm.prepareCall 都先走它再 `adapterCall.stream(options)`；`adapter.stream` 在 rc.2 服务层从不直调）。缺它的症状极具迷惑性：注册/目录/菜单全正常，**真实发对话**才报 `registration.adapter.prepareCall is not a function`。实现对齐 llm-pi-ai 的快照模式：prepare 时捕获一份配置快照，元数据与 dispatch 都出自同一代。回归：`tests/adapter-contract.test.cjs`（T3 直接解析安装版 d.ts 的 LlmAdapter 方法集做契约同步）。
 22. **0.2 配置写入是 HMR 独占事务**：`settings.update` → `configEditor.edit()` → `hmr.runExclusive()`；在 `loader/volatile-update` 回调里回写会抛 `HMR transactions cannot be nested`（实测一段会话内 15 次，面板“测试”结果永远落不了盘）。事务内创建的**任何**异步资源（`AsyncResource` / `setTimeout` / `setInterval`）都继承事务上下文，**只有 `AsyncLocalStorage.exit()` 能切出**：`ctx.get('hmr').executing.exit(fn)`（仅当 `getStore()` 为真时切）。写入会被 `runExclusive` 排进队列、在本次事务结束后执行；**监听器保持同步、不要在外层事务里 await 它**（队列串行，互等即死锁）。
-23. **整字段落盘 + 内存态被配置快照覆盖**：`settings.update` 是整字段替换；`reloadFromConfig()` 每次 volatile-update 都用配置快照整体覆盖 `state.records`，而健康 flush 有 2s 防抖 → **刚记下的一笔在落盘前就被内存覆盖**（症状：面板“测试”成功不入账，失败反被全局拦截器的 catch 记上）。修法：`pendingRecords` 缓冲，快照覆盖后把未落盘的补回，flush 成功后再清账。
+23. **整字段落盘 + 内存态被配置快照覆盖**（0.3.1 已根治）：`settings.update` 是整字段替换；旧实现 `reloadFromConfig()` 每次 volatile-update 都用配置快照整体覆盖 `state.records`，而健康 flush 有 2s 防抖 → **刚记下的一笔在落盘前就被内存覆盖**（症状：面板“测试”成功不入账，失败反被全局拦截器的 catch 记上）。当时的修法是 `pendingRecords` 缓冲补账；0.3.1 起权威数据搬入 storageDomain（见「健康数据存储」），settings 只存 digest 小投影，此竞态从数据模型层消除。
 24. **nonce 落盘时机与启动竞态**：`lastTestHandledNonce` / `lastHandledNonce` 必须在**得出结果之后**写（提前写会让“未就绪”的重试被自己的持久值挡掉）；启动瞬间凭据服务尚未就绪时测试/测速会以 `MISSING_CREDENTIAL` 失败（凭据其实已在 `.credentials.yaml` 里），应识别为「还没就绪」→ 释放认领 + 5s 延时重试（上限 24 次），**不要**写成渠道故障；测速还必须在整组候选都因未就绪失败时**不落盘、不冷却**，否则一次启动重放就把所有渠道误判成故障。
+25. **domain 写入的并发丢失（0.3.1 review 挽救）**：`KvTable.put` 是整 record 覆盖，`get→filter→put` 的读-改-写在 put 的 IO 延迟窗口内并发调用会互相覆盖（后写盖先写，先记的账丢失）——恰好复刻了要消灭的丢账问题。**并发追加必须走原子链**：`update(key, fn)` 的 fn 在写链队列槽位看到当前值；桶不存在时 update 报 `missing-key`，先 put 初始化。另外在 promise 链里 `ctx.effect` 注册 disposer 前必须先验 fiber 活性——对 inactive fiber 注册会抛 `INACTIVE_EFFECT`，若被外层 catch 吞掉则 domain 永不 close，facility 名字被占 → HMR 重载后 `already-open` 静默降级。回归：`tests/health-domain-sync.test.cjs`。
