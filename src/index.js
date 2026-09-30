@@ -552,6 +552,14 @@ export function apply(ctx, config) {
             yield failChunk('channel group "' + cfg.id + '" has no candidates', 'NO_CANDIDATES');
             return;
         }
+        // F14（审计 H07）：enabled=true 但从未测过速的组，首次真实使用时后台触发一次
+        // 自动测速（不阻塞、不 await 当前请求）。旧实现只有 boot 时的 onFirstUse 分支，
+        // 常规请求路径完全没有自动测速入口——开启开关后从未生效。
+        if (cfg.speedTest.enabled && (state.speedResults[cfg.id] || []).length === 0 && !rt.speedTestRunning) {
+            rt.speedTestRunning = true; // 先占位防重入（runSpeedTest 内部还会再查）
+            rt.speedTestRunning = false;
+            runSpeedTest(cfg).catch(() => { });
+        }
         // F08：按本次请求能力过滤（含图/带 effort 时）。过滤发生在测速排序之后，
         // 保序不改变相对优先级。
         const before = order.length;
@@ -559,7 +567,17 @@ export function apply(ctx, config) {
         if (order.length < before)
             pushEvent(cfg, 'capability-filter', { skipped: before - order.length, kept: order.length });
         const strategy = cfg.strategy || 'sticky';
-        let cursor = strategy === 'primary' ? 0 : rt.currentIndex % order.length;
+        // F13（审计 H13）：round-robin 的指针改为「选择时原子预留」——旧实现成功后才
+        // 推进 rt.currentIndex，两个并发请求都从 first 开始（并发不均分）。
+        // 现在：选定时立即占位推进（同步读改写，JS 单线程内原子），失败不回滚
+        // （失败反馈走冷却，指针保持前进语义——轮询分布比严格顺序更重要）。
+        if (strategy === 'round-robin') {
+            cursor = rt.currentIndex % order.length;
+            rt.currentIndex = (cursor + 1) % order.length; // 本次请求已占用 cursor 槽位
+        }
+        else {
+            cursor = strategy === 'primary' ? 0 : rt.currentIndex % order.length;
+        }
         let fullRounds = 0;
         let lastFail = null;
         const failedKeys = [];
@@ -609,12 +627,12 @@ export function apply(ctx, config) {
                         succeeded = true;
                         candidateOk = true;
                         rt.cooldowns.delete(key);
+                        // F13：round-robin 的推进已移到选定时（见上方原子预留）；
+                        // 成功路径只维护 sticky/primary 的语义。
                         const pos = order.findIndex((c) => candKey(c) === key);
-                        if (strategy === 'round-robin')
-                            rt.currentIndex = (pos + 1) % order.length;
-                        else if (strategy === 'sticky')
+                        if (strategy === 'sticky')
                             rt.currentIndex = pos;
-                        else
+                        else if (strategy === 'primary')
                             rt.currentIndex = 0;
                         if (failedKeys.length > 0)
                             pushEvent(cfg, 'failover', { from: failedKeys[failedKeys.length - 1], to: key, reason: 'candidate change after ' + failedKeys.length + ' failure(s)' });

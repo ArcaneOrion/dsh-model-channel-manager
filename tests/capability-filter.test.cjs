@@ -102,7 +102,7 @@ test('F08-6 源级：TTL 缓存 + 全滤退回 + 组事件', () => {
   assert.ok(/kept\.length > 0 \? kept : cands/.test(src), '全滤退回原列表');
   assert.ok(/capability-filter/.test(src), '应有 capability-filter 组事件');
   assert.ok(/resolveModelInfo\(cand\.provider, cand\.model\)/.test(src), '应经宿主 resolveModelInfo');
-  // streamGroup 里调用点在 orderedCandidates 之后（保序）
-  const m = src.match(/let order = orderedCandidates\(cfg\);[\s\S]{0,400}?filterByCapability\(order, options\)/);
+  // streamGroup 里调用点在 orderedCandidates 之后（保序；F14 的自动测速块插在中间）
+  const m = src.match(/let order = orderedCandidates\(cfg\);[\s\S]{0,900}?filterByCapability\(order, options\)/);
   assert.ok(m, '过滤应发生在测速排序之后');
 });
