@@ -1383,6 +1383,13 @@ export function apply(ctx, config) {
                     const text = await fsSvc.readText(target);
                     const legacy = JSON.parse(text);
                     const migrated = normalizeConfig(legacy);
+                    // F10（审计 H15）：读取是 await 的——这个窗口里用户可能已经保存了
+                    // 新组。写前重检：现在有组了就不迁（用户的新配置优先于旧文件复活）。
+                    if (pullConfig().groups.length !== 0) {
+                        console.log('[model-channel-manager] legacy migration skipped: user config arrived during read');
+                        bus.writeHealth({ legacyMigrated: true }).catch(() => { });
+                        return;
+                    }
                     if (migrated.groups.length > 0) {
                         await bus.settings.update(SELF_NS, { groups: migrated.groups });
                         state.config = { groups: migrated.groups };

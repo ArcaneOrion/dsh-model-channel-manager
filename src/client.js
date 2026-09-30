@@ -1556,6 +1556,10 @@ window.__ModuleLoader__.load({
               if (Array.isArray(cleaned.input) && cleaned.input.length > 0) cleaned.input = cleaned.input.slice()
               else delete cleaned.input
               if (cleaned.reasoningEfforts != null && typeof cleaned.reasoningEfforts === 'object' && Object.keys(cleaned.reasoningEfforts).length > 0) cleaned.reasoningEfforts = Object.assign({}, cleaned.reasoningEfforts)
+              else if (cleaned.reasoningEfforts === false) {
+                // F07（审计 C02）：false = 显式关闭推理（继承 catalog 默认的对立面）。
+                // 删掉它 = 静默恢复继承，语义被改变。原样保留。
+              }
               else delete cleaned.reasoningEfforts
               const mc = cleanCompat(cleaned.compat)
               if (mc) cleaned.compat = mc
@@ -1563,7 +1567,12 @@ window.__ModuleLoader__.load({
               return cleaned
             })
             const pObj = Object.assign({}, pVal)
-            pObj.api = pVal.api || 'openai-completions'
+            // F07（审计 C08）：api 缺省 = 继承 catalog 协议；强塞 openai-completions
+            // 会把「继承」变成「显式指定」，materialize 时显式 api 优先于 catalog——
+            // 协议被静默切换。UI 下拉仍显示默认值（渲染默认与持久化默认分离），
+            // 但保存不写显式值。新增供应商时 addGroup 路径已显式给 api。
+            if (typeof pVal.api === 'string' && pVal.api) pObj.api = pVal.api
+            else delete pObj.api
             pObj.models = cleanModels
             if (!(pVal.baseURL && String(pVal.baseURL).trim())) delete pObj.baseURL
             else pObj.baseURL = String(pVal.baseURL).trim()
