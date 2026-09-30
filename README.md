@@ -165,6 +165,14 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 
 ## 已知限制
 
+- **虚拟模型能力声明与候选实际能力无联动（审计 F08，最重要）**：手填 vision/effort/窗口
+  是「撒谎」——实测图片会被宿主静默替换为占位符后仍报成功（H14），非推理候选被强塞
+  effort 后 dispatch 前被拒（H06）。完整修复需异步候选能力解析（`resolveModelInfo` 的
+  `inputModalities` 缺失=未知，只有显式排除才是负能力）+ 缓存 + 未知态策略，属设计级
+  改动，待专项处理
+- **超时不中止上游（审计 F01/F02）**：`Promise.race` 超时后 `inner.return()` 排在挂起的
+  `next()` 之后，慢请求占住 failover 流程；成功/提前退出路径缺统一 finally。需 per-attempt
+  AbortController + 总预算，属引擎级改动
 - 动态超时实现了首响应 + 流中空闲；全炸后「清冷却重试一轮」回溯，未实现「等待最早冷却」的睡眠分支
 - 测速结果不入健康流水（pi 记）；smart 键只统计真实请求
 - **Token 字段只在新记录上出现**：host 升级重启前的存量健康记录无 token 字段，7 天视图对重启前的调用会低估 token（请求数/可用率不受影响）；数据自重启后开始累积
@@ -172,6 +180,10 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 轮询渠道/健康统计面板需要 host 新代码（重启后生效）；健康流水的数据在**实际请求过轮询组**后才出现
 - `reasoningEfforts` 缺失（undefined）的 model 正确渲染（`|| {}` 兜底）
 - 会话模型选择器搜索版已拆出为独立插件 `@arcaneorion/dsh-model-selector-search`（原生座位遮蔽、搜索、向上展开菜单、effort 档位未实现等边界见该仓 README）；本插件不再注册任何座位
+- `makeLegacyApi` 0.1 兼容门面仍保留（94 行、11 调用点）：拆除要动 6 个功能路径的双层
+  信封，待 0.3.2 真实环境验证后再决定
+- 30m/24h 健康视图是近似口径（按最近活跃过滤，数值为 7 天累计，UI 已标注）；精确分窗口
+  需 host 出多份 digest
 
 ## 踩坑速记（本项目，按严重程度）
 
