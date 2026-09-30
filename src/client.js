@@ -1390,9 +1390,18 @@ window.__ModuleLoader__.load({
       const [ready, setReady] = useState(false)
 
       const renameProviderInChannels = (oldId, newId) => {
+        // F17（审计 C05）：改名要同步全部引用——主 candidates + 每个 preset 的
+        // candidates。宿主优先使用 activePreset.candidates，漏改它 = 删旧 provider
+        // 后组仍访问不存在的 ID。
+        const renameCands = (cands) => (cands || []).map((c) => (c && c.provider === oldId) ? Object.assign({}, c, { provider: newId }) : c)
         setChannelsDraft((d) => (d || []).map((g) => {
-          const cands = (g.candidates || []).map((c) => (c && c.provider === oldId) ? Object.assign({}, c, { provider: newId }) : c)
-          return Object.assign({}, g, { candidates: cands })
+          const next = Object.assign({}, g, { candidates: renameCands(g.candidates) })
+          if (Array.isArray(g.presets)) {
+            next.presets = g.presets.map((p) => (p && Array.isArray(p.candidates))
+              ? Object.assign({}, p, { candidates: renameCands(p.candidates) })
+              : p)
+          }
+          return next
         }))
       }
       const [channels, setChannels] = useState(null)
@@ -1481,6 +1490,29 @@ window.__ModuleLoader__.load({
         if (!ready) {
           setNotice('配置尚未加载完成，请稍候再保存')
           setTimeout(() => setNotice(null), 4000)
+          return
+        }
+        // F16 预检：非法/重复组 ID、空候选直接拒绝提交（旧实现保存后 host 静默丢弃，
+        // 界面仍显示「已保存」——H08：3 组保存实际只注册 1 条路由）
+        const groupsToSave = channelsDraft || []
+        const problems = []
+        const seenIds = new Set()
+        for (const g of groupsToSave) {
+          const gid = (g && g.id) || ''
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(gid)) {
+            problems.push('组「' + (gid || '(未命名)') + '」ID 非法（仅小写字母/数字/连字符，字母或数字开头）')
+          } else if (seenIds.has(gid)) {
+            problems.push('组 ID「' + gid + '」重复')
+          } else {
+            seenIds.add(gid)
+          }
+          const candCount = (g && Array.isArray(g.candidates)) ? g.candidates.filter((c) => c && c.provider && c.model).length : 0
+          if (candCount === 0 && gid)
+            problems.push('组「' + gid + '」没有可用候选（候选需同时选择 Provider 和模型）')
+        }
+        if (problems.length > 0) {
+          setNotice('保存被拒绝：' + problems[0] + (problems.length > 1 ? '（共 ' + problems.length + ' 个问题）' : ''))
+          setTimeout(() => setNotice(null), 8000)
           return
         }
         setSaving(true)

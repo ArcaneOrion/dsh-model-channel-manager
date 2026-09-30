@@ -134,10 +134,20 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 
 供应商卡片头部「改名」按钮可重命名 Provider ID（约束：小写字母开头，仅小写字母/数字/连字符）：
 
-- 轮询组候选池中引用该 ID 的 candidate 会自动同步为新 ID
+- 轮询组候选池中引用该 ID 的 candidate 会自动同步为新 ID——**主 candidates 与全部 presets 都同步**（0.3.6 修复审计 F17/C05：宿主优先使用 `activePreset.candidates`，漏改它 = 删旧 provider 后组悬空）
 - `apiKeyEnv` 凭据引用**保持不变**——凭据是 write-only 无法搬移，保持引用名原地不动即可让已存储 Key 继续生效
 - 历史健康流水保留在原 ID 名下（历史存档不受影响）
 - 改名后仍需点击右上「保存全部变更」落盘
+
+## 组配置保存校验（0.3.6，审计 F16/H08）
+
+保存前 client 预检，以下问题**直接拒绝提交**并列出：
+
+- 组 ID 非法（仅小写字母/数字/连字符，字母或数字开头）
+- 组 ID 重复
+- 组无可用候选（候选需同时选 Provider 和模型）
+
+host 侧兜底：`rewireRoutes` 发现配置组数 > 实际路由数时 `console.warn` 列出被丢弃的组 ID（此前是静默丢弃——H08：3 组保存、路由只有 1 条，界面仍显示「已保存」）。允许清空全部组（空列表合法）。
 
 ## 密钥写入（凭据引用虚拟化）
 

@@ -1004,7 +1004,20 @@ export function apply(ctx, config) {
     }
     function rewireRoutes() {
         const llm = ctx.llm;
-        const next = pullConfig().groups.map((g) => routeOfGroup(g.id));
+        // F16（审计 H08）：normalizeConfig 对非法/重复 ID 是静默 continue——保存 3 组
+        // 实际只注册 1 条路由，界面仍显示「已保存」。这里把被丢弃的组大声报出来：
+        // 配置里有 N 组但只有 M 组成为路由时，用户能从日志看到哪组、为什么被丢。
+        const rawGroups = Array.isArray(state.config && state.config.groups) ? state.config.groups : [];
+        const normalized = pullConfig().groups;
+        if (rawGroups.length > normalized.length) {
+            const keptIds = new Set(normalized.map((g) => g.id));
+            const dropped = rawGroups
+                .map((g) => g && g.id)
+                .filter((id) => typeof id === 'string' && !keptIds.has(id));
+            if (dropped.length > 0)
+                console.warn('[model-channel-manager] 以下轮询组未通过校验，已被丢弃（不会成为路由）:', dropped.join(', '), '——组 ID 规则：小写字母/数字/连字符，且不重复');
+        }
+        const next = normalized.map((g) => routeOfGroup(g.id));
         const current = llm.listProviders().map((p) => p.id).filter((id) => id.startsWith(ROUTE_PREFIX));
         if (next.length === 0) {
             // 空配置：LLM 服务拒绝注册零 provider 的适配器——推迟首次注册；已注册则清空路由
