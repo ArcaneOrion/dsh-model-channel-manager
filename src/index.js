@@ -471,15 +471,93 @@ export function apply(ctx, config) {
             await closeInner();
         }
     }
+    // ---------- F08 最小切片：候选能力过滤（防「成功路径改变用户输入」） ----------
+    // 审计 H14：虚拟模型声明 image，候选只支持 text——宿主把图片静默替换为
+    //   "[image omitted...]" 后仍返回 stop 成功（用户输入被改变却报成功）。
+    // 审计 H06：非推理候选被强塞 effort → dispatch 前被拒 → CHANNEL_FULL_FAIL。
+    // 策略：请求含图/带 effort 时，过滤「明确声明不支持」的候选；能力未知
+    // （inputModalities 缺失 = 未知，只有显式排除才是负能力——宿主契约）不过滤，
+    // 保持原 failover 行为。解析失败不阻塞（同样视作未知）。
+    // 缓存 60s TTL：pi-ai 的 resolveModel 是内存快照解析（已核安装版源码），
+    // 但 async 接口 + 每次请求都调不划算；能力基本静态，TTL 足够。
+    const capabilityCache = new Map(); // key: provider::model → { at, info }
+    const CAPABILITY_TTL_MS = 60000;
+    const resolveCapability = async (cand) => {
+        const key = candKey(cand);
+        const hit = capabilityCache.get(key);
+        if (hit && Date.now() - hit.at < CAPABILITY_TTL_MS)
+            return hit.info;
+        try {
+            const info = await ctx.llm.resolveModelInfo(cand.provider, cand.model);
+            const entry = { at: Date.now(), info };
+            capabilityCache.set(key, entry);
+            return info;
+        }
+        catch (_e) {
+            return null; // 解析失败 = 未知，不过滤
+        }
+    };
+    /** 请求是否包含图片输入（粗判：消息 content 里有 image 块）。 */
+    const requestHasImage = (options) => {
+        try {
+            return (options.messages || []).some((m) => Array.isArray(m === null || m === void 0 ? void 0 : m.content) && m.content.some((p) => p && p.type === 'image'));
+        }
+        catch (_e) {
+            return false;
+        }
+    };
+    /** 过滤掉明确不支持本次请求能力的候选；全部被滤或未知时退回原列表（不因过滤而失去候选）。 */
+    const filterByCapability = async (cands, options) => {
+        const needImage = requestHasImage(options);
+        const needReasoning = typeof options.reasoningEffort === 'string' && options.reasoningEffort.length > 0 && options.reasoningEffort !== 'off';
+        if (!needImage && !needReasoning)
+            return cands;
+        const skipped = [];
+        const kept = [];
+        for (const cand of cands) {
+            const info = await resolveCapability(cand);
+            if (info === null) {
+                kept.push(cand); // 未知：不过滤
+                continue;
+            }
+            if (needImage) {
+                const mods = info.inputModalities;
+                if (Array.isArray(mods) && mods.length > 0 && !mods.includes('image')) {
+                    skipped.push({ candidate: candKey(cand), reason: 'image input not supported' });
+                    continue; // 明确排除 image
+                }
+            }
+            if (needReasoning && info.reasoning === undefined) {
+                skipped.push({ candidate: candKey(cand), reason: 'reasoning not supported' });
+                continue; // 明确无 reasoning 档位
+            }
+            kept.push(cand);
+        }
+        // 全被滤掉 = 声明与所有候选冲突：退回原列表（让请求去撞，报真实错误）
+        // 而不是直接 NO_CANDIDATES 假装没有渠道
+        if (skipped.length > 0 && kept.length > 0) {
+            // 记录到组事件（cfg 此时未知，用 provider 维度的 console 代替；组事件在
+            // streamGroup 拿到 cfg 后会补记 capability-filter）
+            console.log('[model-channel-manager] capability filter:', skipped.map((s) => s.candidate + ' (' + s.reason + ')').join(', '));
+        }
+        return kept.length > 0 ? kept : cands;
+    };
+
     // ---------- 引擎：组级故障转移循环 ----------
     async function* streamGroup(cfg, options) {
         const rt = groupRuntime(cfg.id);
-        const order = orderedCandidates(cfg);
+        let order = orderedCandidates(cfg);
         if (order.length === 0) {
             pushEvent(cfg, 'no-candidates', {});
             yield failChunk('channel group "' + cfg.id + '" has no candidates', 'NO_CANDIDATES');
             return;
         }
+        // F08：按本次请求能力过滤（含图/带 effort 时）。过滤发生在测速排序之后，
+        // 保序不改变相对优先级。
+        const before = order.length;
+        order = await filterByCapability(order, options);
+        if (order.length < before)
+            pushEvent(cfg, 'capability-filter', { skipped: before - order.length, kept: order.length });
         const strategy = cfg.strategy || 'sticky';
         let cursor = strategy === 'primary' ? 0 : rt.currentIndex % order.length;
         let fullRounds = 0;
