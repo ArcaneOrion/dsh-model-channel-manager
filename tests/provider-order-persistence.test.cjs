@@ -3,7 +3,18 @@
 //   - settings-file/src/index.ts 的 patchNode（叶子 diff，数组 deepEqual 不等即整值 setIn）
 //   - settings/src/index.ts 的 mergeLayers（update 语义）+ applyPathOp（mutate 语义）+ resolve
 // 场景覆盖见每个 describe
-const { parseDocument } = require('yaml')
+// yaml 是 devDependencies（^2.9.0）：本地未 npm install 时优雅跳过而不是报错
+let parseDocument;
+try {
+  ({ parseDocument } = require('yaml'));
+}
+catch (_e) {
+  parseDocument = null;
+}
+if (parseDocument === null) {
+  console.log('yaml 不可解析（未 npm install），本文件跳过');
+  process.exit(0);
+}
 
 // ---- 复刻 settings-file patchNode（index.ts:70-81，逐行对齐） ----
 const deepEqualJson = (a, b) => JSON.stringify(a) === JSON.stringify(b)

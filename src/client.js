@@ -589,13 +589,18 @@ window.__ModuleLoader__.load({
         if (!apiRef) return
         const key = provider + '::' + model
         setTestStates((s) => Object.assign({}, s, { [key]: { status: 'running' } }))
-        const nonce = Date.now() % 1000000000
+        // F03：Date.now()%1e9 同毫秒可碰撞（碰撞 = 两次测试互相认领/覆盖结果），
+        // 换 UUID；host 侧 testRequest.nonce 消费方是 !== 比较，字符串/数字都行
+        const nonce = (crypto.randomUUID && crypto.randomUUID()) || (String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10))
         const prompt = localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己'
         const maxTokens = Number(localStorage.getItem('mcm_test_max_tokens')) || 256
         apiRef.settings.update({
           ns: 'model-channel-health',
           patch: { testRequest: { nonce, provider, model, prompt, maxTokens } }
-        }).then(() => {
+        }).then((resp) => {
+          // F19：RPC resolve ≠ 业务成功——检查信封（旧实现把 ok:false 当「已触发」）
+          const r = resp && resp.result ? resp.result : resp
+          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'test request rejected')
           pollTest(nonce, provider, model)
         }).catch((e) => {
           setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', error: String((e && e.message) || e) } }))
@@ -704,7 +709,7 @@ window.__ModuleLoader__.load({
             el('span', {
               title: '拖动此手柄调整供应商顺序（保存后生效）',
               draggable: true,
-              onDragStart: (e) => { e.stopPropagation(); setDragIdx(idx); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(idx)) } catch (_e) {} },
+              onDragStart: (e) => { e.stopPropagation(); setDragIdx(realIdx); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(realIdx)) } catch (_e) {} },
               onDragEnd: () => { setDragIdx(null); setOverIdx(null) },
               onClick: (e) => e.stopPropagation(),
               style: { cursor: 'grab', color: 'var(--dsw-alias-label-tertiary)', fontSize: 14, padding: '0 6px', userSelect: 'none' }
@@ -931,6 +936,8 @@ window.__ModuleLoader__.load({
       const providers = props._providers || {}
       const [speedState, setSpeedState] = useState({})
       const [expanded, setExpanded] = useState({})
+      // 顶层 notice 的写入通道（ModelConfigView 传入；测速失败要上浮显示）
+      const setNotice = props._setNotice || (() => {})
 
       const addGroup = () => props.setChannelsDraft((d) => {
         const base = d || []
@@ -965,12 +972,19 @@ window.__ModuleLoader__.load({
 
       const speedtest = (gid) => {
         if (!apiRef) return
-        const nonce = Date.now() % 1000000000
+        // F03/F19 同 fireTest：UUID 防碰撞 + 信封检查（ok:false 不再当「已触发」）
+        const nonce = (crypto.randomUUID && crypto.randomUUID()) || (String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10))
         setSpeedState((s) => Object.assign({}, s, { [gid]: 'running' }))
-        apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then(() => {
+        apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then((resp) => {
+          const r = resp && resp.result ? resp.result : resp
+          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'speed request rejected')
           setSpeedState((s) => Object.assign({}, s, { [gid]: 'sent' }))
           setTimeout(() => setSpeedState((s) => Object.assign({}, s, { [gid]: null })), 3000)
-        }).catch(() => setSpeedState((s) => Object.assign({}, s, { [gid]: 'err' })))
+        }).catch((e) => {
+          setSpeedState((s) => Object.assign({}, s, { [gid]: 'err' }))
+          setNotice('测速触发失败: ' + String((e && e.message) || e))
+          setTimeout(() => setNotice(null), 5000)
+        })
       }
 
       if (groups.length === 0) return el('div', { className: 'mcm-empty' }, '暂无轮询组，点击下方按钮创建', el('div', { style: { marginTop: 12 } }, btn('＋新增轮询组', addGroup, 'primary')))
@@ -1368,6 +1382,9 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState(null)
       const [saving, setSaving] = useState(false)
       const [tab, setTab] = useState('config')
+      // ready 门（审计 F04）：首次 describe 完成前保存不可用——旧实现
+      // channelsDraft || [] 把「还没读到」当「空」，加载前点保存会把轮询组清空
+      const [ready, setReady] = useState(false)
 
       const renameProviderInChannels = (oldId, newId) => {
         setChannelsDraft((d) => (d || []).map((g) => {
@@ -1424,7 +1441,8 @@ window.__ModuleLoader__.load({
           setHealth(hv.digest || (hv.digestAt !== undefined)
             ? { digest: hv.digest || [], digestAt: hv.digestAt || 0, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} }
             : (hn ? { records: hv.records || {}, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} } : null))
-        }).catch((e) => setNotice('加载失败: ' + String(e)))
+          setReady(true) // describe 成功：保存解禁（F04 的门）
+        }).catch((e) => { setNotice('加载失败: ' + String(e)); setReady(false) })
       }
 
       useEffect(() => {
@@ -1453,6 +1471,13 @@ window.__ModuleLoader__.load({
 
       const save = () => {
         if (!apiRef) return
+        // F04 门：describe 未完成时 draft/channelsDraft 都是 null——旧实现
+        // (channelsDraft || []) 把「还没读到」当「空」，这里直接拦截而不是兜底空数组
+        if (!ready) {
+          setNotice('配置尚未加载完成，请稍候再保存')
+          setTimeout(() => setNotice(null), 4000)
+          return
+        }
         setSaving(true)
         setNotice(null)
         // Compat 全量透传：rc.2 PiAiCompatProfile 的 20 个字段全部真实生效——此前
@@ -1600,12 +1625,18 @@ window.__ModuleLoader__.load({
           el('div', { className: 'mcm-actions' },
             notice ? el('span', { style: { fontSize: 12, color: notice.includes('失败') ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)' } }, notice) : null,
             btn('刷新', refresh),
-            btn(saving ? '保存中…' : '保存全部变更', save, 'primary')
+            el('button', {
+              className: 'mcm-btn primary',
+              // F04：未就绪/保存中禁用；disabled 态样式弱化
+              disabled: !ready || saving,
+              style: (!ready || saving) ? { opacity: 0.55, cursor: 'not-allowed' } : undefined,
+              onClick: save
+            }, !ready ? '加载中…' : saving ? '保存中…' : '保存全部变更')
           )
         ),
         el('div', { className: 'mcm-body' },
           tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft, _setNotice: setNotice, _renameProviderInChannels: renameProviderInChannels }) :
-          tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})) }) :
+          tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})), _setNotice: setNotice }) :
           el(HealthPanel, { health, _providers: (draft || (state ? state.providers : {})) })
         )
       )

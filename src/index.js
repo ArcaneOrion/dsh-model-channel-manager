@@ -742,22 +742,27 @@ export function apply(ctx, config) {
     }
     function handleTestRequest(next) {
         const req = next.testRequest;
-        const last = Math.max(next.lastTestHandledNonce || 0, claimedTestNonce);
-        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || typeof req.nonce !== 'number' || req.nonce === last)
+        // nonce 统一为字符串 UUID（0.3.2 起 client 换 randomUUID，防同毫秒碰撞）；
+        // 旧数字 nonce（Date.now()%1e9）仍被接受：typeof 兼容两种，比较用 !==。
+        const nonceOf = (v) => (typeof v === 'number' || typeof v === 'string') ? v : null;
+        const reqNonce = nonceOf(req && req.nonce);
+        const lastNum = typeof next.lastTestHandledNonce === 'number' ? next.lastTestHandledNonce : null;
+        const last = lastNum !== null ? Math.max(lastNum, typeof claimedTestNonce === 'number' ? claimedTestNonce : 0) : (claimedTestNonce || null);
+        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || reqNonce === null || reqNonce === last)
             return;
-        claimedTestNonce = req.nonce;
+        claimedTestNonce = reqNonce;
         // nonce 的落盘推迟到本次测试得出结论之后：只有「真跑过」才算 handled。
         // 启动早于凭据服务就绪时会以 MISSING_CREDENTIAL 失败，那要释放认领重试；
         // 若提前写了 nonce，重试会被自己的持久值挡掉。
         const settle = (entry) => {
             if (bus !== null)
-                bus.writeHealth({ lastTestHandledNonce: req.nonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
+                bus.writeHealth({ lastTestHandledNonce: reqNonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
             return setResult(entry);
         };
         // 0.2 的配置写入是「整字段落盘」，不再有 path-ops；结果集按当前值合并后整段写回。
         const setResult = async (entry) => {
-            const key = String(req.nonce);
-            const value = Object.assign({}, entry, { nonce: req.nonce, provider: req.provider, model: req.model });
+            const key = String(reqNonce);
+            const value = Object.assign({}, entry, { nonce: reqNonce, provider: req.provider, model: req.model });
             const cur = healthOf().testResults || {};
             if (bus !== null)
                 await bus.writeHealth({ testResults: Object.assign({}, cur, { [key]: value }) }).catch((e) => console.error('[model-channel-manager] testResults 写入失败:', e));
@@ -786,7 +791,7 @@ export function apply(ctx, config) {
         }).catch(async (e) => {
             if (notReady(e)) {
                 // 凭据服务尚未就绪（典型是启动瞬间的重放）：不写成假 error，释放认领并延后重试
-                claimedTestNonce = 0;
+                claimedTestNonce = null;
                 scheduleReplay('test', () => reloadFromConfig(false));
                 return;
             }
@@ -896,8 +901,8 @@ export function apply(ctx, config) {
     let runtimeRestored = false;
     // 非持久去重：回写要等当前 HMR 事务结束才落盘，这中间 volatile-update 可能带着同一个 nonce 再来，
     // 内存里先认领，避免同一请求被重复执行（并顺带消掉重复的回写风暴）。
-    let claimedTestNonce = 0;
-    let claimedSpeedNonce = 0;
+    let claimedTestNonce = null; // string UUID 或旧数字；null = 未认领
+    let claimedSpeedNonce = null; // string UUID 或旧数字；null = 未认领
     // 启动早于凭据服务就绪：此时重放测试/测速会以 MISSING_CREDENTIAL 失败。
     // 这类错误是「环境还没准备好」而不是「渠道故障」，必须释放认领、延后重试，不能写成假 error。
     const notReady = (e) => {
@@ -941,20 +946,23 @@ export function apply(ctx, config) {
                 runtime.delete(id);
         rewireRoutes();
         const req = health.speedRequest;
-        const last = Math.max(health.lastHandledNonce || 0, claimedSpeedNonce);
-        if (req && typeof req.group === 'string' && typeof req.nonce === 'number' && req.nonce !== last) {
-            claimedSpeedNonce = req.nonce;
+        // nonce 兼容字符串 UUID / 旧数字（与 handleTestRequest 同一策略）
+        const speedNonce = (typeof (req && req.nonce) === 'number' || typeof (req && req.nonce) === 'string') ? req.nonce : null;
+        const lastNum = typeof health.lastHandledNonce === 'number' ? health.lastHandledNonce : null;
+        const last = lastNum !== null ? Math.max(lastNum, typeof claimedSpeedNonce === 'number' ? claimedSpeedNonce : 0) : (claimedSpeedNonce || null);
+        if (req && typeof req.group === 'string' && speedNonce !== null && speedNonce !== last) {
+            claimedSpeedNonce = speedNonce;
             const cfgRow = pullConfig().groups.find((g) => g.id === req.group);
             // nonce 落盘推迟到本次测速得出结论之后（同 handleTestRequest 的理由）：
             // 提前写会把「没就绪」的重试用自己的持久值挡掉。
             const settleSpeed = () => {
                 if (bus !== null)
-                    bus.writeHealth({ lastHandledNonce: req.nonce }).catch(() => { });
+                    bus.writeHealth({ lastHandledNonce: speedNonce }).catch(() => { });
             };
             if (cfgRow)
                 runSpeedTest(cfgRow).then((r) => {
                     if (r && r.deferred) {
-                        claimedSpeedNonce = 0;
+                        claimedSpeedNonce = null;
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
@@ -962,7 +970,7 @@ export function apply(ctx, config) {
                     settleSpeed();
                 }).catch((e) => {
                     if (notReady(e)) {
-                        claimedSpeedNonce = 0;
+                        claimedSpeedNonce = null;
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
