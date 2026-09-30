@@ -38,22 +38,25 @@ window.__ModuleLoader__.load({
               { ns: 'model-channel-health', value: value.health || {}, user: (user && user.health) || {}, revision: (mcm && mcm.revision) || 0 },
             ] } } }
           },
-          // 旧签名：update({ ns, patch })
+          // 旧签名：update({ ns, patch, expectedRevision })——0.3.2 起透传 revision
+          // （宿主 settings.update 第三参；冲突抛 settings/conflict，由调用方提示重载）
           update: async (args) => {
             const ns = (args && args.ns) || NS_MCM
             const patch = (args && args.patch) || {}
-            if (ns === 'model-channels') return wrap(await remote.settings.update(NS_MCM, patch, undefined))
+            const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
+            if (ns === 'model-channels') return wrap(await remote.settings.update(NS_MCM, patch, expected))
             const row = await readMcm()
             const health = (row && row.value && row.value.health) || {}
-            return wrap(await remote.settings.update(NS_MCM, { health: Object.assign({}, health, patch) }, undefined))
+            return wrap(await remote.settings.update(NS_MCM, { health: Object.assign({}, health, patch) }, expected))
           },
           // 旧签名：mutate({ ns, ops })——0.2 只对真实行命名空间提供 path-ops；
           // 本插件自身的健康子树用合并写实现等价语义。
           mutate: async (args) => {
             const ns = (args && args.ns) || NS_MCM
             const ops = (args && args.ops) || []
+            const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
             if (ns !== 'model-channels' && ns !== 'model-channel-health' && ns !== NS_MCM) {
-              return wrap(await remote.settings.mutate(ns, ops, undefined))
+              return wrap(await remote.settings.mutate(ns, ops, expected))
             }
             const row = await readMcm()
             const health = Object.assign({}, (row && row.value && row.value.health) || {})
@@ -78,9 +81,9 @@ window.__ModuleLoader__.load({
               }
             }
             if (ns === 'model-channels') {
-              return wrap(await remote.settings.update(NS_MCM, { groups: top.groups, providerOrder: top.providerOrder }, undefined))
+              return wrap(await remote.settings.update(NS_MCM, { groups: top.groups, providerOrder: top.providerOrder }, expected))
             }
-            return wrap(await remote.settings.update(NS_MCM, { health }, undefined))
+            return wrap(await remote.settings.update(NS_MCM, { health }, expected))
           },
         },
         credentials: {
@@ -1429,7 +1432,9 @@ window.__ModuleLoader__.load({
           const providers = applyProviderOrder((ns && ns.value && ns.value.providers) || {}, savedOrder)
           // user 层 = 仅用户手工声明的路由（用于真正删除与重排序的 mutate 依据）
           const userProviders = (ns && ns.user && ns.user.providers) || {}
-          setState({ providers, userProviders, providerOrder: savedOrder || [] })
+          // revision 记录（审计 F05）：保存时作为 expectedRevision 传给宿主，
+          // 别处（另一个标签页/host 侧）改过配置则宿主拒绝，防止旧快照覆盖
+          setState({ providers, userProviders, providerOrder: savedOrder || [], nsRevisions: { piAi: (ns && ns.revision) || 0, channels: (cn && cn.revision) || 0 } })
           setDraft((prev) => prev || clone(providers))
           const ch = (cn && cn.value && cn.value.groups) || []
           setChannels(ch)
@@ -1586,9 +1591,14 @@ window.__ModuleLoader__.load({
           for (const k of allKeys) ops.push({ op: 'unset', path: ['providers', k] })
           for (const k of keys) ops.push({ op: 'set', path: ['providers', k], value: cleanProviders[k] })
           if (ops.length === 0) return Promise.resolve()
-          return apiRef.settings.mutate({ ns: 'llm-pi-ai', ops }).then((resp) => {
+          // F05：带 revision 保存——llm-pi-ai 是独立 settings 行，冲突由宿主以
+          // settings/conflict 拒绝；提示里给「刷新后重试」指引而不是静默覆盖
+          return apiRef.settings.mutate({ ns: 'llm-pi-ai', ops, expectedRevision: (state && state.nsRevisions && state.nsRevisions.piAi) || undefined }).then((resp) => {
             const r = resp && resp.result ? resp.result : resp
-            if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed')
+            if (r && r.ok === false) {
+              const conflict = r.error && (r.error.code === 'settings/conflict' || /conflict/i.test(String(r.error.message || '')))
+              throw new Error(conflict ? 'llm-pi-ai 配置已被其他页面修改（版本冲突），请点「刷新」后重试' : ((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed'))
+            }
             return r
           })
         })() : Promise.resolve()
@@ -1597,12 +1607,16 @@ window.__ModuleLoader__.load({
         const orderPatch = draft ? { providerOrder: Object.keys(cleanProviders) } : {}
         const p2 = apiRef.settings.update({
           ns: 'model-channels',
+          expectedRevision: (state && state.nsRevisions && state.nsRevisions.channels) || undefined,
           // 命名单一身份：写入时统一 virtualModel.name = 组 id——旧的独立呈现名
           // （如遗留的 group-1）在下一次保存时自动归一，无需迁移
           patch: Object.assign({ groups: (channelsDraft || []).map((g) => Object.assign({}, g, { virtualModel: Object.assign({}, g.virtualModel, { name: g.id }) })) }, orderPatch)
         }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
-          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'model-channels save failed')
+          if (r && r.ok === false) {
+            const conflict = r.error && (r.error.code === 'settings/conflict' || /conflict/i.test(String(r.error.message || '')))
+            throw new Error(conflict ? '轮询组配置已被其他页面修改（版本冲突），请点「刷新」后重试' : ((r.error && (r.error.message || r.error)) || 'model-channels save failed'))
+          }
           return r
         })
         Promise.all([p1, p2]).then(() => {
