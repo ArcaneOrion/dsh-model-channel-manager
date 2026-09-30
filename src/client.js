@@ -1660,14 +1660,34 @@ window.__ModuleLoader__.load({
           }
           return r
         })
-        Promise.all([p1, p2]).then(() => {
-          setNotice('已全部保存（即时生效）')
-          // 同步草稿与状态为刚保存的清洗版本（含默认请求头合并结果）
-          setDraft(clone(cleanProviders))
-          setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders, providerOrder: Object.keys(cleanProviders) }))
-          setTimeout(() => setNotice(null), 3000)
+        // F06（审计 C10，0.3.8）：两域用 allSettled 而非 all——半成功不再「整单失败」
+        // 掩盖已提交的那半。各自报告，失败域给出明确指引；部分成功时提示里列明
+        // 哪域成功哪域失败，用户知道实际落盘了什么（宿主无跨命名空间事务，
+        // 这是审计建议的务实路线：可观察的分域成败 + 冲突重试）。
+        const settleOf = (label, p) => p.then(() => ({ label, ok: true }), (e) => ({ label, ok: false, error: String((e && e.message) || e) }))
+        Promise.allSettled([settleOf('提供商配置', p1), settleOf('轮询组配置', p2)]).then((results) => {
+          const done = results.map((r) => r.value)
+          const failed = done.filter((d) => d && !d.ok)
+          const okCount = done.length - failed.length
+          if (failed.length === 0) {
+            setNotice('已全部保存（即时生效）')
+          }
+          else if (okCount > 0) {
+            // 部分成功：明确告知哪域已落盘、哪域失败（旧实现统一「保存失败」，
+            // 用户不知道 providers 其实已经提交了）
+            setNotice('部分保存：' + done.filter((d) => d && d.ok).map((d) => d.label).join('、') + ' 已生效；' + failed.map((d) => d.label).join('、') + ' 失败——' + failed[0].error)
+          }
+          else {
+            setNotice('保存失败: ' + failed[0].error)
+          }
+          // 两域都成功才同步本地镜像（半成功时以 refresh 拉回真实状态为准）
+          if (failed.length === 0) {
+            setDraft(clone(cleanProviders))
+            setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders, providerOrder: Object.keys(cleanProviders) }))
+          }
+          setTimeout(() => setNotice(null), failed.length > 0 ? 8000 : 3000)
           refresh()
-        }).catch((e) => setNotice('保存失败: ' + String((e && e.message) || e))).finally(() => setSaving(false))
+        }).finally(() => setSaving(false))
       }
 
       return el('div', { className: 'mcm-root' },
