@@ -1,0 +1,41 @@
+{
+  "version": "0.4.0",
+  "date": "2026-10-01",
+  "artifact": "dist/arcaneorion-dsh-model-channel-manager-0.4.0.tgz",
+  "sha256": "0bb1da83d5f24480d8cbab4803f05e83ad34c55220208a249c882afdb8b3d982",
+  "validation": {
+    "unitAndIntegration": {
+      "passed": 80,
+      "failed": 0,
+      "skipped": 0
+    },
+    "framework": {
+      "sourceCompiled": 2,
+      "installed": 2
+    },
+    "browser": {
+      "checks": [
+        "original-card-layout",
+        "exact-windows",
+        "runtime-only-refresh",
+        "light-dark",
+        "mobile",
+        "stale-data-error",
+        "model-task-no-config-write",
+        "provider-conflict"
+      ],
+      "pageErrors": []
+    },
+    "packedPackage": "passed"
+  },
+  "deployment": {
+    "profile": "web",
+    "reference": "link:/home/arcaneorion/AI/AI-DSH/plugin/model-channel-manager",
+    "frameworkBackup": "backups/framework-1790854153373"
+  },
+  "limits": [
+    "未运行上游仓库全量测试；验证了修改模块的隔离编译和真实框架组合回归。",
+    "已运行的DSH进程需要重启才能加载已安装依赖的框架补丁。",
+    "健康记录保留上限为每桶300条、7天；任务保留最近100条终态。"
+  ]
+}

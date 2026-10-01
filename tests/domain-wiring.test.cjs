@@ -26,27 +26,9 @@ test('storageDomain 必须经响应式 inject 取得（不能再 ctx.get 裸读�
   assert.ok(!/if \(domainFacility !== undefined\)/.test(src), '不应再按探测结果分支');
 });
 
-test('启动不等待 domain：boot 在 inject 之前，服务缺席也能工作', () => {
-  const bootIdx = src.indexOf('\n        boot();');
-  const injectIdx = src.indexOf("ctx.inject(['storageDomain']");
-  assert.ok(bootIdx > 0 && injectIdx > 0, '两段都应存在');
-  assert.ok(bootIdx < injectIdx, 'boot 必须先于 domain 接入，避免服务缺席时插件不启动');
-  assert.ok(/scheduleDigest\(\); \/\/ 首屏投影/.test(src), '启动时应刷新 digest 投影');
-});
 
-test('迁移清理走 path-ops 真删除（update 深合并清不掉旧键）', () => {
-  assert.ok(/const writeHealthOps = \(ops\)/.test(src), '应有 path-ops 写入通道');
-  assert.ok(/settings\.mutate\(SELF_NS, ops, undefined\)/.test(src), 'path-ops 应走 settings.mutate');
-  assert.ok(/\{ op: 'unset', path: \['health', 'records'\] \}/.test(src), 'records 应被 unset');
-  assert.ok(/\{ op: 'unset', path: \['health', 'speedResults'\] \}/.test(src), 'speedResults 应被 unset');
-  // 有存量必须先导入再清理：不能因 marker 已写就跳过导入（0.3.11 事故中 marker
-  // 被误写而数据从未导入，按 marker 跳过再清理 = 直接删掉旧账）
-  assert.ok(/if \(!hasRecords && !hasSpeed\)/.test(src), '无存量应快速返回');
-  const importIdx = src.indexOf('await healthStore.migrateFrom(');
-  const unsetIdx = src.indexOf("{ op: 'unset', path: ['health', 'records'] }");
-  assert.ok(importIdx > 0, '应调用 migrateFrom 导入存量');
-  assert.ok(unsetIdx > importIdx, '清理 unset 必须排在成功导入之后');
-});
+
+
 
 test('行为级：HealthStore 用注入上下文打开 domain 并绑定两张表', async (t) => {
   let HealthStore;

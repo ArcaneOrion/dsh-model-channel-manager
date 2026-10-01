@@ -115,7 +115,7 @@ function aggregate(records, now, windowMode) {
   t('T4c host recordHealth 展平 cacheReadTokens', host.includes('rec.cacheReadTokens = u.cacheReadTokens'))
   // client：指标卡 + 聚合
   t('T4d client 存在总 Token 用量卡', client.includes("'总 Token 用量'"))
-  t('T4e client 聚合 cacheRead+cacheWrite', client.includes('cacheReadTokens') && client.includes('cacheWriteTokens'))
+  t('T4e client 聚合 cacheRead+cacheWrite', fs.readFileSync(path.join(__dirname, '../src/channel-state.js'), 'utf8').includes('token(e.cacheReadTokens) + token(e.cacheWriteTokens)'))
   t('T4f client 模型卡 Tokens 行', client.includes("' · Tokens: '"))
 }
 

@@ -1,85 +1,20 @@
 import z from "@deepseek-ai/schemastery";
+import { randomUUID } from 'node:crypto';
 import { HealthStore } from './health-store.js';
+import { ChannelController, RuntimeStore, TaskRegistry, aggregateHealth, createRpcHandler } from './channel-state.js';
 export const name = 'model-channel-manager';
 export const inject = ['llm', 'timer'];
 // storageDomain 由 dsh-base 组合（json 后端，root=storages/）；不进 inject 硬依赖——
 // 缺栈的 profile 降级为「健康流水不持久化」而不是拒绝启动。
 const ROUTE_PREFIX = 'roundrobin/';
 const GROUP_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
-const NS_CONFIG = 'model-channels';
-const NS_HEALTH = 'model-channel-health';
-// dsh 0.2：settings 不再是可动态注册的命名空间总线，而是「插件行实例配置」的表单投影。
-// 因此原先的 model-channels / model-channel-health 两个命名空间合并为本插件的 Config
-// （字段 groups / providerOrder / effortMemory / health），命名空间 id 即本行 id。
-const HEALTH_SCHEMA = z.object({
-    // records/speedResults 仅作旧版存量迁移的读取源（迁入 domain 后不再写入）；
-    // 权威数据在 storageDomain 的 model_channel_health 单元。
-    records: z.dict(z.array(z.any())).default({}),
-    speedResults: z.dict(z.array(z.any())).default({}),
-    runtime: z.dict(z.any()).default({}),
-    speedRequest: z.any(),
-    // nonce 必须容忍 number 与 string 两种历史形态：0.3.2 的 client 写过 UUID 字符串，
-    // 而 schema 当时声明 z.number() → 字符串一旦落盘，**整个 health 子树校验失败**，
-    // 被 .loose(true) 兜底替换成默认值：records/digest 在运行时全部消失、迁移空转。
-    // （0.3.11 线上事故根因；回归见 tests/health-schema-tolerance.test.cjs）
-    lastHandledNonce: z.union([z.number(), z.string()]).default(0),
-    testRequest: z.any(),
-    testResults: z.dict(z.any()).default({}),
-    lastTestHandledNonce: z.union([z.number(), z.string()]).default(0),
-    legacyMigrated: z.any(),
-    healthMigrated: z.any(),
-    // 小投影：host 聚合好的健康摘要（client 渲染用），digestAt 为生成时刻
-    digest: z.array(z.any()).default([]),
-    digestAt: z.number().default(0),
-}).loose(true);
+// health is a read-only migration input; it is never exposed by Settings forms.
 export const Config = z.object({
     groups: z.array(z.any()).default([]).volatile(),
     providerOrder: z.array(z.string()).default([]).volatile(),
     effortMemory: z.dict(z.string()).default({}).volatile(),
-    health: HEALTH_SCHEMA.volatile(),
+    health: z.any(),
 }).loose(true);
-// ---------- 任务请求的 consume-once 判定（纯函数，便于回归测试） ----------
-// nonce 规范化为字符串键：number（现行 client 的随机 53-bit 整数）与 string（0.3.2–0.3.8 的 UUID）
-// 都能比较；非法形态返回 null。
-export const nonceKey = (v) => (typeof v === 'number' || typeof v === 'string') ? String(v) : null;
-// schema 默认值 0 表示「从未处理过」，不能当一个真实 nonce 用
-export const settledNonceKey = (v) => {
-    const k = nonceKey(v);
-    return (k === null || k === '0') ? null : k;
-};
-/**
- * 是否应当消费这个 nonce（唯一入口，测试与测速共用）。
- * 关键点：只用「严格等值 + 已消费集合」，不做任何数值大小推断——
- * 旧实现用 Math.max(…) 比较数值大小来判等，而 nonce 是随机 53-bit，
- * 「上一轮 > 本轮」时（≈50%）guard 失效，同一请求会在每次 volatile-update
- * 被重新消费（重复上游请求 + 结果条目互相污染）。
- * hasTerminal 为真（finishedAt / status ok|error）时也视为已消费：结果已落地，
- * 重放只会得到重复计费与覆盖。
- */
-export function shouldConsumeNonce({ consumed, key, claimed, settled, hasTerminal }) {
-    if (key === null || key === undefined) return false;
-    if (hasTerminal) return false;
-    if (key === claimed || key === settled) return false;
-    return !consumed.has(key);
-}
-/**
- * 启动清扫的分类（纯函数）：新进程里已存在的测试条目分为两类——
- *   aborted  : status=running 且没有 finishedAt = 上次进程遗留的在飞任务（重载打断），
- *              必须补写 ABORTED 终态，否则客户端只会等到 66s 假超时（审计 R3）；
- *   repaired : status=running 但有 finishedAt（终态字段已在）= status 被并发整树回写
- *              改坏的僵尸条目，按 ok 归一状态位（审计 #2 的线上物证形态）。
- */
-export function selectStaleTestEntries(testResults) {
-    const aborted = [];
-    const repaired = [];
-    for (const [key, e] of Object.entries(testResults || {})) {
-        if (!e || typeof e !== 'object') continue;
-        if (e.status !== 'running') continue;
-        if (!e.finishedAt) aborted.push(key);
-        else if (e.ok === true || e.code || e.error) repaired.push(key);
-    }
-    return { aborted, repaired };
-}
 export function apply(ctx, config) {
     // 本行在 profile 中的 entry id 就是 settings 命名空间；缺失时回落到包名。
     const SELF_NS = (ctx.fiber && ctx.fiber.entry && ctx.fiber.entry.options && ctx.fiber.entry.options.id) || 'model-channel-manager';
@@ -95,7 +30,7 @@ export function apply(ctx, config) {
         }
         return fallback;
     };
-    const healthOf = () => refOf('health', null) || {};
+    const legacyHealth = config.health || {};
     const cfgOf = () => ({
         groups: refOf('groups', []) || [],
         providerOrder: refOf('providerOrder', []) || [],
@@ -117,7 +52,27 @@ export function apply(ctx, config) {
     const groupOfRoute = (p) => (p != null && p.startsWith(ROUTE_PREFIX) ? p.slice(ROUTE_PREFIX.length) : null);
     const routeOfGroup = (id) => ROUTE_PREFIX + id;
     const runtime = new Map();
-    const state = { config: { groups: [] }, records: {}, speedResults: {}, testResults: {} };
+    const state = { config: cfgOf(), records: clone(legacyHealth.records || {}), speedResults: clone(legacyHealth.speedResults || {}) };
+    let healthStore = null;
+    let runtimeStore = null;
+    let storageReady = Promise.resolve();
+    let storageStatus = 'memory';
+    let storageError = null;
+    let closed = false;
+    let runtimeTimer = null;
+    let cleanupLegacy = () => {};
+    const pendingEvents = [];
+    const saveRuntime = async (rows = tasks.list()) => {
+        if (runtimeStore) await runtimeStore.save({ runtime: persistRuntime(), tasks: rows });
+    };
+    const tasks = new TaskRegistry({ persist: saveRuntime });
+    const scheduleRuntime = () => {
+        if (runtimeTimer || closed) return;
+        runtimeTimer = ctx.timeout(() => {
+            runtimeTimer = null;
+            saveRuntime().catch(error => { storageError = error.message; });
+        }, 5000);
+    };
     const groupRuntime = (id) => {
         let g = runtime.get(id);
         if (g === undefined) {
@@ -138,14 +93,14 @@ export function apply(ctx, config) {
         let timer = null;
         const promise = new Promise((_, reject) => { rejectFn = reject; });
         const fire = (err) => { if (settled) return; settled = true; rejectFn(err); };
-        ctx.effect(() => {
+        const release = ctx.effect(() => {
             timer = setTimeout(() => fire(makeError()), ms);
             return () => {
                 if (timer !== null) clearTimeout(timer);
                 fire({ code: 'ABORTED', message: 'plugin reloaded while this attempt was in flight' });
             };
         }, 'model-channel timeout guard');
-        return { promise, dispose: () => { if (timer !== null) clearTimeout(timer); settled = true; } };
+        return { promise, dispose: () => { settled = true; release(); } };
     };
     // ---------- 配置归一化（与动态原型逐行一致） ----------
     function normalizeConfig(raw) {
@@ -318,11 +273,12 @@ export function apply(ctx, config) {
     function pushEvent(cfg, kind, payload) {
         const rt = groupRuntime(cfg.id);
         rt.events.push(Object.assign({ ts: Date.now(), group: cfg.id, kind }, payload || {}));
+        scheduleRuntime();
         if (rt.events.length > 200)
             rt.events.splice(0, rt.events.length - 200);
     }
-    // ---------- 持久化：settings 总线 ----------
-    const persistRuntime = async () => {
+    // ---------- 路由运行态快照 ----------
+    const persistRuntime = () => {
         const out = {};
         for (const [id, rt] of runtime) {
             const now = Date.now();
@@ -331,6 +287,7 @@ export function apply(ctx, config) {
                 cooldowns: Array.from(rt.cooldowns.entries()).map(([key, until]) => ({ key, until, active: until > now })),
                 events: rt.events.slice(-40),
                 lastSpeedTestAt: rt.lastSpeedTestAt,
+                speedTestRunning: rt.speedTestRunning,
             };
         }
         return out;
@@ -356,7 +313,7 @@ export function apply(ctx, config) {
     const recordHealth = (gid, cand, entry) => {
         const now = Date.now();
         const key = gid || 'global';
-        const rec = { ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null };
+        const rec = { id: randomUUID(), ts: now, provider: cand.provider, model: cand.model, ok: entry.ok, ttftMs: entry.ttftMs, latencyMs: entry.latencyMs, code: entry.code || null };
         // 上游真实 token 用量（来自 usage StreamChunk，计费口径与 dsh-token-meter 一致）：
         // 展平写入记录条目；缺失/非法字段不写，旧记录按 0 处理（向后兼容）。
         const u = entry.usage;
@@ -375,16 +332,15 @@ export function apply(ctx, config) {
         const cutoff = now - 7 * 24 * 3600 * 1000;
         state.records[key] = list.filter((e) => e.ts >= cutoff).slice(-300);
         if (healthStore !== null) {
-            healthStore.appendEvent(key, rec).catch((e) => console.warn('[model-channel-manager] health event append failed:', e && e.message));
-        }
-        scheduleDigest();
+            healthStore.appendEvent(key, rec).catch((e) => { storageError = e.message; console.warn('[model-channel-manager] health event append failed:', e.message); });
+        } else if (storageStatus === 'loading') pendingEvents.push({ key, rec });
+        scheduleRuntime();
     };
     const persistSpeedResults = async (r) => {
         if (healthStore !== null) {
             await healthStoreSpeed(r).catch(() => { });
         }
-        if (bus === null) return;
-        await bus.writeHealth({ runtime: await persistRuntime() });
+        await saveRuntime();
     };
     const healthStoreSpeed = async (r) => {
         for (const [groupId, rows] of Object.entries(r || {})) {
@@ -750,9 +706,16 @@ export function apply(ctx, config) {
     // F15 修复：旧行为每 chunk 重置 guard（单次等待上限而非总时限，H12：timeoutMs=40
     // 流每 20ms 输出，84ms 后仍成功）+ 超时不中止上游。现在：总时限 deadline +
     // 超时 abort 上游（与 streamAttempt 同一模式）+ 统一 finally 关闭。
-    async function measureCandidate(cfg, cand, st) {
+    async function measureCandidate(cfg, cand, st, signal) {
         const llm = ctx.llm;
         const controller = new AbortController();
+        const cancelled = new Promise((_, reject) => {
+            const abort = () => { controller.abort(signal.reason); reject(signal.reason); };
+            if (signal?.aborted) abort();
+            else signal?.addEventListener('abort', abort, { once: true });
+            controller.detach = () => signal?.removeEventListener('abort', abort);
+        });
+        cancelled.catch(() => {});
         const deadline = Date.now() + (st.timeoutMs || 60000);
         const inner = llm.stream({ provider: cand.provider, model: cand.model, messages: [{ role: 'user', content: [{ type: 'text', text: st.prompt }] }], maxTokens: st.maxTokens, sessionId: 'mcm-speedtest-' + (st.nonce ?? Date.now()), signal: controller.signal });
         const start = Date.now();
@@ -781,7 +744,7 @@ export function apply(ctx, config) {
                 const guard = timed(Math.max(1, remaining), () => ({ code: 'TIMEOUT', message: 'speedtest timed out after ' + st.timeoutMs + 'ms (total)' }));
                 let next;
                 try {
-                    next = await Promise.race([inner.next(), guard.promise]);
+                    next = await Promise.race([inner.next(), guard.promise, cancelled]);
                 }
                 catch (raceErr) {
                     if (raceErr && raceErr.code === 'TIMEOUT')
@@ -808,10 +771,11 @@ export function apply(ctx, config) {
             throw { code: (err && err.code) || 'STREAM_ERROR', message: (err && err.message) || 'speedtest failed' };
         }
         finally {
+            controller.detach();
             await closeInner();
         }
     }
-    async function runSpeedTest(cfg) {
+    async function runSpeedTest(cfg, signal) {
         const rt = groupRuntime(cfg.id);
         if (rt.speedTestRunning)
             return { ok: false, reason: 'already-running' };
@@ -823,6 +787,7 @@ export function apply(ctx, config) {
             const results = [];
             const concurrency = Math.max(1, st.concurrency || 3);
             for (let i = 0; i < order.length; i += concurrency) {
+                signal?.throwIfAborted();
                 const wave = order.slice(i, i + concurrency);
                 if (wave.length === 0)
                     break;
@@ -830,9 +795,10 @@ export function apply(ctx, config) {
                     let lastErr = null;
                     for (let t = 0; t <= (st.retries || 0); t++) {
                         try {
-                            return await measureCandidate(cfg, cand, st);
+                            return await measureCandidate(cfg, cand, st, signal);
                         }
                         catch (err) {
+                            signal?.throwIfAborted();
                             lastErr = err;
                             if (t < (st.retries || 0))
                                 await ctx.timeout(1500);
@@ -924,8 +890,8 @@ export function apply(ctx, config) {
         },
     };
     let adapterHandle = null;
-    // ---------- 单模型真实请求测试（client 经 settings 总线下发，走 DSH 真实 llm.stream 链路） ----------
-    async function runModelTest(provider, model, prompt, maxTokens) {
+    // ---------- 单模型任务：通过 DSH llm.stream 执行 ----------
+    async function runModelTest(provider, model, prompt, maxTokens, signal) {
         const llm = ctx.llm;
         // F15（与 measureCandidate 同一模式）：总时限 45s（旧行为每 chunk 重置 guard，
         // 持续输出的请求永不超时而 client 已放弃）+ 超时 abort 上游 + 统一 finally 关闭。
@@ -933,6 +899,13 @@ export function apply(ctx, config) {
         // 「终态写入 + 下一次 describe」，跑满就会撞上假超时（审计 #7）。
         const MODEL_TEST_TOTAL_MS = 45000;
         const controller = new AbortController();
+        const cancelled = new Promise((_, reject) => {
+            const abort = () => { controller.abort(signal.reason); reject(signal.reason); };
+            if (signal?.aborted) abort();
+            else signal?.addEventListener('abort', abort, { once: true });
+            controller.detach = () => signal?.removeEventListener('abort', abort);
+        });
+        cancelled.catch(() => {});
         const deadline = Date.now() + MODEL_TEST_TOTAL_MS;
         const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512, sessionId: 'mcm-modeltest-' + Date.now(), signal: controller.signal });
         const start = Date.now();
@@ -964,7 +937,7 @@ export function apply(ctx, config) {
                 const guard = timed(Math.max(1, remaining), () => ({ code: 'TIMEOUT', message: 'model test timed out after ' + MODEL_TEST_TOTAL_MS + 'ms (total)' }));
                 let next;
                 try {
-                    next = await Promise.race([inner.next(), guard.promise]);
+                    next = await Promise.race([inner.next(), guard.promise, cancelled]);
                 }
                 catch (raceErr) {
                     if (raceErr && raceErr.code === 'TIMEOUT')
@@ -983,16 +956,15 @@ export function apply(ctx, config) {
                 if (chunk && chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object')
                     lastUsage = chunk.usage;
                 if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-                    text += chunk.text;
+                    text = (text + chunk.text).slice(0, 2000);
                 }
                 else if (chunk && chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
-                    reasoning += chunk.text;
+                    reasoning = (reasoning + chunk.text).slice(0, 2000);
                 }
                 if (isTerminalChunk(chunk)) {
                     const reason = chunk.reason || {};
                     if (isSuccessReason(reason)) {
-                        // 命中 finish 就 return，内层流不会被全局拦截器完整排干，成功这一笔要自己补记
-                        // （失败那笔由拦截器的 catch 分支记，所以此前只有失败会进健康流水）
+                        // Internal model tests bypass the global interceptor and record exactly once here.
                         recordHealth(provider, { provider, model }, { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, code: null, usage: lastUsage });
                         return { ok: true, ttftMs: ttft, latencyMs: Date.now() - start, text: text.slice(0, 2000), reasoning: reasoning.slice(0, 2000) };
                     }
@@ -1001,150 +973,14 @@ export function apply(ctx, config) {
             }
         }
         catch (err) {
+            if (!controller.signal.aborted && err?.code !== 'ABORTED')
+                recordHealth(provider, { provider, model }, { ok: false, ttftMs: ttft, latencyMs: Date.now() - start, code: err.code || 'STREAM_ERROR', usage: lastUsage });
             throw err;
         }
         finally {
+            controller.detach();
             await closeInner();
         }
-    }
-    // 启动清扫（审计 R3）：新进程里任何「status running 但没有 finishedAt」的测试条目
-    // 必然是上一次进程遗留的（进程内在飞任务都有 fiber 生命周期，重载会打断它们，
-    // 旧闭包的收尾写入往往以 "Configuration entry is no longer available" 失败）。
-    // 补写 ABORTED 终态，客户端就不必等到 66s 假超时。
-    // 同时修复「running + finishedAt」的僵尸条目（status 被并发整树回写改坏），
-    // 按 ok 归一状态位。
-    const sweepStaleTestResults = () => {
-        if (bus === null) return;
-        const all = healthOf().testResults || {};
-        const { aborted, repaired } = selectStaleTestEntries(all);
-        for (const key of aborted) {
-            bus.writeHealthLeaf(['testResults', key], Object.assign({}, all[key], {
-                status: 'error', code: 'ABORTED',
-                error: 'host 在测试执行期间重启/重载，结果未写入；请重试',
-                finishedAt: Date.now(),
-            })).catch((err) => console.warn('[model-channel-manager] stale test result sweep failed:', err && err.message));
-        }
-        for (const key of repaired) {
-            bus.writeHealthLeaf(['testResults', key], Object.assign({}, all[key], { status: all[key].ok === true ? 'ok' : 'error' }))
-                .catch((err) => console.warn('[model-channel-manager] zombie test result repair failed:', err && err.message));
-        }
-        if (aborted.length > 0 || repaired.length > 0)
-            console.log('[model-channel-manager] test results swept after restart: aborted =', aborted.length, ', repaired =', repaired.length);
-    };
-    // 兜底重试（审计 R2）：testRequest 存在、却既没被认领也没结算 —— 典型是 loader 的
-    // volatile 提交被静默拒绝（document 落盘、fiber 引用不更新、不发 volatile-update），
-    // 请求会被彻底忽略。这里每个 nonce 主动重试一次并留下日志，不再无声失败。
-    const sweepPendingTestRequest = () => {
-        if (bus === null) return;
-        const health = healthOf();
-        const req = health.testRequest;
-        const key = nonceKey(req && req.nonce);
-        if (key === null) return;
-        const entry = (health.testResults || {})[key];
-        const hasTerminal = !!(entry && (entry.finishedAt || entry.status === 'ok' || entry.status === 'error'));
-        // 复用与消费路径同一个（已被测试覆盖的）判定：返回 true = 这个请求还没被消费
-        const needsSweep = shouldConsumeNonce({
-            consumed: consumedTestNonces,
-            key,
-            claimed: nonceKey(claimedTestNonce),
-            settled: settledNonceKey(health.lastTestHandledNonce),
-            hasTerminal,
-        });
-        if (!needsSweep || pendingSweepAttempted.has(key)) return;
-        markConsumed(pendingSweepAttempted, key);
-        console.warn('[model-channel-manager] testRequest nonce', key,
-            '既未结算也未消费——疑似 volatile 提交被静默拒绝，主动重试一次（若仍无结果，请看宿主 stdout 的 loader 警告）');
-        reloadFromConfig(false);
-    };
-    function handleTestRequest(next) {
-        const req = next.testRequest;
-        // nonce 接受 number（现行 client 的随机 53-bit 整数）与 string（0.3.2–0.3.8 的 UUID）
-        // 两种历史形态；去重一律按字符串键严格比较，不再做数值大小推断。
-        const nonceOf = (v) => (typeof v === 'number' || typeof v === 'string') ? v : null;
-        const reqNonce = nonceOf(req && req.nonce);
-        const reqKey = nonceKey(reqNonce);
-        const claimedKey = nonceKey(claimedTestNonce);
-        const settled = settledNonceKey(next.lastTestHandledNonce);
-        const entry = reqKey !== null ? (next.testResults || {})[reqKey] : null;
-        // 终态判定用 finishedAt（写入后不会被覆盖），不只信 status：
-        // 整树快照回写曾把 status 改回 running 却保留 finishedAt/code/error（0.3.11 事故）。
-        const hasTerminal = !!(entry && (entry.finishedAt || entry.status === 'ok' || entry.status === 'error'));
-        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || reqKey === null) {
-            // 字段非法：显式记一次，别再静默吞掉（审计 R2）
-            if (req && reqKey !== null && !warnedTestNonces.has(reqKey)) {
-                markConsumed(warnedTestNonces, reqKey);
-                console.warn('[model-channel-manager] testRequest 字段非法，已忽略（需要 provider/model/nonce）:', JSON.stringify(req).slice(0, 200));
-            }
-            return;
-        }
-        if (Date.now() < testBackoffUntil) return; // 退避窗口内不消费（等重放）
-        if (!shouldConsumeNonce({ consumed: consumedTestNonces, key: reqKey, claimed: claimedKey, settled, hasTerminal })) {
-            // 未消费的显式解释：请求存在但既没被认领、也没终态 → 多半是 volatile 提交被
-            // loader 静默拒绝（document 已落盘、fiber 引用不更新、不发 volatile-update，
-            // 审计 R2），此时请求会被彻底忽略且没有任何可见报错。
-            if (!hasTerminal && reqKey !== claimedKey && !warnedTestNonces.has(reqKey)) {
-                markConsumed(warnedTestNonces, reqKey);
-                console.warn('[model-channel-manager] testRequest 未被消费: nonce', reqKey,
-                    '（已结算或已消费命中）——若本次测试始终没有结果，检查宿主 stdout 是否有 loader 的 "volatile config update failed"');
-            }
-            return;
-        }
-        markConsumed(consumedTestNonces, reqKey);
-        claimedTestNonce = reqNonce;
-        // nonce 的落盘推迟到本次测试得出结论之后：只有「真跑过」才算 handled。
-        // 启动早于凭据服务就绪时会以 MISSING_CREDENTIAL 失败，那要释放认领重试；
-        // 若提前写了 nonce，重试会被自己的持久值挡掉。
-        const settle = (entry) => {
-            if (bus !== null)
-                bus.writeHealth({ lastTestHandledNonce: reqNonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
-            return setResult(entry);
-        };
-        // 0.3.12：结果按「单键叶写」落盘（path-ops），不再把整个 testResults 读出来整段写回。
-        // 整段写回的 payload 是调用时刻的快照，落盘晚于并发的终态写时会把该 nonce 的
-        // status 改回 running（深合并保留 finishedAt/code/error）——线上事故的直接成因。
-        // 叶写只动这一个 nonce 的条目，物理上不可能覆盖别人的、也不可能自我回退。
-        const setResult = async (entry) => {
-            const key = String(reqNonce);
-            const value = Object.assign({}, entry, { nonce: reqNonce, provider: req.provider, model: req.model });
-            if (bus !== null)
-                await bus.writeHealthLeaf(['testResults', key], value).catch((e) => console.error('[model-channel-manager] testResults 写入失败:', e));
-        };
-        // 修剪低频执行：只在条目数超限时砍到 50。用 unset 叶删（update 的深合并删不掉键）
-        const maybePrune = () => {
-            const all = healthOf().testResults || {};
-            const entries = Object.entries(all);
-            if (entries.length <= 50) return;
-            const removed = entries
-                .sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0))
-                .slice(50)
-                .map(([k]) => k);
-            if (removed.length === 0 || bus === null) return;
-            bus.writeHealthOps(removed.map((k) => ({ op: 'unset', path: ['health', 'testResults', k] })))
-                .catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
-        };
-        const done = async (r) => {
-            try {
-                await settle(Object.assign({}, r, { finishedAt: Date.now() }));
-                maybePrune();
-            }
-            catch (_e) { }
-        };
-        void setResult({ status: 'running', startedAt: Date.now() });
-        runModelTest(req.provider, req.model, req.prompt, req.maxTokens).then(async (r) => {
-            replayAttempts.delete('test');
-            await done(Object.assign({ status: 'ok' }, r));
-        }).catch(async (e) => {
-            if (notReady(e)) {
-                // 凭据服务尚未就绪（典型是启动瞬间的重放）：不写成假 error，释放认领并延后重试
-                claimedTestNonce = null;
-                releaseConsumed(consumedTestNonces, reqKey); // 释放后才能靠重放再消费
-                releaseConsumed(warnedTestNonces, reqKey);
-                testBackoffUntil = Date.now() + 5000;       // 退避窗口：期间任何 volatile-update 都不再消费
-                scheduleReplay('test', () => reloadFromConfig(false));
-                return;
-            }
-            await done({ status: 'error', code: (e && e.code) || 'STREAM_ERROR', error: (e && e.message) || String(e) });
-        });
     }
     function rewireRoutes() {
         const llm = ctx.llm;
@@ -1174,348 +1010,116 @@ export function apply(ctx, config) {
         else if (JSON.stringify(current) !== JSON.stringify(next))
             adapterHandle.replace(next);
     }
-    // ---------- 健康数据 domain 存储 + 存量迁移 + 小投影 ----------
-    // healthStore：storageDomain 存在时启用（dsh-base 组合了 json 后端）。
-    // 启动序列：先开 domain → 迁移 settings 存量 → reloadFromConfig 从 domain 读权威数据。
-    let healthStore = null;
-    // digest：写进 settings health 子树的小投影（client 健康页渲染用）。
-    // 聚合上移 host，client 不再拉原始流水全量 describe——settings 里不再出现 records。
-    let digestTimer = null;
-    let lastDigestJson = null;   // 上次落盘的 digest 内容（相同则跳过，减少 revision 噪声）
-    let lastDigestWriteAt = 0;
-    const DIGEST_INTERVAL = 5000;
-    const buildDigest = () => {
-        // 与旧 client HealthPanel 聚合口径一致：total/success/ttft/latency/token（计费口径
-        // = input + cacheRead + cacheWrite + output），外加 lastTs/lastOk/lastCode
-        const by = new Map();
-        for (const list of Object.values(state.records)) {
-            for (const e of list) {
-                const key = e.provider + '::' + e.model;
-                let a = by.get(key);
-                if (a === undefined) {
-                    a = { provider: e.provider, model: e.model, total: 0, success: 0, ttftSum: 0, latSum: 0, tokIn: 0, tokOut: 0, tokCache: 0, lastTs: 0, lastOk: null, lastCode: null };
-                    by.set(key, a);
-                }
-                a.total++;
-                const inTok = e.inputTokens || 0;
-                const outTok = e.outputTokens || 0;
-                const cacheTok = (e.cacheReadTokens || 0) + (e.cacheWriteTokens || 0);
-                a.tokIn += inTok;
-                a.tokOut += outTok;
-                a.tokCache += cacheTok;
-                if (e.ok) {
-                    a.success++;
-                    if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs;
-                    if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs;
-                }
-                if ((e.ts || 0) > a.lastTs) {
-                    a.lastTs = e.ts || 0;
-                    a.lastOk = e.ok;
-                    a.lastCode = e.ok ? null : (e.code || null); // lastCode 随 lastTs 对齐（不再按遍历序覆盖）
-                }
-            }
-        }
-        return [...by.values()].map((a) => ({
-            provider: a.provider, model: a.model, total: a.total, success: a.success,
-            ttftAvg: a.success > 0 ? Math.round(a.ttftSum / a.success) : null,
-            latAvg: a.success > 0 ? Math.round(a.latSum / a.success) : null,
-            tokIn: a.tokIn, tokOut: a.tokOut, tokCache: a.tokCache,
-            lastTs: a.lastTs, lastOk: a.lastOk, lastCode: a.lastCode,
-        }));
-    };
-    const flushDigest = () => {
-        digestTimer = null;
-        if (bus !== null) {
-            const digest = buildDigest();
-            // 0.3.14：内容没变就不写。settings 行的 revision 是 raw config 的 JSON 指纹
-            // （dsh-settings describe：revision += raw !== previous.raw），每一次无意义的写
-            // 都会让 client 手里的 revision 过期，表现为保存时的 settings/conflict。
-            // 60s 心跳保证 digestAt 不会永远停住。
-            const json = JSON.stringify(digest);
-            if (json === lastDigestJson && Date.now() - lastDigestWriteAt < 60000) return;
-            lastDigestJson = json;
-            lastDigestWriteAt = Date.now();
-            bus.writeHealth({ digest, digestAt: Date.now() }).catch(() => { });
-        }
-    };
-    const scheduleDigest = () => {
-        if (digestTimer === null) {
-            digestTimer = ctx.timeout(flushDigest, DIGEST_INTERVAL);
-        }
-    };
-    ctx.effect(() => () => {
-        if (digestTimer !== null) {
-            digestTimer();
-            digestTimer = null;
-        }
-        flushDigest();
-    }, 'model-channel health digest');
-    // settings 存量 records/speedResults → domain 一次性迁移（桶已存在即跳过，domain 权威）。
-    // 清空旧键必须走 path-ops：update 是深合并，`records: {}` 清不掉已有键——
-    // 0.3.8 用合并写「清空」实际没删，旧流水一直留在 profile 里（每 5s describe 都要带着它）。
-    const migrateHealthToDomain = async () => {
-        if (healthStore === null || bus === null) return;
-        const health = healthOf();
-        const alreadyMigrated = health.healthMigrated === true;
-        const hasRecords = health.records !== undefined && Object.keys(health.records || {}).length > 0;
-        const hasSpeed = health.speedResults !== undefined && Object.keys(health.speedResults || {}).length > 0;
-        if (!hasRecords && !hasSpeed) {
-            // 无存量：只补哨兵（幂等）
-            if (!alreadyMigrated) {
-                await bus.writeHealthOps([{ op: 'set', path: ['health', 'healthMigrated'], value: true }])
-                    .catch((e) => console.warn('[model-channel-manager] health marker write failed:', e && e.message));
-            }
-            return;
-        }
-        // 有存量就必须导入（合并幂等）——不能只看 marker：schema 缺陷期间 marker 可能已被
-        // 误写而数据从未导入（0.3.11 线上事故），照 marker 跳过再清理 = 直接删掉旧账。
-        let ok = false;
-        try {
-            ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
-        }
-        catch (e) {
-            console.warn('[model-channel-manager] legacy health import failed (will retry next boot):', e && e.message);
-            return;
-        }
-        if (!ok) return; // store 已关闭（卸载竞态）：不清理，避免标记与数据永久不一致
-        // 导入成功才真删除旧键（path-ops；update 的深合并清不掉）+ 落哨兵
-        const ops = [];
-        if (hasRecords) ops.push({ op: 'unset', path: ['health', 'records'] });
-        if (hasSpeed) ops.push({ op: 'unset', path: ['health', 'speedResults'] });
-        if (!alreadyMigrated) ops.push({ op: 'set', path: ['health', 'healthMigrated'], value: true });
-        if (ops.length === 0) return;
-        await bus.writeHealthOps(ops).catch((e) => console.warn('[model-channel-manager] legacy health cleanup failed:', e && e.message));
-        console.log('[model-channel-manager] legacy health imported into domain and cleared from settings');
-    };
-
-    // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
-    let bus = null;
-    let runtimeRestored = false;
-    // 非持久去重：回写要等当前 HMR 事务结束才落盘，这中间 volatile-update 可能带着同一个 nonce 再来，
-    // 内存里先认领，避免同一请求被重复执行（并顺带消掉重复的回写风暴）。
-    //
-    // 0.3.12：改为严格 consume-once（字符串键集合），不再依赖 nonce 的数值单调性。
-    // 旧实现 last = Math.max(上一轮结算值, 本次认领值)，而两个 nonce 都是随机 53-bit：
-    // 「上一轮 > 本轮」时判等直接失效（≈50%），于是测试在每次 loader/volatile-update
-    // （包括宿主自己每 5s 的 digest 回写）都被重新消费——重复上游请求（真实计费）
-    // 且结果条目互相污染。线上物证：同 nonce 一条记录同时带
-    // `code TIMEOUT / 60000ms` 与 `ok:true / text`（单次执行不可能）。
-    // 回归见 tests/task-dedup.test.cjs。
-    let claimedTestNonce = null; // string UUID 或旧数字；null = 未认领
-    let claimedSpeedNonce = null; // string UUID 或旧数字；null = 未认领
-    let lastHealthKeyCount = -1;  // health 子树键数（用于探测「被兜底清空」，审计 R2/#4）
-    const consumedTestNonces = new Set();  // 已消费过的 nonce 字符串键（含本次）
-    const consumedSpeedNonces = new Set();
-    const warnedTestNonces = new Set();    // 每个 nonce 只提醒一次（防日志刷屏）
-    const pendingSweepAttempted = new Set(); // 兜底重试每个 nonce 只做一次
-    const CONSUMED_NONCE_CAP = 256; // 上限：只用于防重复消费，不需要无限历史
-    // notReady（凭据服务未就绪）释放认领后的退避窗口：期间不再消费，等 scheduleReplay 到点。
-    // 否则释放后任何一次 volatile-update 都会立刻再消费，并发起多个 60s 上游请求（审计 #6）。
-    let testBackoffUntil = 0;
-    let speedBackoffUntil = 0;
-    const markConsumed = (set, key) => {
-        set.add(key);
-        if (set.size > CONSUMED_NONCE_CAP) {
-            const oldest = set.values().next().value;
-            set.delete(oldest);
-        }
-    };
-    const releaseConsumed = (set, key) => { if (key !== null) set.delete(key); };
-    // 启动早于凭据服务就绪：此时重放测试/测速会以 MISSING_CREDENTIAL 失败。
-    // 这类错误是「环境还没准备好」而不是「渠道故障」，必须释放认领、延后重试，不能写成假 error。
-    const notReady = (e) => {
-        const code = (e && e.code) || '';
-        const msg = String((e && (e.message || e.error)) || '');
-        return code === 'MISSING_CREDENTIAL' || code === 'INVALID_CREDENTIAL' || /no credential|credential .*not set|is not set — store/i.test(msg);
-    };
-    const replayAttempts = new Map();
-    const scheduleReplay = (key, fn, ms = 5000) => {
-        const n = (replayAttempts.get(key) || 0) + 1;
-        if (n > 24)
-            return;
-        replayAttempts.set(key, n);
-        ctx.timeout(() => { fn(); }, ms);
-    };
-    // 从实例配置读取全部状态；volatile 提交后由 loader/volatile-update 触发重载。
-    // 0.3.1 起 records/speedResults 的权威在 storageDomain（healthStore）；
-    // settings health 子树只承载小投影（digest 给 client 渲染）+ 运行态 + 任务哨，
-    // volatile 快照覆盖不再能抹掉任何流水（F11/F23 的根因消除）。
-    function reloadFromConfig(initial) {
-        const cfg = cfgOf();
-        state.config = clone(cfg) || { groups: [] };
-        const health = healthOf();
-        // 意外清空告警（审计 R2/#4）：health 子树本来有内容，运行时却变成空对象 =
-        // schema 校验失败被 .loose(true) 兜底（0.3.11 事故形态），必须大声报出来。
-        const healthKeys = Object.keys(health || {}).length;
-        if (healthKeys === 0 && lastHealthKeyCount > 0) {
-            console.warn('[model-channel-manager] health 子树在运行时变空（上一轮有 ' + lastHealthKeyCount + ' 个键）——极可能是 schema 校验失败被 .loose(true) 静默兜底，请检查最近一次写入的字段类型');
-        }
-        lastHealthKeyCount = healthKeys;
-        state.records = healthStore !== null
-            ? clone(healthStore.allEventBuckets())
-            : clone(health.records || {});
-        state.speedResults = healthStore !== null
-            ? clone(healthStore.allSpeedBuckets())
-            : clone(health.speedResults || {});
-        state.testResults = clone(health.testResults || {});
-        if (initial && !runtimeRestored) {
-            restoreRuntime(health.runtime || {});
-            runtimeRestored = true;
-        }
+    // Configuration changes only rebuild routes; they never reload runtime snapshots.
+    const reloadFromConfig = () => {
+        state.config = clone(cfgOf());
         const live = pullConfig().groups;
-        for (const g of live)
-            groupRuntime(g.id);
-        // 清理已删除组的运行时残留，避免 runtime 持久化无限累积
-        for (const id of Array.from(runtime.keys()))
-            if (!live.some((g) => g.id === id))
-                runtime.delete(id);
+        for (const group of live) groupRuntime(group.id);
+        for (const id of runtime.keys()) if (!live.some(group => group.id === id)) runtime.delete(id);
         rewireRoutes();
-        const req = health.speedRequest;
-        // 与 handleTestRequest 同一策略：nonce 兼容字符串/数字，去重按字符串键严格等值
-        const speedKey = nonceKey(req && req.nonce);
-        const speedClaimed = nonceKey(claimedSpeedNonce);
-        const speedSettled = settledNonceKey(health.lastHandledNonce);
-        if (req && typeof req.group === 'string' && Date.now() < speedBackoffUntil) return;
-        if (req && typeof req.group === 'string'
-            && shouldConsumeNonce({ consumed: consumedSpeedNonces, key: speedKey, claimed: speedClaimed, settled: speedSettled, hasTerminal: false })) {
-            markConsumed(consumedSpeedNonces, speedKey);
-            claimedSpeedNonce = req.nonce;
-            const cfgRow = pullConfig().groups.find((g) => g.id === req.group);
-            // nonce 落盘推迟到本次测速得出结论之后（同 handleTestRequest 的理由）：
-            // 提前写会把「没就绪」的重试用自己的持久值挡掉。
-            const settleSpeed = () => {
-                if (bus !== null)
-                    bus.writeHealth({ lastHandledNonce: req.nonce }).catch(() => { });
-            };
-            if (cfgRow)
-                runSpeedTest(cfgRow).then((r) => {
-                    if (r && r.deferred) {
-                        claimedSpeedNonce = null;
-                        releaseConsumed(consumedSpeedNonces, speedKey);
-                        speedBackoffUntil = Date.now() + 5000; // 退避：别让 volatile-update 立刻再消费
-                        scheduleReplay('speed', () => reloadFromConfig(false));
-                        return;
-                    }
-                    replayAttempts.delete('speed');
-                    settleSpeed();
-                }).catch((e) => {
-                    if (notReady(e)) {
-                        claimedSpeedNonce = null;
-                        releaseConsumed(consumedSpeedNonces, speedKey);
-                        speedBackoffUntil = Date.now() + 5000; // 退避：同上
-                        scheduleReplay('speed', () => reloadFromConfig(false));
-                        return;
-                    }
-                    settleSpeed();
-                    console.error('[model-channel-manager] speedtest error:', e);
-                });
-            else
-                settleSpeed();
-        }
-        handleTestRequest(health);
+    };
+    const notReady = error => /credential/i.test(String(error?.code || '') + ' ' + String(error?.message || ''));
+    restoreRuntime(legacyHealth.runtime || {});
+    tasks.restore(Object.entries(legacyHealth.testResults || {}).map(([id, row]) => ({ ...row, id, kind: 'test', fingerprint: 'legacy' })));
+    ctx.on('loader/volatile-update', reloadFromConfig);
+    reloadFromConfig();
+
+    // No settings service is needed for runtime reads or model tasks.
+    {
+        const handler = createRpcHandler({
+            tasks,
+            ready: () => storageReady,
+            snapshot: () => ({
+                windows: aggregateHealth(state.records), digestAt: Date.now(),
+                speedResults: clone(state.speedResults), runtime: persistRuntime(),
+                storage: { mode: storageStatus, error: storageError },
+                retention: { days: 7, perBucketLimit: 300 },
+            }),
+            test: (request, signal) => runModelTest(request.provider, request.model, request.prompt, request.maxTokens, signal),
+            speed: async (request, signal) => {
+                const group = pullConfig().groups.find(group => group.id === request.group);
+                if (!group) throw Object.assign(new Error('轮询组不存在，请先保存配置'), { code: 'GROUP_NOT_FOUND' });
+                const result = await runSpeedTest(group, signal);
+                if (!result.ok) throw Object.assign(new Error(result.deferred ? '凭据尚未就绪，请配置后重试' : '该组正在测速'), { code: result.deferred ? 'MISSING_CREDENTIAL' : 'BUSY' });
+                return result;
+            },
+        });
+        ctx.plugin(ChannelController, { handler });
     }
-    ctx.inject(['settings'], (sctx) => {
-        const settings = sctx.settings;
-        // 0.2 只暴露「按行 id 定位的实例配置」；健康字段是同一 Config 里的 health 子树，
-        // 写入为整字段合并写（旧的 path-ops mutate 在 0.2 不存在）。
-        // 0.2 的配置写入走 configEditor.edit() → hmr.runExclusive()，而 runExclusive 一旦发现已在
-        // 事务内就直接拒绝（"HMR transactions cannot be nested"）。loader/volatile-update 回调本身
-        // 就运行在该事务里，所以回写必须先切出事务上下文：事务内创建的异步资源（AsyncResource、
-        // setTimeout）都会继承事务上下文，只有 AsyncLocalStorage.exit() 能干净地切出去，
-        // 写入再由 runExclusive 排进队列、在本次事务结束后执行。
-        const outsideTransaction = (fn) => {
-            const hmr = ctx.get('hmr');
-            const als = hmr && hmr.executing;
-            if (als && typeof als.exit === 'function' && als.getStore()) return als.exit(fn);
-            return fn();
-        };
-        // 0.2 是「整字段落盘」，并发调用会各自基于同一份旧快照做 read-modify-write，
-        // 后写的直接覆盖先写的（实测 lastTestHandledNonce 与 records 就这样丢过）。
-        // 所以写入串行化：排队后逐个重新读当前值再合并，不让两次写入互相覆写。
-        let healthWrites = Promise.resolve();
-        const enqueueHealthWrite = (run) => {
-            const queued = healthWrites.then(run, run);
-            healthWrites = queued.catch(() => { });
-            return queued;
-        };
-        // 0.2 的 health 子树写入曾用「整树读-改-写」（cur = healthOf(); update({health:{...cur, patch}})）。
-        // 只要内存视图落后于已提交的行（volatile 提交与事件之间有窗口），旧快照就会把新值写回去：
-        // 线上物证是终态写入后 status 又被改回 running（同一 nonce 同时有 finishedAt/error 与 running）。
-        // 0.3.12 起一律「叶写」：patch 里出现的每个顶层键单独 set，不再回灌未见过的值。
-        // 需要只动某个子键时用 writeHealthLeaf（如 testResults.<nonce>）。
-        const writeHealth = (patch) => enqueueHealthWrite(async () => {
-            const ops = Object.keys(patch || {}).map((k) => ({ op: 'set', path: ['health', k], value: patch[k] }));
-            if (ops.length === 0) return;
-            return outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined));
+
+    ctx.inject(['storageDomain'], dctx => {
+        const store = new HealthStore(dctx);
+        const profile = ctx.get('profileContext');
+        const persistent = new RuntimeStore(dctx, (profile?.dir || 'default') + ':' + SELF_NS);
+        storageStatus = 'loading';
+        storageReady = (async () => {
+            await store.open();
+            const saved = await persistent.open();
+            // Import before deleting Config, including requests retained as an archive only.
+            await persistent.archive(clone(legacyHealth));
+            await store.migrateFrom(legacyHealth.records || {}, legacyHealth.speedResults || {});
+            await store.migrateFrom(state.records, state.speedResults);
+            while (pendingEvents.length) {
+                const batch = {};
+                for (const { key, rec } of pendingEvents.splice(0)) (batch[key] ||= []).push(rec);
+                await store.migrateFrom(batch, {});
+            }
+            if (closed) { await store.close(); await persistent.close(); return; }
+            healthStore = store;
+            runtimeStore = persistent;
+            state.records = clone(store.allEventBuckets());
+            state.speedResults = clone(store.allSpeedBuckets());
+            if (saved) { restoreRuntime(saved.runtime); tasks.restore(saved.tasks); }
+            await saveRuntime();
+            storageStatus = 'persistent';
+            queueMicrotask(() => cleanupLegacy());
+        })().catch(async error => {
+            storageStatus = 'memory';
+            storageError = '健康数据暂存内存，旧配置保留：' + error.message;
+            console.warn('[model-channel-manager]', storageError);
         });
-        // path-ops 写入：update 是深合并，空对象清不掉旧键；需要真删除时走 mutate。
-        const writeHealthOps = (ops) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined)));
-        // 单叶写入：把 value 精确写到 health.<path...>，不读、不带任何快照
-        const writeHealthLeaf = (path, value) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, [{ op: 'set', path: ['health', ...path], value }], undefined)));
-        // 行级配置写入（groups 等）：也必须切出 HMR 事务——migrateLegacyConfig 可能在
-        // loader 回调链里被调用，事务内直写会抛 "HMR transactions cannot be nested"
-        // 并被空 catch 吞掉，只剩哨兵、旧配置永久不迁（审计 #13）。
-        const writeConfig = (patch) => enqueueHealthWrite(async () => outsideTransaction(() => settings.update(SELF_NS, patch, undefined)));
-        bus = {
-            settings,
-            writeHealth,
-            writeHealthOps,
-            writeHealthLeaf,
-            writeConfig,
-            cfgScope: { get: () => cfgOf() },
-            healthScope: { get: () => healthOf() },
-        };
-        // 卸载竞态防护：异步链回到插件时先确认 fiber 仍存活（uid 被清除即已卸载）。
-        const fiberUid = ctx.fiber && ctx.fiber.uid;
-        const fiberAlive = () => ctx.fiber !== undefined && ctx.fiber.uid !== undefined && ctx.fiber.uid === fiberUid;
-        // 启动不等待 domain：先用现有 settings 数据把路由与健康页带起来（旧 records 尚在
-        // settings 时也能立即显示）；domain 就绪后再以它为权威重载。
-        // 清扫必须在首次消费 testRequest 之前：新进程里已存在的 running 条目都是上次遗留的。
-        sweepStaleTestResults();
-        reloadFromConfig(true);
-        ctx.on('loader/volatile-update', () => {
-            reloadFromConfig(false);
-            console.log('[model-channel-manager] config hot-reloaded, routes:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
-        });
-        boot();
-        scheduleDigest(); // 首屏投影：让健康页不用等下一次真实请求
-        // 未消费请求的兜底轮询（审计 R2）：每 5s 看一眼 testRequest 是否被静默丢弃
-        ctx.effect(() => {
-            const timer = setInterval(() => { try { sweepPendingTestRequest(); } catch (_e) { } }, 5000);
-            return () => clearInterval(timer);
-        }, 'model-channel pending-request sweep');
-        // storageDomain 是可选服务，必须经响应式 inject 取得「已声明依赖」的上下文：
-        // 直接 ctx.get('storageDomain') 只能拿到未注入的裸服务，随后任何属性访问都会被
-        // Cordis 代理拒绝（实测 "cannot get property storageDomain without inject"，
-        // domain 永远打不开、健康流水静默降级为内存）。inject 回调在服务可用时触发；
-        // profile 没有 storage 栈时它不触发，插件保持内存模式，路由与面板不受影响。
-        ctx.inject(['storageDomain'], (dctx) => {
-            const store = new HealthStore(dctx);
-            Promise.resolve()
-                .then(() => store.open())
-                .then(() => {
-                    if (!fiberAlive()) {
-                        void store.close().catch(() => { }); // 已卸载：由 facility closeAll 兜底回收
-                        return;
-                    }
-                    healthStore = store;
-                    ctx.effect(() => () => { void store.close(); }, 'model-channel health domain close');
-                    console.log('[model-channel-manager] health domain ready: model_channel_health');
-                })
-                .catch((e) => {
-                    console.warn('[model-channel-manager] storageDomain open failed, health records stay in-memory only:', e && e.message);
-                })
-                .then(() => (healthStore !== null ? migrateHealthToDomain().catch(() => { }) : null))
-                .then(() => {
-                    if (!fiberAlive()) return;
-                    reloadFromConfig(true); // domain 权威数据覆盖内存镜像
-                    scheduleDigest();       // 立刻把投影刷新到 settings（健康页首屏可读）
-                })
-                .catch(() => { }); // 卸载竞态下 reload 内部可能 throw，链尾兜底防 unhandled rejection
-        });
+        dctx.effect(() => async () => {
+            await storageReady;
+            await tasks.close();
+            await saveRuntime().catch(error => { storageError = error.message; });
+            if (healthStore === store) healthStore = null;
+            if (runtimeStore === persistent) runtimeStore = null;
+            await store.close();
+            await persistent.close();
+            if (!closed) { tasks.closed = false; storageStatus = 'memory'; }
+        }, 'model-channel persistent stores');
     });
+    // This one-time edit uses ConfigEditor because health is intentionally not live-editable.
+    ctx.inject(['configEditor'], ectx => {
+        const hmr = ctx.get('hmr');
+        const cleanup = async () => {
+            await storageReady;
+            if (closed || storageStatus !== 'persistent' || !Object.keys(legacyHealth).length) return;
+            const entry = ectx.configEditor.entries().find(row => row.options.id === SELF_NS);
+            if (!entry || !Object.hasOwn(entry.options.config || {}, 'health')) return;
+            await ectx.configEditor.edit(entry, raw => {
+                if (JSON.stringify(raw.health) !== JSON.stringify(legacyHealth)) throw new Error('旧健康数据在迁移期间发生变化，已保留配置，请重新加载完成迁移');
+                const next = { ...raw };
+                delete next.health;
+                return next;
+            });
+        };
+        const launch = () => { void cleanup().catch(error => { storageError = error.message; console.warn('[model-channel-manager] migration cleanup:', error.message); }); };
+        cleanupLegacy = () => {
+            if (hmr?.executing?.getStore()) hmr.executing.exit(launch);
+            else launch();
+        };
+        cleanupLegacy();
+    });
+    ctx.effect(() => async () => {
+        closed = true;
+        if (runtimeTimer) runtimeTimer();
+        await tasks.close();
+    }, 'model-channel task shutdown');
+
     // ---------- 全局 LLM 请求健康拦截 (涵盖所有非虚拟路由的真实渠道模型调用) ----------
     ctx.on('llm/stream', async function* (options, next) {
+        if (/^mcm-(modeltest|speedtest)-/.test(options?.sessionId || '')) { yield* next(); return; }
         // 如果 options.provider 是虚拟轮询路由（以 roundrobin/ 开头），则跳过被动采集（避免双计）
         if (options && typeof options.provider === 'string' && options.provider.startsWith(ROUTE_PREFIX)) {
             for await (const chunk of next()) {
@@ -1582,61 +1186,5 @@ export function apply(ctx, config) {
         }
     }, { global: true, prepend: true });
 
-    // ---------- 启动 ----------
-    async function boot() {
-        // 动态原型迁移异步进行，不阻塞路由注册（迁移落盘后 cfg watcher 会热重建路由）
-        void migrateLegacyConfig();
-        rewireRoutes();
-        for (const g of pullConfig().groups) {
-            if (g.speedTest.enabled && g.speedTest.onFirstUse) {
-                const rt = groupRuntime(g.id);
-                if ((state.speedResults[g.id] || []).length === 0)
-                    runSpeedTest(g).catch(() => { });
-            }
-        }
-        console.log('[model-channel-manager] booted, groups:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
-    }
-    // 工作区 .channel-manager/config.json -> 本行实例配置（一次性）。
-    // 完成后写 legacyMigrated 哨兵，防止「用户清空全部组 → 重启 → 旧配置复活」；
-    // fs/sandboxPolicy 未就绪时短暂重试，而不是静默放弃直到下次重启。
-    async function migrateLegacyConfig() {
-        if (bus === null || pullConfig().groups.length !== 0)
-            return;
-        if (healthOf().legacyMigrated === true)
-            return;
-        for (let attempt = 0; attempt < 6; attempt++) {
-            const fsSvc = ctx.get('fs');
-            const sp = ctx.get('sandboxPolicy');
-            const root = sp ? sp.workspaceRoot : null;
-            if (fsSvc !== undefined && root) {
-                try {
-                    const target = await fsSvc.resolve(root + '/.channel-manager/config.json');
-                    const text = await fsSvc.readText(target);
-                    const legacy = JSON.parse(text);
-                    const migrated = normalizeConfig(legacy);
-                    // F10（审计 H15）：读取是 await 的——这个窗口里用户可能已经保存了
-                    // 新组。写前重检：现在有组了就不迁（用户的新配置优先于旧文件复活）。
-                    if (pullConfig().groups.length !== 0) {
-                        console.log('[model-channel-manager] legacy migration skipped: user config arrived during read');
-                        bus.writeHealth({ legacyMigrated: true }).catch(() => { });
-                        return;
-                    }
-                    if (migrated.groups.length > 0) {
-                        await bus.writeConfig({ groups: migrated.groups });
-                        state.config = { groups: migrated.groups };
-                        console.log('[model-channel-manager] migrated legacy config from workspace .channel-manager/config.json');
-                    }
-                }
-                catch (_e) { /* 无遗留配置，忽略 */ }
-                bus.writeHealth({ legacyMigrated: true }).catch(() => { });
-                return;
-            }
-            try {
-                await ctx.timeout(5000);
-            }
-            catch (_e) {
-                return; // 插件已卸载，停止重试
-            }
-        }
-    }
+    console.log('[model-channel-manager] ready, groups:', pullConfig().groups.map(group => group.id).join(', ') || '(none)');
 }

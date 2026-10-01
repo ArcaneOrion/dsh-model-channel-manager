@@ -53,7 +53,7 @@ test('F15 契约：测速/测试是总时限（不再每 chunk 重置）', () =>
   assert.ok(measure, 'measureCandidate 应存在');
   assert.ok(/const deadline = Date\.now\(\) \+/.test(measure[0]), '测速应有总 deadline');
   assert.ok(!/guard = timed\(Math\.max\(1, st\.timeoutMs\),[\s\S]{0,80}\n(\s*)const next/.test(measure[0].replace('remaining', 'X')) || /remaining = deadline - Date\.now\(\)/.test(measure[0]), 'guard 应基于 remaining');
-  const modelTest = src.match(/async function runModelTest[\s\S]*?function handleTestRequest/);
+  const modelTest = src.match(/async function runModelTest[\s\S]*?function rewireRoutes/);
   assert.ok(modelTest, 'runModelTest 应存在');
   assert.ok(/MODEL_TEST_TOTAL_MS/.test(modelTest[0]), '测试应有总时限常量');
   assert.ok(/total\)/.test(modelTest[0]), '超时消息应标注 total');

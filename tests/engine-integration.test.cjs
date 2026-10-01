@@ -38,6 +38,7 @@ function makeCtx({ llmStream }) {
   const ctx = {
     fiber: { uid: 1, entry: { options: { id: 'model-channel-manager' } } },
     get: () => undefined,
+    plugin: () => {}, // Gateway controller is exercised by runtime-api.test.cjs.
     on: () => {},
     effect: (cb) => { const d = cb(); if (typeof d === 'function') effects.push(d); return d; },
     timeout: (...args) => {

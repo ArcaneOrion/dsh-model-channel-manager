@@ -1,0 +1,204 @@
+diff --git a/packages/boot/config-editor/README.i18n.yaml b/packages/boot/config-editor/README.i18n.yaml
+index 5e26f64cec..2edc478992 100644
+--- a/packages/boot/config-editor/README.i18n.yaml
++++ b/packages/boot/config-editor/README.i18n.yaml
+@@ -18,8 +18,8 @@
+   en: 1eedaa5d72b48177
+   zh: 39abc1d927a692d2
+ /deepseek-ai-dsh-config-editor/understand-the-implementation:
+-  en: b6ecd942daccc797
+-  zh: 2f4637d725034f96
++  en: d6b32203a1ab0b75
++  zh: 79b1f3feba136be0
+ /deepseek-ai-dsh-config-editor/further-exploration:
+   en: 0c9e1d1401a865cc
+   zh: 6130d52636e84676
+diff --git a/packages/boot/config-editor/README.md b/packages/boot/config-editor/README.md
+index a7ae05067a..d38b997a68 100644
+--- a/packages/boot/config-editor/README.md
++++ b/packages/boot/config-editor/README.md
+@@ -38,7 +38,7 @@ Use [settings](../../settings/settings/README.md) for forms restricted to live f
+ <details>
+ <summary>Implementation internals — click to expand</summary>
+ 
+-The [editor](src/index.ts) reconciles external changes before deriving a candidate, locks the profile manifest alongside other profile operations, and atomically replaces its config override. It preserves YAML comments and `!!js` expressions outside replaced values. A failed reconciliation restores the prior document and reloads the prior patches.
++The [editor](src/index.ts) reconciles external changes before deriving a candidate, locks the profile manifest alongside other profile operations, and atomically replaces its config override. It preserves YAML comments and `!!js` expressions outside replaced values. A failed reconciliation, including a Loader rejection contained by group dispatch, restores the prior document and reloads the prior patches. The editor verifies that the target entry accepted the submitted raw config before reporting success.
+ 
+ Configuration reads share one composition for entries without profile config overrides. Overridden entries are composed separately with only their own override removed; profile inserts and other entries' overrides remain effective. Returned configs are detached, and compositions are not cached between reads.
+ 
+diff --git a/packages/boot/config-editor/README.zh.md b/packages/boot/config-editor/README.zh.md
+index a5bfe0faed..f2a31f0603 100644
+--- a/packages/boot/config-editor/README.zh.md
++++ b/packages/boot/config-editor/README.zh.md
+@@ -38,7 +38,7 @@ kind: "package-reference"
+ <details>
+ <summary>实现内部细节——点击展开</summary>
+ 
+-[编辑器](src/index.ts) 在派生候选配置前应用外部更改，与其他 profile 操作共同锁定 profile manifest，并原子替换配置覆盖项。它保留替换值以外的 YAML 注释和 `!!js` 表达式。应用失败时恢复之前的文档并重新加载之前的 patch。
++[编辑器](src/index.ts) 在派生候选配置前应用外部更改，与其他 profile 操作共同锁定 profile manifest，并原子替换配置覆盖项。它保留替换值以外的 YAML 注释和 `!!js` 表达式。应用失败时恢复之前的文档并重新加载之前的 patch，包括被 Group 分发包含而未传播的 Loader 拒绝。编辑器在报告成功前检查目标条目是否确实接受了提交的原始配置。
+ 
+ 读取配置时，没有 profile config 覆盖项的条目共用一次组合结果。有覆盖项的条目分别组合，仅移除自身的覆盖项；profile 插入的条目和其他条目的覆盖项仍然生效。返回的配置为独立副本，组合结果不跨读取缓存。
+ 
+diff --git a/packages/boot/config-editor/src/index.ts b/packages/boot/config-editor/src/index.ts
+index ffec879f40..0269e81c91 100644
+--- a/packages/boot/config-editor/src/index.ts
++++ b/packages/boot/config-editor/src/index.ts
+@@ -142,6 +142,9 @@ export class ConfigEditor extends Service {
+         await writeFileAtomic(path, String(document), { mode: 0o600 })
+         try {
+           await reconcileProfilePatches(this.ownerContext.root, patches, 'dsh', [entry.options.id])
++          if (!isDeepStrictEqual(entry.options.config ?? {}, next)) {
++            throw new Error(`Configuration for "${entry.options.id}" was rejected by Loader`)
++          }
+         } catch (error) {
+           await writeFileAtomic(path, before, { mode: 0o600 })
+           await reconcileProfilePatches(this.ownerContext.root, beforePatches, 'dsh')
+diff --git a/packages/settings/settings/tests/editor-failures.spec.ts b/packages/settings/settings/tests/editor-failures.spec.ts
+index 7767189182..3805e30b9d 100644
+--- a/packages/settings/settings/tests/editor-failures.spec.ts
++++ b/packages/settings/settings/tests/editor-failures.spec.ts
+@@ -32,3 +32,20 @@ it('creates a patch removed between validation and reading the document', async
+   await ctx.configEditor.edit(entry, raw => ({ ...raw, count: 6 }))
+   expect(readFileSync(profile.patchPath, 'utf8')).toContain('count: 6')
+ })
++
++
++it('rolls back a volatile edit rejected on its second config evaluation', async () => {
++  const { ctx, profile } = await configurationFixture({ hmr: false })
++  const entry = ctx.configEditor.entries().find(row => row.options.id === 'first')!
++  const before = readFileSync(profile.patchPath, 'utf8')
++  const previous = entry.options.config
++  let evaluations = 0
++  entry.fiber!.ctx.on('internal/config', (raw, next) => {
++    if ((raw as { count?: number }).count === 77 && ++evaluations === 2) throw new Error('second evaluation failed')
++    return next()
++  })
++  await expect(ctx.settings.update('first', { count: 77 })).rejects.toThrow('rejected by Loader')
++  expect(readFileSync(profile.patchPath, 'utf8')).toBe(before)
++  expect(entry.options.config).toEqual(previous)
++  expect(ctx.settings.describe().find(row => row.ns === 'first')!.value).toMatchObject({ count: 2 })
++})
+diff --git a/scripts/loader-volatile-update.spec.ts b/scripts/loader-volatile-update.spec.ts
+index 16d8f3b0a8..30eea9a7dd 100644
+--- a/scripts/loader-volatile-update.spec.ts
++++ b/scripts/loader-volatile-update.spec.ts
+@@ -94,7 +94,7 @@ describe('volatile Loader updates', () => {
+     } }
+     const fiber = await mountEntry(ctx, plugin, {})
+     const before = configs[0]!
+-    await update(fiber, { title: 'invalid candidate', nested: { count: -1 } })
++    await expect(update(fiber, { title: 'invalid candidate', nested: { count: -1 } })).rejects.toMatchObject({ code: 'CORDIS_VOLATILE_CONFIG_INVALID' })
+     expect(before.title.get()).toBe('hello')
+     expect(notifications).not.toHaveBeenCalled()
+     await update(fiber, { title: 'new', fixed: 'restart' })
+@@ -339,7 +339,7 @@ it('commits volatile edits in place and retains direct Fiber updates', async ()
+   expect(fiber.config).toBe(original)
+   expect(original.title.get()).toBe('enabled')
+   expect(notifications).toHaveBeenCalledExactlyOnceWith([['title']])
+-  await update(fiber, { title: 'invalid', nested: { count: -1 } })
++  await expect(update(fiber, { title: 'invalid', nested: { count: -1 } })).rejects.toMatchObject({ code: 'CORDIS_VOLATILE_CONFIG_INVALID' })
+   expect(original.title.get()).toBe('enabled')
+   await update(fiber, { title: 'mixed', fixed: 'changed' })
+   expect(apply).toHaveBeenCalledTimes(2)
+@@ -470,7 +470,7 @@ it.each(['group', 'include'] as const)('applies profile patches to a %s subtree
+   expect(events).toHaveBeenCalledTimes(2)
+ })
+ 
+-it('logs an invalid candidate and keeps its references while other entries commit', async () => {
++it('rejects an invalid candidate and restores raw config while other entries commit', async () => {
+   const ctx = await runtimeContext()
+   const events = vi.fn()
+   const plugin = { Config, apply(owner: Context) { owner.on('loader/volatile-update', events) } }
+@@ -478,11 +478,14 @@ it('logs an invalid candidate and keeps its references while other entries commi
+   const healthy = await mountEntry(ctx, plugin)
+   const warning = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+   onTestFinished(() => { warning.mockRestore() })
+-  await invalid.entry!.update({ config: { title: 'invalid', nested: { count: -1 } } })
++  const previousRaw = invalid._config
++  const previousOptions = { ...invalid.entry!.options }
++  await expect(invalid.entry!.update({ config: { title: 'invalid', nested: { count: -1 } } })).rejects.toMatchObject({ code: 'CORDIS_VOLATILE_CONFIG_INVALID' })
+   await healthy.entry!.update({ config: { title: 'healthy' } })
+-  expect(warning).toHaveBeenCalledTimes(2)
++  expect(warning).not.toHaveBeenCalled()
+   expect((invalid.config as ReturnType<typeof Config>).title.get()).toBe('hello')
+-  expect(invalid._config).toEqual({ title: 'invalid', nested: { count: -1 } })
++  expect(invalid._config).toBe(previousRaw)
++  expect(invalid.entry!.options).toEqual(previousOptions)
+   expect((healthy.config as ReturnType<typeof Config>).title.get()).toBe('healthy')
+   expect(events).toHaveBeenCalledExactlyOnceWith([['title']])
+ })
+diff --git a/vendor/README.md b/vendor/README.md
+index cfe68fc15e..5bf3950618 100644
+--- a/vendor/README.md
++++ b/vendor/README.md
+@@ -54,7 +54,7 @@ Keep this log exhaustive — every divergence from upstream must be listed.
+ 
+ 21. **`cordis/src/logger.ts` exporter disposal**: each disposer retains its registration id, so removing an earlier exporter cannot delete a later console or telemetry exporter. Covered by startup collector cleanup in `packages/boot/app-boot/tests/app-boot.spec.ts` and disabled-feedback output in `packages/session/session-telemetry-otel/tests/loader-composition.e2e.ts`.
+ 
+-22. **Volatile config across `cosmokit`, `schemastery`, `cordis`, and `loader`**: Cosmokit supplies immutable references and framework-owned commits; `deepEqual` treats two references as equal, propagates strict comparison into arrays, compares every array slot with holes treated as undefined, handles cycles conservatively, compares URLs by normalized href, and compares other opaque objects by identity in strict mode. Schemastery adds `.volatile()`, optional/default inference, placement validation without eager lazy-schema expansion (a lazy inner is validated once when built), metadata-free serialized node compatibility, serialized metadata, reference-aware simplification, unsupported volatile values reported as `ValidationError` with their path, and `.default()` accepting the raw input type `Partial<S>` because a volatile field makes the output type carry references. Loader's save path calls `simplify` with its schema receiver (`unparse.call`), an independent fix for the unbound-`this` call. Cordis exports consumer types without changing Fiber lifecycle. Loader compares raw options strictly in `Entry.update`; for a config-only change on an active fiber it calls the pure `equalExceptVolatile` function in `config/diff.ts`, which narrows the Standard Schema to Schemastery's `Schema` type (a new type-only `@deepseek-ai/schemastery` dependency of `loader`) and recursively skips fixed volatile paths using schema metadata without executing config hooks or validation. Missing or null object nodes compare using their declared defaults, including nodes without volatile descendants; schema backedges retain raw comparison. Entry passes its actual schema and preserves ordinary context and custom-update lifecycles. For a volatile-only change, `Entry._commitVolatile` re-parses the raw config through the fiber's `internal/config` hook and `resolveConfig`, compares ordinary effective values, commits references and emits the instance-local `loader/volatile-update` declared in `loader/src/index.ts`; a changed ordinary effective value falls back to the ordinary remount, and an invalid candidate is logged while the raw config stays retained for the next activation. Cosmokit provides reference enumeration and commits, and `simplify` is called with its schema receiver. The package READMEs document these additions; schema tests live in `scripts/volatile-config.spec.ts`, Loader runtime and real-file tests in `scripts/loader-volatile-update.spec.ts`, and code replacement tests in the HMR module suite.
++22. **Volatile config across `cosmokit`, `schemastery`, `cordis`, and `loader`**: Cosmokit supplies immutable references and framework-owned commits; `deepEqual` treats two references as equal, propagates strict comparison into arrays, compares every array slot with holes treated as undefined, handles cycles conservatively, compares URLs by normalized href, and compares other opaque objects by identity in strict mode. Schemastery adds `.volatile()`, optional/default inference, placement validation without eager lazy-schema expansion (a lazy inner is validated once when built), metadata-free serialized node compatibility, serialized metadata, reference-aware simplification, unsupported volatile values reported as `ValidationError` with their path, and `.default()` accepting the raw input type `Partial<S>` because a volatile field makes the output type carry references. Loader's save path calls `simplify` with its schema receiver (`unparse.call`), an independent fix for the unbound-`this` call. Cordis exports consumer types without changing Fiber lifecycle. Loader compares raw options strictly in `Entry.update`; for a config-only change on an active fiber it calls the pure `equalExceptVolatile` function in `config/diff.ts`, which narrows the Standard Schema to Schemastery's `Schema` type (a new type-only `@deepseek-ai/schemastery` dependency of `loader`) and recursively skips fixed volatile paths using schema metadata without executing config hooks or validation. Missing or null object nodes compare using their declared defaults, including nodes without volatile descendants; schema backedges retain raw comparison. Entry passes its actual schema and preserves ordinary context and custom-update lifecycles. For a volatile-only change, `Entry._commitVolatile` re-parses the raw config through the fiber's `internal/config` hook and `resolveConfig`, compares ordinary effective values, commits references and emits the instance-local `loader/volatile-update` declared in `loader/src/index.ts`; a changed ordinary effective value falls back to the ordinary remount, and an invalid candidate rejects with `CORDIS_VOLATILE_CONFIG_INVALID` while previous entry options, raw config and references are retained. This rejection lets ConfigEditor roll back a candidate that passed prevalidation but failed during Loader reconciliation. Cosmokit provides reference enumeration and commits, and `simplify` is called with its schema receiver. The package READMEs document these additions; schema tests live in `scripts/volatile-config.spec.ts`, Loader runtime and real-file tests in `scripts/loader-volatile-update.spec.ts`, and code replacement tests in the HMR module suite.
+ 
+ ## Sync procedure
+ 
+diff --git a/vendor/loader/README.md b/vendor/loader/README.md
+index 9001b2a8c2..d15589bf8a 100644
+--- a/vendor/loader/README.md
++++ b/vendor/loader/README.md
+@@ -49,4 +49,4 @@ For file-backed trees, use `@cordisjs/plugin-include`.
+ 
+ ## Volatile configuration
+ 
+-`Entry.update` compares raw entry options strictly; when only `config` changed on an active fiber in an unchanged context, the pure `equalExceptVolatile` function in `config/diff.ts` compares the raw configs using Schemastery metadata. It ignores volatile fields at fixed object paths without executing expressions, validators or `internal/config` hooks. Object nodes use their declared defaults for null or absent values, including objects without volatile fields; equivalent defaults skip updates. Other ordinary values, parent expressions and unknown fields retain raw comparison. Recursive schema backedges use raw comparison. Entry passes the actual plugin schema; a non-Schemastery schema compares raw. Context changes, other option changes and pending fibers use ordinary updates. A volatile-only change retains the raw Fiber config for later activation, then `_commitVolatile` parses it through the fiber's `internal/config` hook and schema, commits the new values into the running references when every ordinary effective value still matches, and emits `loader/volatile-update` to the owning fiber with the changed paths. A changed ordinary effective value uses the ordinary remount with a debug log naming the entry; because strict comparison treats class instances other than URL, Date and RegExp by identity, an ordinary field whose transform builds a fresh instance on every parse always takes that remount. An invalid candidate is logged and leaves the running references unchanged. A throwing `loader/volatile-update` listener is logged and does not fail the update; the values are already committed. Group/Include retain child dispatch, and programmatic Fiber updates preserve saving and `noSave`; `simplify` is called with its schema receiver so saved config contains plain values.
++`Entry.update` compares raw entry options strictly; when only `config` changed on an active fiber in an unchanged context, the pure `equalExceptVolatile` function in `config/diff.ts` compares the raw configs using Schemastery metadata. It ignores volatile fields at fixed object paths without executing expressions, validators or `internal/config` hooks. Object nodes use their declared defaults for null or absent values, including objects without volatile fields; equivalent defaults skip updates. Other ordinary values, parent expressions and unknown fields retain raw comparison. Recursive schema backedges use raw comparison. Entry passes the actual plugin schema; a non-Schemastery schema compares raw. Context changes, other option changes and pending fibers use ordinary updates. A volatile-only change retains the raw Fiber config for later activation, then `_commitVolatile` parses it through the fiber's `internal/config` hook and schema, commits the new values into the running references when every ordinary effective value still matches, and emits `loader/volatile-update` to the owning fiber with the changed paths. A changed ordinary effective value uses the ordinary remount with a debug log naming the entry; because strict comparison treats class instances other than URL, Date and RegExp by identity, an ordinary field whose transform builds a fresh instance on every parse always takes that remount. An invalid candidate rejects with `CORDIS_VOLATILE_CONFIG_INVALID`, restoring the previous entry options and raw Fiber config while preserving the running references. A throwing `loader/volatile-update` listener is logged and does not fail the update; the values are already committed. Group/Include retain child dispatch, and programmatic Fiber updates preserve saving and `noSave`; `simplify` is called with its schema receiver so saved config contains plain values.
+diff --git a/vendor/loader/src/config/entry.ts b/vendor/loader/src/config/entry.ts
+index 8ab9f8e6a0..64e2e5fe93 100644
+--- a/vendor/loader/src/config/entry.ts
++++ b/vendor/loader/src/config/entry.ts
+@@ -144,8 +144,20 @@ export class Entry {
+       const volatileOnly = changes.length === 1 && changes[0] === 'config'
+         && this.fiber.state === FiberState.ACTIVE && Object.getPrototypeOf(this.ctx) === this.parent.ctx
+         && equalExceptVolatile(legacy.config, this.options.config, this.fiber.runtime?.Config)
+-      if (volatileOnly) this.fiber._config = this.options.config
+-      const pending = volatileOnly && this._commitVolatile() ? [] : changes
++      let pending = changes
++      if (volatileOnly) {
++        const previousRaw = this.fiber._config
++        this.fiber._config = this.options.config
++        try {
++          if (this._commitVolatile()) pending = []
++        } catch (cause) {
++          this.options = legacy
++          this.fiber._config = previousRaw
++          throw Object.assign(new Error(`Volatile config update failed for "${this.options.id}"`, { cause }), {
++            code: 'CORDIS_VOLATILE_CONFIG_INVALID',
++          })
++        }
++      }
+       if (!pending.length && !force) return
+       this.context.emit('loader/partial-dispose', this, legacy, true)
+       this._patchContext(pending)
+@@ -156,7 +168,7 @@ export class Entry {
+ 
+   /**
+    * Parse a volatile-only raw config change and commit its values into the running fiber's references.
+-   * An invalid candidate is logged and leaves the running references unchanged; the raw config stays retained for the next activation.
++   * An invalid candidate rejects the update; entry options, raw config and running references keep their previous values.
+    * @returns `false` when an ordinary effective value changed, so the caller applies the ordinary update lifecycle.
+    */
+   private _commitVolatile(): boolean {
+@@ -164,14 +176,7 @@ export class Entry {
+     const refs = volatileEntries(fiber.config)
+     if (!refs.length) return true
+     const raw = this.options.config
+-    let candidate: unknown
+-    try {
+-      candidate = resolveConfig(fiber.runtime!, fiber.ctx.waterfall(fiber, 'internal/config', raw, () => raw))
+-    } catch (error) {
+-      this.ctx.logger.warn('volatile config update failed for %C', this.options.id)
+-      this.ctx.logger.warn(error)
+-      return true
+-    }
++    const candidate = resolveConfig(fiber.runtime!, fiber.ctx.waterfall(fiber, 'internal/config', raw, () => raw))
+     if (!deepEqual(fiber.config, candidate, true)) {
+       this.ctx.logger.debug('ordinary config values of %C changed with its volatile values; applying the ordinary update', this.options.id)
+       return false

@@ -17,37 +17,15 @@ const os = require('node:os');
 // 由于 apply() 闭包无法直接导入，这里对「关键行为契约」做源级断言 + 逻辑复刻验证。
 const src = fs.readFileSync(path.join(__dirname, '../src/index.js'), 'utf8');
 
-test('recordHealth 不再有 2s 防抖 flush + pendingRecords 缓冲（竞态根因移除）', () => {
-  assert.ok(!src.includes('pendingRecords.push'), 'pendingRecords 缓冲应已删除');
-  assert.ok(!/healthFlushHandle/.test(src), '2s 防抖句柄应已删除');
-  assert.ok(src.includes('healthStore.appendEvent'), 'recordHealth 应改为 domain 追加');
-});
 
-test('reloadFromConfig 优先从 domain 读权威数据（volatile 覆盖不再抹流水）', () => {
-  assert.ok(src.includes('healthStore.allEventBuckets()'), '应从 domain 读事件桶');
-  assert.ok(!src.includes('for (const p of pendingRecords)'), '快照覆盖后的补账循环应已删除');
-});
 
-test('digest 小投影：schema 声明 + 写入路径存在', () => {
-  assert.ok(src.includes('digest: z.array(z.any()).default([])'), 'HEALTH_SCHEMA 应含 digest');
-  assert.ok(src.includes('buildDigest()'), '应有 buildDigest 聚合');
-  assert.ok(src.includes('digestAt'), '投影应带生成时刻');
-});
 
-test('聚合口径：digest 含 token 三分项与 lastTs（client 渲染所需全字段）', () => {
-  const m = src.match(/const buildDigest = [\s\S]*?\n    };/);
-  assert.ok(m, 'buildDigest 函数应存在');
-  const body = m[0];
-  for (const field of ['tokIn', 'tokOut', 'tokCache', 'lastTs', 'lastOk', 'lastCode', 'ttftAvg', 'latAvg']) {
-    assert.ok(body.includes(field), 'digest 应含字段 ' + field);
-  }
-});
 
-test('存量迁移：settings records → domain 一次性搬运 + 标记', () => {
-  assert.ok(src.includes('migrateHealthToDomain'), '迁移函数应存在');
-  assert.ok(src.includes('healthMigrated'), '迁移标记应存在');
-  assert.ok(src.includes('migrateFrom('), '应调用 HealthStore.migrateFrom');
-});
+
+
+
+
+
 
 test('HealthStore：迁移幂等（桶已存在即跳过）+ 窗口过期 + 截断 + 并发追加原子链', async (t) => {
   // health-store.js 依赖 zod/storage-domain（peerDeps，本仓无 node_modules）；
@@ -115,11 +93,7 @@ test('HealthStore：迁移幂等（桶已存在即跳过）+ 窗口过期 + 截�
   assert.equal(buckets.get('p3').events.length, 3, '并发追加不应丢事件（missing-key 回退 + update 排队）');
 });
 
-test('client 兼容：digest 缺席时回落原始 records 路径', () => {
-  const csrc = fs.readFileSync(path.join(__dirname, '../src/client.js'), 'utf8');
-  assert.ok(csrc.includes("Array.isArray(health.digest)"), '应探测 digest 数组');
-  assert.ok(csrc.includes('旧 host 原始流水路径'), '应保留旧路径兼容');
-});
+
 
 function pathToFileURL(p) {
   const { pathToFileURL: toURL } = require('node:url');

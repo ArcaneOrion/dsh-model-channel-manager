@@ -1,19 +1,5 @@
-/**
- * 健康数据存储：原始流水（事件/测速）搬入 storageDomain 的 per-record KV 表。
- *
- * 动机（审计 F11/F12/F23 的根因）：0.1 时代健康流水整字段存在 settings 命名空间里，
- * 与配置共用同一条「HMR 独占事务 + 整字段落盘」通道，导致：
- *  - 2s 防抖 flush 与 volatile-update 快照覆盖互相踩（刚记的账被旧快照抹掉）；
- *  - profile patch 文件膨胀（实测 6350 行中 health 约占 3000 行）；
- *  - 任何无关 settings 写入都会整段重写健康数据。
- *
- * 现在的归属：事实数据（append-only 事件）进 domain；settings 里只保留
- * 一份给 client 渲染用的小投影（聚合摘要 + 运行态指针），由 host 定期刷新。
- *
- * 组合方式照抄 dsh-session-projection-cache 范本：
- *  - 依赖方 inject ['storageDomain']（dsh-base 已装 json 后端，root=storages/）；
- *  - Service.init 里 open(spec)，effect 持有 close；
- *  - per-record 布局：一条事件一个文档，坏记录 backup-and-skip 不阻塞整体。
+/** Retained health events and speed results in the existing per-record storage domain.
+ * Runtime snapshots and task results live in channel-state.js; neither uses Config.
  */
 import { z } from 'zod';
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain';
@@ -24,6 +10,7 @@ const PER_KEY_LIMIT = 300;
 
 /** 单条健康事件记录（zod，domain 落盘边界校验）。向后兼容：token 字段可选。 */
 const eventRecord = z.object({
+  id: z.string().optional(),
   ts: z.number().int().nonnegative(),
   provider: z.string(),
   model: z.string(),
@@ -73,7 +60,7 @@ const healthDomainSpec = defineDomain({
  * 会被当成同一笔合并掉。把判定性字段一起纳入指纹——同毫秒 + 同渠道 + 同结果形态
  * 的两笔在语义上本就不可区分；真正不同的两笔（成功率/延迟/token 不同）不会再被吞。
  */
-const eventKey = (e) => [
+const eventKey = (e) => e.id || [
   e.ts, e.provider, e.model, e.ok ? 1 : 0, e.code || '',
   e.ttftMs ?? '', e.latencyMs ?? '',
   e.inputTokens ?? '', e.outputTokens ?? '', e.cacheReadTokens ?? '', e.cacheWriteTokens ?? '',
@@ -132,6 +119,7 @@ export class HealthStore {
   appendEvent(provider, rec) {
     if (this.events === null) return Promise.resolve();
     return this.enqueueEvent(async () => {
+      rec = eventRecord.parse(rec);
       const cutoff = Date.now() - WINDOW_MS;
       const cur = this.events.get(provider);
       if (cur === undefined) {
@@ -148,9 +136,10 @@ export class HealthStore {
    * 避免与迁移/追加写入交错（快照语义下后写者胜，交错会写出半新半旧的桶）。 */
   async putSpeedRows(groupId, rows) {
     if (this.speed === null) return;
+    const record = speedRecord.parse({ rows });
     await this.enqueueEvent(async () => {
       if (this.speed === null) return;
-      await this.speed.put(groupId, { rows });
+      await this.speed.put(groupId, record);
     });
   }
 
@@ -185,7 +174,8 @@ export class HealthStore {
     const cutoff = Date.now() - WINDOW_MS;
     for (const [provider, list] of Object.entries(records || {})) {
       const incoming = (Array.isArray(list) ? list : [])
-        .filter((e) => e && Number.isFinite(e.ts) && e.ts >= cutoff);
+        .filter((e) => e && Number.isFinite(e.ts) && e.ts >= cutoff)
+        .map(e => eventRecord.parse(e));
       if (incoming.length === 0) continue;
       await this.enqueueEvent(async () => {
         const existing = (this.events.get(provider) || {}).events || [];
@@ -203,10 +193,11 @@ export class HealthStore {
     }
     for (const [groupId, rows] of Object.entries(speedResults || {})) {
       if (!Array.isArray(rows) || rows.length === 0) continue;
+      const record = speedRecord.parse({ rows });
       await this.enqueueEvent(async () => {
         if (this.speed === null) return;
         if (this.speed.get(groupId) !== undefined) return; // domain 已有该组结果：以 domain 为准
-        await this.speed.put(groupId, { rows });
+        await this.speed.put(groupId, record);
       });
     }
     return true;

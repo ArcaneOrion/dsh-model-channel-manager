@@ -1,0 +1,13 @@
+{
+  "checks": [
+    "original-card-layout",
+    "exact-windows",
+    "runtime-only-refresh",
+    "light-dark",
+    "mobile",
+    "stale-data-error",
+    "model-task-no-config-write",
+    "provider-conflict"
+  ],
+  "pageErrors": []
+}

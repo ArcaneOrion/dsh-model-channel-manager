@@ -1,10 +1,4 @@
-/** @arcaneorion/dsh-model-channel-manager — client 半（现代化设计版）。
- * 遵循 DSH 规范：inject ["slots","connection"]，
- * apply(ctx) 捕获 ctx.get("connection").api，组件经闭包使用。
- * 数据通道 = api.settings / api.llm / api.credentials（公共 seam，无私有 RPC）。
- * 会话模型选择器（座位遮蔽）已拆出为独立插件 @arcaneorion/dsh-model-selector-search，
- * 本包只保留 conversation.view 模型配置页签。
- */
+/** Model configuration, independent runtime status, and cancellable tasks. */
 window.__ModuleLoader__.load({
   id: '@arcaneorion/dsh-model-channel-manager',
   factory: (require) => {
@@ -30,60 +24,29 @@ window.__ModuleLoader__.load({
       return n === 0 ? nonceFallbackCounter + 1 : n
     }
 
-    // dsh 0.2：客户端远程面由 connection.api 改为 ctx.remote；参数改为位置参数，结果统一为
-    // RemoteResult。本适配层把两者还原成 0.1 的调用形状（对象入参 + {result:{ok,value}}）。
-    // 另：0.2 的 settings 命名空间恒等于「插件行 id」，本插件的两套旧命名空间
-    // （model-channels / model-channel-health）现由其实例配置的字段承载，在此合成回旧视图。
     const NS_MCM = 'model-channel-manager'
-    const makeLegacyApi = (remote) => {
-      const wrap = (res) => ({ result: res || { ok: false } });
+    const makeLegacyApi = (remote, connection) => {
+      const wrap = (result) => ({ result: result || { ok: false } })
       return {
+        runtime: async (method, payload = {}, signal) => {
+          const result = await connection.rpc.call('/api', 'modelChannels/invoke', { args: { method, payload } }, signal)
+          if (!result || !result.ok) throw Object.assign(new Error(result?.error?.message || '健康服务不可用，请确认宿主已升级并重新加载'), { code: result?.error?.code })
+          return result.value
+        },
         settings: {
           describe: async () => {
             const res = await remote.settings.describe()
-            if (!res || res.ok !== true) return wrap(res)
-            const namespaces = (res.value && res.value.namespaces) || []
-            const mcm = namespaces.find((n) => n && n.ns === NS_MCM)
-            const value = (mcm && mcm.value) || {}
-            const user = (mcm && mcm.user) || {}
-            return { result: { ok: true, value: { namespaces: [...namespaces,
-              { ns: 'model-channels', value: { groups: value.groups || [], providerOrder: value.providerOrder || [], effortMemory: value.effortMemory || {} }, user: { groups: user.groups, providerOrder: user.providerOrder }, revision: (mcm && mcm.revision) || 0 },
-              { ns: 'model-channel-health', value: value.health || {}, user: (user && user.health) || {}, revision: (mcm && mcm.revision) || 0 },
-            ] } } }
+            if (!res || !res.ok) return wrap(res)
+            const namespaces = res.value?.namespaces || []
+            const mcm = namespaces.find(row => row.ns === NS_MCM)
+            const value = mcm?.value || {}
+            return wrap({ ok: true, value: { namespaces: [...namespaces, {
+              ns: 'model-channels', value: { groups: value.groups || [], providerOrder: value.providerOrder || [], effortMemory: value.effortMemory || {} },
+              user: mcm?.user || {}, revision: mcm?.revision,
+            }] } })
           },
-          // 旧签名：update({ ns, patch, expectedRevision })——0.3.2 起透传 revision
-          // （宿主 settings.update 第三参；冲突抛 settings/conflict，由调用方提示重载）
-          update: async (args) => {
-            const ns = (args && args.ns) || NS_MCM
-            const patch = (args && args.patch) || {}
-            const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
-            if (ns === 'model-channels') return wrap(await remote.settings.update(NS_MCM, patch, expected))
-            // 0.3.12：health 子树改成「叶写」（path-ops），不再 describe 快照 + 整树回写。
-            // 旧写法在 read→write 的两次 RPC 之间有窗口：宿主刚写入的终态会被旧快照覆盖
-            // （线上事故：testResults[nonce].status 被改回 running，finishedAt/code/error 却保留，
-            //  客户端永远等不到终态 → 66s 后误报「host 未处理」）。
-            const ops = Object.entries(patch).map(([k, v]) => ({ op: 'set', path: ['health', k], value: v }))
-            if (ops.length === 0) return { result: { ok: true, value: null } }
-            return wrap(await remote.settings.mutate(NS_MCM, ops, expected))
-          },
-          // 旧签名：mutate({ ns, ops })——health 子树现在也走真实 path-ops（不再本地模拟整树写）
-          mutate: async (args) => {
-            const ns = (args && args.ns) || NS_MCM
-            const ops = (args && args.ops) || []
-            const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
-            if (ns === NS_MCM) return wrap(await remote.settings.mutate(NS_MCM, ops, expected))
-            const prefix = (ns === 'model-channels') ? [] : ['health']
-            const mapped = []
-            for (const op of ops) {
-              const path = (op && op.path) || []
-              if (path.length === 0) continue
-              // legacy 混合命名空间：groups/providerOrder 属于行顶层，其余视为 health 子键
-              const p = (ns === 'model-channels' && (path[0] === 'groups' || path[0] === 'providerOrder')) ? path : [...prefix, ...path]
-              mapped.push({ op: (op && op.op) || 'set', path: p, value: op && op.value })
-            }
-            if (mapped.length === 0) return { result: { ok: true, value: null } }
-            return wrap(await remote.settings.mutate(NS_MCM, mapped, expected))
-          },
+          update: async ({ ns, patch, expectedRevision }) => wrap(await remote.settings.update(ns === 'model-channels' ? NS_MCM : ns, patch, expectedRevision)),
+          mutate: async ({ ns, ops, expectedRevision }) => wrap(await remote.settings.mutate(ns === 'model-channels' ? NS_MCM : ns, ops, expectedRevision)),
         },
         credentials: {
           // 旧签名：set({ ref, value })
@@ -112,6 +75,12 @@ window.__ModuleLoader__.load({
     }
 
     const CSS = `
+.mcm-root button { font:inherit; }
+.mcm-nav-item { border:0; background:transparent; }
+.mcm-root :focus-visible { outline:2px solid var(--dsw-alias-brand-primary); outline-offset:3px; }
+.mcm-root button:disabled { opacity:.5; cursor:wait; }
+@media (max-width:760px) { .mcm-root .mcm-header { flex-wrap:wrap; gap:12px; padding:12px; } .mcm-root .mcm-body { padding:16px 12px; } .mcm-root .mcm-metrics-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .mcm-root .mcm-nav-item { padding:8px; } .mcm-health-toolbar { flex-wrap:wrap; gap:12px; } .mcm-health-toolbar > div:first-child { flex-wrap:wrap; } .mcm-health-toolbar .mcm-nav-item { white-space:nowrap; } .mcm-health-toolbar > div:last-child { margin-left:auto; } .mcm-root .mcm-health-grid { grid-template-columns:minmax(0,1fr); } .mcm-health-card-h { flex-wrap:wrap; }  }
+
 .mcm-root { display:flex; flex-direction:column; height:100%; overflow:hidden; font-size:13px; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-base); }
 .mcm-header { display:flex; align-items:center; justify-content:space-between; padding:12px 24px; border-bottom:1px solid var(--dsw-alias-border-l1); background:var(--dsw-alias-bg-layer-1); flex-shrink:0; }
 .mcm-nav { display:flex; background:var(--dsw-alias-bg-layer-2); padding:3px; border-radius:10px; border:1px solid var(--dsw-alias-border-l2); gap:2px; }
@@ -340,8 +309,9 @@ window.__ModuleLoader__.load({
             el('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
               el('span', { className: 'mcm-badge brand' }, win.provider),
               el('span', { className: 'mcm-badge' }, win.model),
-              res.status === 'ok' ? el('span', { className: 'mcm-badge success' }, 'HTTP 200 OK') : el('span', { className: 'mcm-badge error' }, res.code || 'ERROR')
+              res.status === 'ok' ? el('span', { className: 'mcm-badge success' }, '响应正常') : el('span', { className: 'mcm-badge error' }, res.code || 'ERROR')
             ),
+            res.persistenceError ? el('div', { className: 'mcm-banner', role: 'alert' }, res.persistenceError) : null,
             res.status === 'ok' ? el('div', { style: { background: 'var(--dsw-alias-bg-layer-2)', padding: 12, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', display: 'flex', flexDirection: 'column', gap: 6 } },
               el('div', { style: { display: 'flex', gap: 16, fontSize: 12, color: 'var(--dsw-alias-state-success-primary)', fontWeight: 600 } },
                 el('span', null, 'TTFT 首字响应: ' + (res.ttftMs != null ? (res.ttftMs / 1000).toFixed(2) + 's' : '—')),
@@ -512,6 +482,37 @@ window.__ModuleLoader__.load({
       }).catch((e) => setDisc({ provider: name, error: String((e && e.message) || e) }))
     }
 
+    function useTaskRunner(setRows) {
+      const active = useRef(new Map())
+      useEffect(() => () => { for (const job of active.current.values()) job.controller.abort(); active.current.clear() }, [])
+      const start = async (kind, request, key) => {
+        if (!apiRef || active.current.has(key)) return
+        const controller = new AbortController()
+        const nonce = createNonce()
+        active.current.set(key, { controller, id: String(nonce) })
+        const update = row => { if (!controller.signal.aborted) setRows(rows => ({ ...rows, [key]: row })) }
+        update({ id: String(nonce), status: 'running' })
+        try {
+          let row = await apiRef.runtime(kind, { ...request, nonce }, AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]))
+          update(row)
+          while (row.status === 'running' && !controller.signal.aborted) {
+            await new Promise(resolve => { const done = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', done); resolve() }; const timer = setTimeout(done, 800); controller.signal.addEventListener('abort', done, { once: true }) })
+            if (controller.signal.aborted) return
+            row = await apiRef.runtime('task', { id: String(nonce) }, AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]))
+            update(row)
+          }
+        } catch (error) { update({ id: String(nonce), status: 'error', code: error.code, error: error.message }) }
+        finally { active.current.delete(key) }
+      }
+      const cancel = async key => {
+        const job = active.current.get(key)
+        if (!job) return
+        try { await apiRef.runtime('cancel', { id: job.id }, AbortSignal.timeout(15000)) }
+        catch (error) { setRows(rows => ({ ...rows, [key]: { ...rows[key], error: '取消失败：' + error.message } })) }
+      }
+      return { start, cancel }
+    }
+
     function ModelConfigPanel(props) {
       const draft = props._draft; const setDraft = props._setDraft
       const setNotice = props._setNotice || (() => {})
@@ -519,6 +520,7 @@ window.__ModuleLoader__.load({
       const [sa, setSa] = useState({})
       const [keyInput, setKeyInput] = useState({})
       const [testStates, setTestStates] = useState({})
+      const testRunner = useTaskRunner(setTestStates)
       const [detailWin, setDetailWin] = useState(null)
       const [configWin, setConfigWin] = useState(false)
       const [disc, setDisc] = useState(null)
@@ -563,63 +565,11 @@ window.__ModuleLoader__.load({
         return {}
       }
 
-      const pollTest = (nonce, provider, model, attempt = 0) => {
-        if (!apiRef) return
-        const key = provider + '::' + model
-        // host 侧测试超时 45s（0.3.13 从 60s 下调，给终态写入留出余量），
-        // 约 55 次 × 1.2s ≈ 66s 后放弃。放弃时按现场分三种提示，不再一律甩锅「未处理」。
-        const giveUp = (e, settledHere) => setTestStates((s) => Object.assign({}, s, { [key]: settledHere
-          ? { status: 'error', code: 'POLL_TIMEOUT_SETTLED', error: 'host 已完成本次测试但结果条目未能写入（写入失败或被覆盖）：请重试，若反复出现请查看宿主日志' }
-          : (e && e.status === 'running')
-            ? { status: 'error', code: 'POLL_TIMEOUT_RUNNING', error: '测试仍在执行（约 66 秒未返回结果）：host 已收到请求，可能是渠道慢或上游挂起；稍后可在健康统计里核对' }
-            : { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 未写入结果（可能 host 未重启到新版，或结果写入失败）' } }))
-        apiRef.settings.describe({}).then((resp) => {
-          const r = resp && resp.result ? resp.result : resp
-          const d = r && r.value !== undefined ? r.value : r
-          const ns = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
-          const tr = (ns && ns.value && ns.value.testResults) || {}
-          const e = tr[nonce]
-          // 终态判定不能只看 status：整树快照回写曾把 status 改回 running 而保留
-          // finishedAt/code/error（0.3.11 事故）。finishedAt 写入后不会被抹掉，把它也当终态，
-          // 并按 ok 归一 status —— 这样「僵尸条目」也能显示真实的上游错误而不是假超时。
-          const terminal = !!(e && (e.status === 'ok' || e.status === 'error' || e.finishedAt))
-          if (terminal) {
-            const norm = (e.status === 'ok' || e.status === 'error') ? e : Object.assign({}, e, { status: e.ok === true ? 'ok' : 'error' })
-            setTestStates((s) => Object.assign({}, s, { [key]: norm }))
-          } else if (attempt >= 55) {
-            // host 已结算（lastTestHandledNonce === 自己的 nonce）但结果条目不在 → 写入失败
-            const settled = ns && ns.value ? ns.value.lastTestHandledNonce : undefined
-            giveUp(e, settled !== undefined && settled !== null && String(settled) === String(nonce))
-          } else {
-            setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1200)
-          }
-        }).catch(() => {
-          if (attempt >= 55) giveUp()
-          else setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1500)
-        })
-      }
-
-      const fireTest = (provider, model) => {
-        if (!apiRef) return
-        const key = provider + '::' + model
-        setTestStates((s) => Object.assign({}, s, { [key]: { status: 'running' } }))
-        // F03：Date.now()%1e9 同毫秒可碰撞（碰撞 = 两次测试互相认领/覆盖结果），
-        // 换 UUID；host 侧 testRequest.nonce 消费方是 !== 比较，字符串/数字都行
-        const nonce = createNonce()
-        const prompt = localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己'
-        const maxTokens = Number(localStorage.getItem('mcm_test_max_tokens')) || 256
-        apiRef.settings.update({
-          ns: 'model-channel-health',
-          patch: { testRequest: { nonce, provider, model, prompt, maxTokens } }
-        }).then((resp) => {
-          // F19：RPC resolve ≠ 业务成功——检查信封（旧实现把 ok:false 当「已触发」）
-          const r = resp && resp.result ? resp.result : resp
-          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'test request rejected')
-          pollTest(nonce, provider, model)
-        }).catch((e) => {
-          setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', error: String((e && e.message) || e) } }))
-        })
-      }
+      const fireTest = (provider, model) => testRunner.start('test', {
+        provider, model,
+        prompt: localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己',
+        maxTokens: Math.min(8192, Math.max(1, Number(localStorage.getItem('mcm_test_max_tokens')) || 256)),
+      }, provider + '::' + model)
 
       const launchTest = (provider, model) => {
         // 模型尚未保存到配置中 → 友好提示
@@ -829,7 +779,7 @@ window.__ModuleLoader__.load({
                       }, '✗ 异常 (详情)')
                     ) : null,
                     el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
-                      btn('⚡测试', () => launchTest(name, m.id), 'primary'),
+                      ts?.status === 'running' ? btn('取消测试', () => testRunner.cancel(name + '::' + m.id)) : btn('⚡测试', () => launchTest(name, m.id), 'primary'),
                       btn('✕', () => removeModel(name, mi), 'danger')
                     )
                   ),
@@ -949,6 +899,7 @@ window.__ModuleLoader__.load({
       const groups = props.channelsDraft || []
       const providers = props._providers || {}
       const [speedState, setSpeedState] = useState({})
+      const speedRunner = useTaskRunner(setSpeedState)
       const [expanded, setExpanded] = useState({})
       // 顶层 notice 的写入通道（ModelConfigView 传入；测速失败要上浮显示）
       const setNotice = props._setNotice || (() => {})
@@ -984,22 +935,7 @@ window.__ModuleLoader__.load({
         return cur
       }))
 
-      const speedtest = (gid) => {
-        if (!apiRef) return
-        // F03/F19 同 fireTest：UUID 防碰撞 + 信封检查（ok:false 不再当「已触发」）
-        const nonce = createNonce()
-        setSpeedState((s) => Object.assign({}, s, { [gid]: 'running' }))
-        apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then((resp) => {
-          const r = resp && resp.result ? resp.result : resp
-          if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'speed request rejected')
-          setSpeedState((s) => Object.assign({}, s, { [gid]: 'sent' }))
-          setTimeout(() => setSpeedState((s) => Object.assign({}, s, { [gid]: null })), 3000)
-        }).catch((e) => {
-          setSpeedState((s) => Object.assign({}, s, { [gid]: 'err' }))
-          setNotice('测速触发失败: ' + String((e && e.message) || e))
-          setTimeout(() => setNotice(null), 5000)
-        })
-      }
+      const speedtest = gid => speedRunner.start('speed', { group: gid }, gid)
 
       if (groups.length === 0) return el('div', { className: 'mcm-empty' }, '暂无轮询组，点击下方按钮创建', el('div', { style: { marginTop: 12 } }, btn('＋新增轮询组', addGroup, 'primary')))
 
@@ -1008,7 +944,7 @@ window.__ModuleLoader__.load({
           const isOpen = !!expanded[i]
           const vm = g.virtualModel || {}
           const stCfg = g.speedTest || {}
-          const st = speedState[g.id]
+          const st = speedState[g.id]?.status
           return el('div', { className: 'mcm-card', key: 'rr_card_' + i },
             el('div', { className: 'mcm-card-h', onClick: () => setExpanded((e) => Object.assign({}, e, { [i]: !e[i] })) },
               el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, isOpen ? '▼' : '▶'),
@@ -1016,8 +952,8 @@ window.__ModuleLoader__.load({
               el('span', { className: 'mcm-badge' }, (g.candidates || []).length + ' 候选'),
               el('span', { className: 'mcm-badge' }, g.strategy || 'sticky'),
               el('div', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, onClick: (e) => e.stopPropagation() },
-                btn('⚡测速排序', () => speedtest(g.id), 'primary'),
-                st === 'running' ? el('span', { className: 'mcm-badge brand' }, '测速中…') : st === 'sent' ? el('span', { className: 'mcm-badge success' }, '已触发') : null,
+                st === 'running' ? btn('取消测速', () => speedRunner.cancel(g.id)) : btn('⚡测速排序', () => speedtest(g.id), 'primary'),
+                st === 'running' ? el('span', { className: 'mcm-badge brand' }, '测速中…') : st === 'ok' ? el('span', { className: 'mcm-badge success' }, '测速完成') : st === 'error' ? el('span', { className: 'mcm-badge error', title: speedState[g.id].error }, speedState[g.id].code === 'ABORTED' ? '已取消' : '测速失败') : null,
                 btn('删', () => { if (confirm('删除轮询组 ' + g.id + '?')) props.setChannelsDraft((d) => d.filter((_, gi) => gi !== i)) }, 'danger')
               )
             ),
@@ -1087,26 +1023,9 @@ window.__ModuleLoader__.load({
     function HealthPanel(props) {
       const health = props.health
       const providers = props._providers || {}
-      // 默认 7d：digest 是窗口聚合，小窗口在长时间无请求时会合法显示 0，
-      // 用户容易误认为「数据丢了」。先默认展示历史，再可切 30m/24h 看实时/近期。
-      const [windowMode, setWindowMode] = useState('7d') // '30m' | '24h' | '7d'
-
-      if (!health) return el('div', { className: 'mcm-empty' }, '健康统计数据准备中…')
-
-      const now = Date.now()
-      const windowCutoff = windowMode === '30m' ? now - 30 * 60 * 1000 : windowMode === '24h' ? now - 24 * 3600 * 1000 : 0
-
-      // ---------- 聚合数据源 ----------
-      // 0.3.1 起优先用 host 下发的 digest 小投影（聚合已上移 host，client 不再拉原始流水）。
-      // digest 是 7 天全窗口聚合；30m/24h 视图按 lastTs 近似（lastTs 在窗口内才计入），
-      // 精细窗口统计属后续增强（需要 host 按窗口出多份 digest）。
-      // 旧 host 兼容：无 digest 字段时走原始 records 路径（升级窗口不断供）。
-      // #11（审计）：digest 是空数组时不要遮蔽 settings 里仍存在的 records——
-      // 典型场景是 domain 打开成功但迁移失败（host 保留旧流水不清理）或 host 刚重启
-      // 尚未投影。此时回落到 records 路径，页面显示旧流水而不是全 0。
-      const rawRecords = health.records || {}
-      const hasRawRecords = Object.keys(rawRecords).some((k) => Array.isArray(rawRecords[k]) && rawRecords[k].length > 0)
-      const digestRows = (Array.isArray(health.digest) && (health.digest.length > 0 || !hasRawRecords)) ? health.digest : null
+      const [windowMode, setWindowMode] = useState('7d')
+      if (!health) return el('div', { className: 'mcm-empty', role: 'status' }, props.healthError ? '健康服务连接失败：' + props.healthError : '健康统计数据准备中…', btn('重试', props.refreshHealth))
+      const digestRows = health.windows?.[windowMode] || []
       // 按 provider 分组
       const byProvider = new Map()
 
@@ -1142,18 +1061,8 @@ window.__ModuleLoader__.load({
       let totalTokIn = 0
       let totalTokOut = 0
       let totalTokCache = 0
-      // allEvents 必须在两个分支前声明：旧 host 兼容路径（digest 缺失）会在
-      // else 块里赋值它（供顶部指标卡用）；若在此处之后才 let 声明，
-      // 赋值撞未声明变量 → ReferenceError 白屏（host 重启首次加载、digest
-      // 尚未生成时正是此路径）。这是 0.3.1 引入双路径时的遗漏。
-      let allEvents = []
-
-      if (digestRows !== null) {
-        // ---------- digest 投影路径 ----------
-        for (const row of digestRows) {
+      for (const row of digestRows) {
           if (!row || !row.provider || !row.model) continue
-          // 窗口过滤：lastTs 不在窗口内的渠道不计入该窗口（近似口径，见上注）
-          if (windowCutoff > 0 && (row.lastTs || 0) < windowCutoff) continue
           let pMap = byProvider.get(row.provider)
           if (!pMap) { pMap = new Map(); byProvider.set(row.provider, pMap) }
           let a = pMap.get(row.model)
@@ -1181,8 +1090,10 @@ window.__ModuleLoader__.load({
           a.total = row.total || 0
           a.success = row.success || 0
           a.fail = a.total - a.success
-          a.ttftSum = (row.ttftAvg || 0) * a.success
-          a.latSum = (row.latAvg || 0) * a.success
+          a.ttftSum = (row.ttftAvg || 0) * row.ttftCount
+          a.ttftCount = row.ttftCount
+          a.latCount = row.latCount
+          a.latSum = (row.latAvg || 0) * row.latCount
           a.lastTs = row.lastTs || 0
           a.lastOk = row.lastOk
           a.lastCode = row.lastCode || null
@@ -1194,87 +1105,12 @@ window.__ModuleLoader__.load({
           totalTokOut += a.tokOut
           totalTokCache += a.tokCache
         }
-      } else {
-        // ---------- 旧 host 原始流水路径（兼容） ----------
-        const recsMap = health.records || {}
-        const rawEvents = Object.values(recsMap).flat()
-        // 时间窗口过滤（赋给函数级 allEvents，供顶部指标卡使用）
-        allEvents = rawEvents.filter((e) => (e.ts || 0) >= windowCutoff)
-        // 累加时间窗口内的真实流水记录
-        for (const e of allEvents) {
-          if (!e || !e.provider || !e.model) continue
-          let pMap = byProvider.get(e.provider)
-          if (!pMap) { pMap = new Map(); byProvider.set(e.provider, pMap) }
-          let a = pMap.get(e.model)
-          if (!a) {
-            a = {
-              provider: e.provider,
-              model: e.model,
-              name: e.model,
-              total: 0,
-              success: 0,
-              fail: 0,
-              ttftSum: 0,
-              latSum: 0,
-              lastTs: 0,
-              lastOk: null,
-              lastCode: null,
-              recentErrors: 0,
-              tokSum: 0,
-              tokIn: 0,
-              tokOut: 0,
-              tokCache: 0
-            }
-            pMap.set(e.model, a)
-          }
-          a.total++
-          const tokIn = (e && e.inputTokens) || 0
-          const tokOut = (e && e.outputTokens) || 0
-          const tokCache = ((e && e.cacheReadTokens) || 0) + ((e && e.cacheWriteTokens) || 0)
-          totalTokIn += tokIn
-          totalTokOut += tokOut
-          totalTokCache += tokCache
-          a.tokIn += tokIn
-          a.tokOut += tokOut
-          a.tokCache += tokCache
-          a.tokSum += tokIn + tokOut + tokCache
-          if (e.ok) {
-            a.success++
-            if (e.ttftMs != null && e.ttftMs >= 0) a.ttftSum += e.ttftMs
-            if (e.latencyMs != null && e.latencyMs >= 0) a.latSum += e.latencyMs
-          } else {
-            a.fail++
-            if (e.code) a.lastCode = e.code
-          }
-          if ((e.ts || 0) > a.lastTs) {
-            a.lastTs = e.ts || 0
-            a.lastOk = e.ok
-          }
-        }
-      }
-
-      // 顶部指标卡：digest 路径用聚合值求和，旧路径用原始事件计数
-      // （allEvents 已在上方分支前声明）
-      let totalRequests = 0
-      let totalSuccess = 0
-      let ttftWeightedSum = 0
-      if (digestRows !== null) {
-        for (const pMap of byProvider.values()) {
-          for (const a of pMap.values()) {
-            totalRequests += a.total
-            totalSuccess += a.success
-            ttftWeightedSum += a.ttftSum
-          }
-        }
-      } else {
-        totalRequests = allEvents.length
-        totalSuccess = allEvents.filter((x) => x.ok).length
-        for (const pMap of byProvider.values()) {
-          for (const a of pMap.values()) ttftWeightedSum += a.ttftSum
-        }
-      }
-      const globalRate = totalRequests > 0 ? ((totalSuccess / totalRequests) * 100).toFixed(1) + '%' : '100%'
-      const avgGlobalTtft = totalSuccess > 0 ? (ttftWeightedSum / totalSuccess / 1000).toFixed(2) + 's' : '—'
+      const totalRequests = digestRows.reduce((n, r) => n + r.total, 0)
+      const totalSuccess = digestRows.reduce((n, r) => n + r.success, 0)
+      const measured = digestRows.reduce((n, r) => n + r.ttftCount, 0)
+      const ttftWeightedSum = digestRows.reduce((n, r) => n + (r.ttftAvg || 0) * r.ttftCount, 0)
+      const globalRate = totalRequests > 0 ? ((totalSuccess / totalRequests) * 100).toFixed(1) + '%' : '—'
+      const avgGlobalTtft = measured > 0 ? (ttftWeightedSum / measured / 1000).toFixed(2) + 's' : '—'
 
       const providerGroups = [...byProvider.entries()].map(([provName, modelMap]) => {
         const models = [...modelMap.values()].map((m) => {
@@ -1300,8 +1136,8 @@ window.__ModuleLoader__.load({
             statusKind,
             ratePercent: m.total > 0 ? (rate * 100).toFixed(0) + '%' : '未调用',
             rateValue: rate,
-            avgTtft: m.success > 0 && m.ttftSum > 0 ? (m.ttftSum / m.success / 1000).toFixed(2) + 's' : '—',
-            avgLat: m.success > 0 && m.latSum > 0 ? (m.latSum / m.success / 1000).toFixed(2) + 's' : '—',
+            avgTtft: m.ttftCount > 0 ? (m.ttftSum / m.ttftCount / 1000).toFixed(2) + 's' : '—',
+            avgLat: m.latCount > 0 ? (m.latSum / m.latCount / 1000).toFixed(2) + 's' : '—',
             lastTimeStr: m.lastTs > 0 ? new Date(m.lastTs).toLocaleTimeString() : '无调用记录'
           }
         })
@@ -1315,27 +1151,28 @@ window.__ModuleLoader__.load({
       providerGroups.sort((a, b) => b.total - a.total)
 
       return el('div', null,
-        el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 } },
+        props.healthError ? el('div', { className: 'mcm-banner', role: 'alert' }, '刷新失败，保留上次数据：' + props.healthError, btn('重试', props.refreshHealth)) : null,
+        health.storage?.mode === 'memory' || health.storage?.error ? el('div', { className: 'mcm-banner', role: 'status' }, health.storage.error || '当前为内存模式，重启后不保留新增记录。') : null,
+        el('div', { className: 'mcm-health-toolbar', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 } },
           el('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
             el('span', { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-secondary)' } }, '统计时间窗口:'),
             el('div', { className: 'mcm-nav', style: { padding: 2 } },
-              el('div', { className: 'mcm-nav-item' + (windowMode === '30m' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('30m') }, '🟢 近 30 分钟 (实时探针)'),
-              el('div', { className: 'mcm-nav-item' + (windowMode === '24h' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('24h') }, '🟡 近 24 小时'),
-              el('div', { className: 'mcm-nav-item' + (windowMode === '7d' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('7d') }, '🔵 近 7 天全量')
+              el('button', { type: 'button', className: 'mcm-nav-item' + (windowMode === '30m' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('30m') }, '🟢 近 30 分钟'),
+              el('button', { type: 'button', className: 'mcm-nav-item' + (windowMode === '24h' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('24h') }, '🟡 近 24 小时'),
+              el('button', { type: 'button', className: 'mcm-nav-item' + (windowMode === '7d' ? ' active' : ''), style: { padding: '4px 12px', fontSize: 11 }, onClick: () => setWindowMode('7d') }, '🔵 近 7 天')
             )
           ),
           el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--dsw-alias-state-success-primary)' } },
-            el('span', { className: 'mcm-status-dot ok' }),
-            el('span', null, '前台 5s 自动刷新流')
+            el('span', { className: 'mcm-status-dot ' + (props.healthError ? 'err' : 'ok') }),
+            el('span', null, props.healthError ? '连接中断' : '更新于 ' + new Date(health.digestAt).toLocaleTimeString()), btn('刷新统计', props.refreshHealth)
           )
         ),
         el('div', { className: 'mcm-metrics-grid' },
           el('div', { className: 'mcm-metric-card' },
-            el('span', { className: 'mcm-metric-label' }, windowMode === '30m' ? '近 30 分钟请求' : windowMode === '24h' ? '近 24 小时请求' : '7 天全周期请求'),
+            el('span', { className: 'mcm-metric-label' }, windowMode === '30m' ? '近 30 分钟请求' : windowMode === '24h' ? '近 24 小时请求' : '近7天保留记录'),
             el('span', { className: 'mcm-metric-value' }, totalRequests),
-            // digest 聚合是 7 天窗口口径；30m/24h 只按「最近活跃」过滤渠道，数值为该渠道 7 天累计
             el('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
-              digestRows !== null && windowMode !== '7d' ? '窗口内活跃渠道的 7 天累计（聚合口径）' : '真实上游交互捕获')
+              '按实际调用时间统计 · 每桶最多保留300条')
           ),
           el('div', { className: 'mcm-metric-card' },
             el('span', { className: 'mcm-metric-label' }, '总 Token 用量'),
@@ -1429,6 +1266,8 @@ window.__ModuleLoader__.load({
       const [channels, setChannels] = useState(null)
       const [channelsDraft, setChannelsDraft] = useState(null)
       const [health, setHealth] = useState(null)
+      const [healthError, setHealthError] = useState(null)
+      const healthFlight = useRef(null)
 
       const unwrap = (resp) => {
         const r = resp && resp.result ? resp.result : resp
@@ -1450,28 +1289,21 @@ window.__ModuleLoader__.load({
         const d = unwrap(resp)
         return ((d && d.namespaces) || []).find((n) => n && n.ns === ns) || null
       }
-      // 带 revision 的保存 + 「自噪声冲突」自动重试（0.3.14）：
-      //
-      // 为什么必须这样：本插件的 settings 行（model-channel-manager）同时承载健康投影，
-      // 宿主每 5s 的 digest 叶写都会改动该行的 raw config；而 describe() 的 revision
-      // 正是「raw config 的 JSON 指纹」（dsh-settings：revision += raw !== previous.raw）。
-      // 于是 client 手里那份 revision 在几秒内必然过期，保存被 settings/conflict 拒绝——
-      // 提示里的「其他页面修改」其实是插件自己写的健康数据。
-      //
-      // 策略：① 每次写入前取最新 revision（消除过期）；② 仍冲突时比较远端值与我们加载时
-      // 的基线：没变 = 纯 revision 噪声 → 用新 revision 重试；真的变了 = 真冲突 → 报错。
+      // Check the loaded field baseline before using a fresh revision; unrelated changes may retry.
       const saveWithRevisionRetry = async ({ ns, baseline, remoteOf, write, conflictMessage, attempts = 3 }) => {
         let lastError = null
         for (let attempt = 0; attempt < attempts; attempt++) {
           const desc = await readNsDesc(ns).catch(() => null)
-          const rev = desc && typeof desc.revision === 'number' ? desc.revision : undefined
+          if (!desc || typeof desc.revision !== 'number') throw new Error('无法读取配置版本，请刷新后重试')
+          if (!sameJson(remoteOf(desc), baseline)) throw new Error(conflictMessage)
+          const rev = desc.revision
           const r = await write(rev)
           if (!(r && r.ok === false)) return r
           lastError = r.error
           if (!isConflict(r.error)) throw new Error((r.error && (r.error.message || r.error)) || (ns + ' save failed'))
           const now = await readNsDesc(ns).catch(() => null)
           if (!sameJson(remoteOf(now), baseline)) throw new Error(conflictMessage)
-          // 远端未变：属于插件自身健康写入造成的 revision 噪声 → 取新 revision 重试
+          // Only retry while the fields being edited still match the loaded baseline.
         }
         throw new Error(conflictMessage.replace(/，请点「刷新」后重试/, '') + '（已自动重试 ' + attempts + ' 次仍未成功）' + (lastError ? '：' + String(lastError.message || lastError) : ''))
       }
@@ -1491,7 +1323,7 @@ window.__ModuleLoader__.load({
         return out
       }
 
-      const refresh = () => {
+      const refresh = (reset = false) => {
         if (!apiRef) return
         apiRef.settings.describe({}).then((resp) => {
           const d = unwrap(resp)
@@ -1506,17 +1338,10 @@ window.__ModuleLoader__.load({
           // revision 记录（审计 F05）：保存时作为 expectedRevision 传给宿主，
           // 别处（另一个标签页/host 侧）改过配置则宿主拒绝，防止旧快照覆盖
           setState({ providers, userProviders, providerOrder: savedOrder || [], nsRevisions: { piAi: (ns && ns.revision) || 0, channels: (cn && cn.revision) || 0 } })
-          setDraft((prev) => prev || clone(providers))
+          setDraft((prev) => reset ? clone(providers) : prev || clone(providers))
           const ch = (cn && cn.value && cn.value.groups) || []
           setChannels(ch)
-          setChannelsDraft((prev) => prev || clone(ch))
-          const hn = findNs('model-channel-health')
-          // 0.3.1：健康权威数据在 host 的 storageDomain；client 只接收小投影 digest。
-          // 兼容旧 host（无 digest 字段）时回落到 records 原始视图，避免升级窗口白屏。
-          const hv = (hn && hn.value) || {}
-          setHealth(hv.digest || (hv.digestAt !== undefined)
-            ? { digest: hv.digest || [], digestAt: hv.digestAt || 0, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} }
-            : (hn ? { records: hv.records || {}, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} } : null))
+          setChannelsDraft((prev) => reset ? clone(ch) : prev || clone(ch))
           setReady(true) // describe 成功：保存解禁（F04 的门）
         }).catch((e) => { setNotice('加载失败: ' + String(e)); setReady(false) })
       }
@@ -1524,25 +1349,23 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         refresh()
       }, [])
-      // 健康页签激活时才 5s 静默轮询（仅拉健康命名空间），切走即停，避免后台常驻全量 describe
+      const refreshHealth = async () => {
+        if (!apiRef || healthFlight.current) return
+        const controller = new AbortController()
+        healthFlight.current = controller
+        try {
+          const value = await apiRef.runtime('snapshot', {}, AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]))
+          if (!controller.signal.aborted) { setHealth(value); setHealthError(null) }
+        } catch (error) { if (!controller.signal.aborted) setHealthError(error.message) }
+        finally { if (healthFlight.current === controller) healthFlight.current = null }
+      }
       useEffect(() => {
         if (tab !== 'health') return
-        const pull = () => {
-          if (!apiRef) return
-          apiRef.settings.describe({}).then((resp) => {
-            const d = unwrap(resp)
-            const hn = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
-            if (hn && hn.value) {
-              const hv = hn.value
-              setHealth(hv.digest || (hv.digestAt !== undefined)
-                ? { digest: hv.digest || [], digestAt: hv.digestAt || 0, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} }
-                : { records: hv.records || {}, speedResults: hv.speedResults || {}, runtime: hv.runtime || {} })
-            }
-          }).catch(() => {})
-        }
+        const pull = () => { if (!document.hidden) void refreshHealth() }
         pull()
         const timer = setInterval(pull, 5000)
-        return () => clearInterval(timer)
+        document.addEventListener('visibilitychange', pull)
+        return () => { clearInterval(timer); document.removeEventListener('visibilitychange', pull); healthFlight.current?.abort(); healthFlight.current = null }
       }, [tab])
 
       const save = () => {
@@ -1715,10 +1538,6 @@ window.__ModuleLoader__.load({
           // （如遗留的 group-1）在下一次保存时自动归一，无需迁移
           groups: (channelsDraft || []).map((g) => Object.assign({}, g, { virtualModel: Object.assign({}, g.virtualModel, { name: g.id }) }))
         }, orderPatch)
-        // 0.3.14：本行同时承载健康投影，宿主每 5s 的 digest 叶写会不断推高它的 revision
-        // （revision = raw config 的 JSON 指纹）——旧实现用加载时的旧 revision，几乎必然
-        // 撞 settings/conflict，于是出现「部分保存：轮询组配置失败……点击多次才能成功」。
-        // 现在每次写入前取最新 revision；冲突时只有远端 groups/providerOrder 真的变了才报冲突。
         const p2 = saveWithRevisionRetry({
           ns: 'model-channels',
           baseline: { groups: channels || [], providerOrder: (state && state.providerOrder) || [] },
@@ -1758,20 +1577,20 @@ window.__ModuleLoader__.load({
             setState((s) => Object.assign({}, s, { providers: cleanProviders, userProviders: cleanProviders, providerOrder: Object.keys(cleanProviders) }))
           }
           setTimeout(() => setNotice(null), failed.length > 0 ? 8000 : 3000)
-          refresh()
+          if (failed.length === 0) refresh(true)
         }).finally(() => setSaving(false))
       }
 
       return el('div', { className: 'mcm-root' },
         el('div', { className: 'mcm-header' },
           el('div', { className: 'mcm-nav' },
-            el('div', { className: 'mcm-nav-item' + (tab === 'config' ? ' active' : ''), onClick: () => setTab('config') }, '提供商与模型'),
-            el('div', { className: 'mcm-nav-item' + (tab === 'roundrobin' ? ' active' : ''), onClick: () => setTab('roundrobin') }, '故障转移轮询组'),
-            el('div', { className: 'mcm-nav-item' + (tab === 'health' ? ' active' : ''), onClick: () => setTab('health') }, '全局健康统计')
+            el('button', { type: 'button', className: 'mcm-nav-item' + (tab === 'config' ? ' active' : ''), onClick: () => setTab('config') }, '提供商与模型'),
+            el('button', { type: 'button', className: 'mcm-nav-item' + (tab === 'roundrobin' ? ' active' : ''), onClick: () => setTab('roundrobin') }, '故障转移轮询组'),
+            el('button', { type: 'button', className: 'mcm-nav-item' + (tab === 'health' ? ' active' : ''), onClick: () => setTab('health') }, '全局健康统计')
           ),
           el('div', { className: 'mcm-actions' },
             notice ? el('span', { style: { fontSize: 12, color: notice.includes('失败') ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)' } }, notice) : null,
-            btn('刷新', refresh),
+            btn('重新加载配置', () => refresh(true)),
             el('button', {
               className: 'mcm-btn primary',
               // F04：未就绪/保存中禁用；disabled 态样式弱化
@@ -1784,7 +1603,7 @@ window.__ModuleLoader__.load({
         el('div', { className: 'mcm-body' },
           tab === 'config' ? el(ModelConfigPanel, { _state: state, _draft: draft, _setDraft: setDraft, _setNotice: setNotice, _renameProviderInChannels: renameProviderInChannels }) :
           tab === 'roundrobin' ? el(RoundrobinPanel, { channels, channelsDraft, setChannelsDraft, _providers: (draft || (state ? state.providers : {})), _setNotice: setNotice }) :
-          el(HealthPanel, { health, _providers: (draft || (state ? state.providers : {})) })
+          el(HealthPanel, { health, healthError, refreshHealth, _providers: (draft || state?.providers || {}) })
         )
       )
     }
@@ -1793,7 +1612,7 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       // dsh 0.2：远程调用面为 ctx.remote（connection.api 已移除）。保留 0.1 的调用形状，
       // 由下面的适配层把位置参数/RemoteResult 还原成旧的 {result:{ok,value}} 与对象入参。
-      ctx.inject(['remote'], (scope) => { apiRef = makeLegacyApi(scope.remote) })
+      ctx.inject(['remote', 'connection'], (scope) => { apiRef = makeLegacyApi(scope.remote, scope.connection); scope.effect(() => () => { apiRef = null }) })
       ctx.effect(() => {
         const tag = document.createElement('style')
         tag.dataset.mcmStyle = ''
@@ -1812,6 +1631,6 @@ window.__ModuleLoader__.load({
       ))
     }
 
-    return { name: 'model-channel-manager', inject: ['slots', 'remote', 'remote.settings', 'remote.credentials', 'remote.llm'], apply }
+    return { name: 'model-channel-manager', inject: ['slots', 'connection', 'remote', 'remote.settings', 'remote.credentials', 'remote.llm'], apply }
   },
 })

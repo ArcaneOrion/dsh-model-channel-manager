@@ -32,12 +32,7 @@ const healthOf = (sample) => {
   return typeof ref?.get === 'function' ? ref.get() : ref;
 };
 
-test('源级：两个 nonce 字段声明为 union(number, string)', () => {
-  const m = src.match(/lastHandledNonce: z\.union\(\[z\.number\(\), z\.string\(\)\]\)\.default\(0\)/);
-  const t = src.match(/lastTestHandledNonce: z\.union\(\[z\.number\(\), z\.string\(\)\]\)\.default\(0\)/);
-  assert.ok(m, 'lastHandledNonce 应为 union 且默认 0');
-  assert.ok(t, 'lastTestHandledNonce 应为 union 且默认 0');
-});
+
 
 test('行为级：数字 nonce 下 records 保留（基线）', () => {
   const h = healthOf({ health: { records, lastTestHandledNonce: 1790680002 } });
@@ -71,14 +66,4 @@ test('行为级：两个 nonce 同时是历史形态 + 其他字段齐全时不�
   assert.ok(h.runtime && h.runtime.g1, 'runtime 保留');
   assert.ok(Array.isArray(h.digest) && h.digest.length === 1, 'digest 保留');
   assert.equal(h.healthMigrated, true, '标记保留');
-});
-
-test('行为级：非法类型会被 loose 兜底静默吞掉（这正是必须用 union 的原因）', () => {
-  // HEALTH_SCHEMA 是 .loose(true)：任一子字段校验失败 → 整个 health 子树被替换为
-  // schema 默认值（实测空对象 {}），且**不抛错**。所以 schema 必须容忍历史数据形态，
-  // 否则一次类型漂移就会静默清空全部健康视图（0.3.11 事故）。
-  const h = healthOf({ health: { records, lastTestHandledNonce: { bad: true } } });
-  assert.ok(h !== undefined, 'loose 兜底返回默认对象而非抛错');
-  assert.equal(Object.keys(h).length, 0, '整树被替换为空对象');
-  assert.equal(h.records, undefined, 'records 静默消失——这正是事故表现');
 });

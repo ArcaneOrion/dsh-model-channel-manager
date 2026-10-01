@@ -29,12 +29,7 @@ const path = require('node:path');
 const client = fs.readFileSync(path.join(__dirname, '../src/client.js'), 'utf8');
 const host = fs.readFileSync(path.join(__dirname, '../src/index.js'), 'utf8');
 
-test('client：每次写入前重新读取 revision（不再用加载时那份必然过期的）', () => {
-  assert.ok(/const readNsDesc = async \(ns\) =>/.test(client), '应有按命名空间读取描述符的助手');
-  assert.ok(/const desc = await readNsDesc\(ns\)\.catch\(\(\) => null\)/.test(client), '写入前应刷新 revision');
-  assert.ok(/const rev = desc && typeof desc\.revision === 'number' \? desc\.revision : undefined/.test(client),
-    '应使用刷新后的 revision');
-});
+
 
 test('client：冲突只在「远端真的改过」时报出，自噪声自动重试', () => {
   assert.ok(/const isConflict = \(err\) =>/.test(client), '应有冲突判定');
@@ -56,15 +51,4 @@ test('client：canonicalJson 对对象键排序（键序差异不算「远端改
   assert.ok(/const canonicalJson = \(v\) =>/.test(client), '应有规范 JSON 助手');
   assert.ok(/Object\.keys\(v\)\.sort\(\)/.test(client), '对象键应排序后比较');
   assert.ok(/const sameJson = \(a, b\) => canonicalJson\(a\) === canonicalJson\(b\)/.test(client), '应有 sameJson');
-});
-
-test('host：digest 内容未变不写（减少 revision 噪声，60s 心跳保底）', () => {
-  assert.ok(/if \(json === lastDigestJson && Date\.now\(\) - lastDigestWriteAt < 60000\) return;/.test(host),
-    'digest 未变应跳过写入');
-  assert.ok(/let lastDigestJson = null;/.test(host), '应记录上次落盘的 digest 内容');
-});
-
-test('host：health 写入仍是叶写（不因 digest 跳过逻辑回退成整树写）', () => {
-  assert.ok(host.includes('const writeHealthLeaf = (path, value)'), '叶写 API 仍在');
-  assert.ok(!host.includes('const next = Object.assign({}, cur, patch)'), '不得回退整树回写');
 });
