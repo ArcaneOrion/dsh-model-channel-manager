@@ -130,7 +130,33 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 - 结果：`status:'ok'`（ttftMs/latencyMs/text）或 `status:'error'`（code/error）
 - 模型行内显示 ⏳→✓/✗ 状态标签（hover 见详情）
 
-> 注意：此通道依赖 host 半新代码。**旧 host（未重启）无 testRequest 处理器**，测试会一直「请求中」——client 现在约 66s 后超时报 `POLL_TIMEOUT` 并提示 host 未处理（不再无限轮询）。
+> 注意：此通道依赖 host 半新代码。**旧 host（未重启）无 testRequest 处理器**，测试会一直「请求中」——client 现在约 66s 后超时，并按现场区分提示：`POLL_TIMEOUT_RUNNING`（host 已收到、仍在执行：渠道慢或上游挂起）或 `POLL_TIMEOUT`（host 未写入结果：多为旧 host 未重启或写入失败）。
+>
+> 0.3.12 起终态判定同时接受 `finishedAt`：即使条目的 `status` 被并发写坏成 `running`，只要带 `finishedAt`/`code`/`error` 就按终态显示真实上游错误，不再误报「host 未处理」。
+
+## 任务通道完整性（0.3.12 重构：去重与写入语义）
+
+## 任务通道完整性（0.3.12 重构：去重与写入语义）
+
+0.3.11 线上症状「等待测试结果超时：host 可能未处理该请求」的两个真实成因，均在 0.3.12 修掉：
+
+- **去重不许做数值推断**：`handleTestRequest` / `reloadFromConfig`（测速）改用纯函数
+  `shouldConsumeNonce()`（导出，可在测试里直接断言判定表）——严格等值 + 已消费集合 +
+  已结算值 + 已有终态结果，四者任一命中即不消费。旧实现 `last = Math.max(lastTestHandledNonce,
+  claimedNonce)` 对随机 53-bit nonce 有 ≈50% 失效率（「上一轮 > 本轮」即失效），
+  于是同一请求在每次 `loader/volatile-update`（含宿主自己每 5s 的 digest 回写）都被重新消费：
+  重复上游请求（真实计费）+ 多次执行结果写进同一条目（线上物证：同 nonce 同时带
+  `code TIMEOUT / 60000ms` 与 `ok:true / text`，单次执行不可能）。
+- **health 子树一律叶写**：`writeHealth` 由「读整树 → 合并 → 整树写回」改为对 patch 命中的
+  顶层键逐个 `set`（path-ops），单键结果用 `writeHealthLeaf(['testResults', nonce], value)`；
+  client 侧 shim 同样不再 `describe` 快照 + 整树回写，直接下推 path-ops。整树回写的 payload 是
+  「调用时刻的快照」，晚于并发的终态落盘时会把 `status` 改回 `running`，而 `update` 的深合并
+  保留后写入的 `finishedAt/code/error` → 僵尸条目 → 客户端永远等不到终态。
+- client 终态判定加 `finishedAt`（写入后不可抹掉），并把 `ok` 归一成 `status` 显示真实错误。
+- 降级 nonce 路径改用安全整数随机数（旧 `Date.now()*1000+counter ≈ 1.8e18` 超出
+  `MAX_SAFE_INTEGER`，同毫秒可撞值；strict consume-once 下撞值 = 测试被静默丢弃）。
+
+回归：`tests/task-dedup.test.cjs`（判定表用真实导出，不复制实现）、`tests/testresult-fallback.test.cjs`（叶写语义 + 事故复现：终态后并发叶写不得改回 running）。
 
 ## 拉取上游（模型选择）
 
@@ -205,6 +231,25 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 30m/24h 健康视图是近似口径（按最近活跃过滤，数值为 7 天累计，UI 已标注）；精确分窗口
   需 host 出多份 digest
 
+### 0.3.12 审计已确认、尚未修（按严重度）
+
+均为 2026-10-01 只读审计结论（13 项），0.3.12 先修了其中最要命的两条（去重 guard、整树回写）：
+
+- **volatile 提交静默失败仍是放大器**：loader 的 `_commitVolatile` 在 `resolveConfig` 抛错时
+  只 `logger.warn` 后返回——document 已落盘、fiber 引用不更新、**不发 volatile-update**，
+  而宿主只在 volatile-update 里消费请求 → 请求被彻底忽略且无任何可见报错。当前 payload
+  校验通过，属潜在复发路径。建议：宿主加「未结算 nonce」兜底轮询 + 未消费显式日志。
+- **remount/dispose 会打断在飞的测试**：超时守卫挂在 `ctx.effect` 上，dispose 只 `clearTimeout`，
+  promise 永不 reject → `runModelTest` 挂死 → 终态永不写入（旧闭包的排队写入只进
+  `console.error`）。建议：守卫不挂 fiber effect，dispose 时补写 ABORTED 终态。
+- **60s（host）/66s（client）预算错配**：跑满 60s 时终态写入稍晚于 client giveUp。建议 host 收到
+  45s 或 client 放弃前比较 `lastTestHandledNonce` 再补一轮。
+- **health 写不带 `expectedRevision`**（配置域已带）：叶写后危害大幅降低（不同键互不覆盖），
+  但同一叶子仍无冲突检测。
+- 低危：`digest: []` 空数组会遮蔽 settings 里的旧 `records`；`migrateLegacyConfig` 直写未走
+  `outsideTransaction`（在事务内会抛 "cannot be nested" 并被空 catch 吞掉）；health-store 的
+  `eventKey = ts|provider|model` 会把同毫秒同渠道两笔当重复合并。
+
 ## 引擎超时与生命周期（0.3.3 重构：审计 F01/F02/F15 已修）
 
 - **per-attempt AbortController**：每次候选尝试独立 signal，用户取消转发（`relayAbort`，
@@ -251,6 +296,9 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 26. **`ctx.get(name)` 是宽松读，不代表可以访问服务（0.3.10 线上事故）**：Cordis 的服务属性访问经 Proxy 校验 inject——`ctx.get('storageDomain')` 直接查 store 返回裸服务（不校验 state/inject），但拿着这个未声明的 ctx 做 `ctx.storageDomain.open(...)` 会抛 `cannot get property "storageDomain" without inject`；若被 promise 链的 catch 吞掉，表现为「插件启动正常、domain 永远不打开、健康流水静默降级为内存」。**可选服务必须用响应式 inject**：`ctx.inject(['storageDomain'], (dctx) => { ... dctx.storageDomain ... })`——回调只在服务可用（state=2）时触发，缺席时插件照常工作；同时把插件主启动（`reloadFromConfig` + `boot`）放在 inject **之外**先跑，避免服务缺席时路由不注册。回归：`tests/domain-wiring.test.cjs`。
 27. **`settings.update` 的深合并清不掉旧键（0.3.10 修）**：`update` 走 `mergeLayers`，`{records: {}}` 覆盖已有对象是**深合并**——旧键原样保留。0.3.8 的迁移「清空 settings 旧流水」实际没删，`records` 一直留在 profile 里，每次 `describe`（client 5s 轮询全量命名空间）都要带着它。要真删除必须走 path-ops：`settings.mutate(ns, [{op:'unset', path:['health','records']}, ...])`（`isVolatilePath` 对 volatile 子树的后代返回 true，允许操作）。回归：`tests/domain-wiring.test.cjs`。
 28. **schema 类型漂移会静默清空整个 volatile 子树（0.3.11 线上事故，自己埋的）**：0.3.2 把 client nonce 改成 UUID 字符串、host 消费代码也兼容了字符串，**但没同步改 schema**——`lastTestHandledNonce: z.number()`。字符串一落盘，`HEALTH_SCHEMA` 解析时子字段抛错；而它是 `.loose(true)`，宽松兜底把**整个 health 子树换成默认空对象**（实测 `healthOf()` 返回 `{}`，不报错、不告警）。后果：`records`/`digest` 在运行时全部消失 → 存量迁移遍历空对象（什么都不导入）→ 清理逻辑以为「无残留」（旧键删不掉）→ 表现为「健康页没有历史数据」且旧 `records` 永久占据 profile。三条教训：① **写侧放宽类型时，schema 必须同步放宽**（用 `z.union([z.number(), z.string()])` 兼容历史值）；② **`.loose(true)` 的兜底是静默的**，volatile 子树里一个字段失配 = 整树数据不可见；③ **迁移标记不可信**——`migrateFrom` 改为「桶已存在时合并去重」而非整桶跳过，且「有存量必须先导入再清理」，这样即使 marker 被误写也能把旧账救回来。回归：`tests/health-schema-tolerance.test.cjs`。
+
+29. **去重不能依赖 nonce 的数值单调性（0.3.12）**：`last = Math.max(lastTestHandledNonce, claimedNonce)` 看似「取最新」，实则假设了 nonce 单调递增——而 0.3.2 起 nonce 是随机 53-bit，**「上一轮 > 本轮」时（≈50%）判等失效**，同一 testRequest 在每次 `loader/volatile-update`（包括宿主自己每 5s 的 digest 回写触发的那次）都被重新消费。症状是两级：① 上游被真实重复调用（计费）；② 多次执行的结果写进同一条目（线上物证：同 nonce 一条记录同时带 `code TIMEOUT / 60000ms` 与 `ok:true / text/ttftMs`，单次执行不可能）。**规则：去重只做严格等值 + 已消费集合 + 已结算值 + 已有终态，任何「大小推断」都是错的**。释放认领（notReady 重放）时必须同时释放已消费集合，否则重放被自己的去重挡住。回归：`tests/task-dedup.test.cjs`（判定表直接调用生产导出 `shouldConsumeNonce`）。
+30. **整树读-改-写会把并发终态「回灌」成旧值（0.3.12 线上事故）**：health 子树的每次写入都曾是 `cur = healthOf(); update({health:{...cur, patch}})`——payload 是调用时刻的**整树快照**。只要它晚于并发的终态写落盘，`status` 就被改回 `running`；而 `settings.update` 是深合并（只覆盖出现的键、不删键），后写入的 `finishedAt/code/error` 反而被保留 → 条目变成「running + 终态字段」的僵尸，客户端只认 `status==='ok'|'error'` 就永远等不到终态，66s 后误报「host 可能未处理该请求」。**规则：settings 里的共享子树一律叶写**（patch 命中的键逐个 `set`；单键结果用 `writeHealthLeaf(['testResults', nonce], value)`；修剪用 `unset` 而非整字典覆盖），client 侧同样不得「describe 快照 + 整树回写」。另：客户端终态判定要接受 `finishedAt`——状态位可能被写坏，但已经发生的终态字段不会消失。回归：`tests/testresult-fallback.test.cjs`（F4 直接复刻事故时序）。
 
 ## 0.3.11 修复后的自愈路径（无需手工清库）
 

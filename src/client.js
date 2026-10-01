@@ -23,8 +23,11 @@ window.__ModuleLoader__.load({
         const n = (words[0] & 0x1fffff) * 0x100000000 + words[1]
         return n === 0 ? 1 : n
       }
+      // 降级路径：旧写法 Date.now()*1000+counter ≈ 1.8e18 > MAX_SAFE_INTEGER，
+      // 同毫秒内可能撞值（且 strict consume-once 去重下撞值 = 测试被静默丢弃）。
       nonceFallbackCounter = (nonceFallbackCounter + 1) % 1000
-      return Date.now() * 1000 + nonceFallbackCounter
+      const n = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
+      return n === 0 ? nonceFallbackCounter + 1 : n
     }
 
     // dsh 0.2：客户端远程面由 connection.api 改为 ctx.remote；参数改为位置参数，结果统一为
@@ -34,11 +37,6 @@ window.__ModuleLoader__.load({
     const NS_MCM = 'model-channel-manager'
     const makeLegacyApi = (remote) => {
       const wrap = (res) => ({ result: res || { ok: false } });
-      const readMcm = async () => {
-        const res = await remote.settings.describe()
-        if (!res || res.ok !== true) return null
-        return ((res.value && res.value.namespaces) || []).find((n) => n && n.ns === NS_MCM) || null
-      }
       return {
         settings: {
           describe: async () => {
@@ -60,45 +58,31 @@ window.__ModuleLoader__.load({
             const patch = (args && args.patch) || {}
             const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
             if (ns === 'model-channels') return wrap(await remote.settings.update(NS_MCM, patch, expected))
-            const row = await readMcm()
-            const health = (row && row.value && row.value.health) || {}
-            return wrap(await remote.settings.update(NS_MCM, { health: Object.assign({}, health, patch) }, expected))
+            // 0.3.12：health 子树改成「叶写」（path-ops），不再 describe 快照 + 整树回写。
+            // 旧写法在 read→write 的两次 RPC 之间有窗口：宿主刚写入的终态会被旧快照覆盖
+            // （线上事故：testResults[nonce].status 被改回 running，finishedAt/code/error 却保留，
+            //  客户端永远等不到终态 → 66s 后误报「host 未处理」）。
+            const ops = Object.entries(patch).map(([k, v]) => ({ op: 'set', path: ['health', k], value: v }))
+            if (ops.length === 0) return { result: { ok: true, value: null } }
+            return wrap(await remote.settings.mutate(NS_MCM, ops, expected))
           },
-          // 旧签名：mutate({ ns, ops })——0.2 只对真实行命名空间提供 path-ops；
-          // 本插件自身的健康子树用合并写实现等价语义。
+          // 旧签名：mutate({ ns, ops })——health 子树现在也走真实 path-ops（不再本地模拟整树写）
           mutate: async (args) => {
             const ns = (args && args.ns) || NS_MCM
             const ops = (args && args.ops) || []
             const expected = (args && args.expectedRevision !== undefined) ? args.expectedRevision : undefined
-            if (ns !== 'model-channels' && ns !== 'model-channel-health' && ns !== NS_MCM) {
-              return wrap(await remote.settings.mutate(ns, ops, expected))
-            }
-            const row = await readMcm()
-            const health = Object.assign({}, (row && row.value && row.value.health) || {})
-            const top = {
-              groups: (row && row.value && row.value.groups) || [],
-              providerOrder: (row && row.value && row.value.providerOrder) || [],
-            }
+            if (ns === NS_MCM) return wrap(await remote.settings.mutate(NS_MCM, ops, expected))
+            const prefix = (ns === 'model-channels') ? [] : ['health']
+            const mapped = []
             for (const op of ops) {
               const path = (op && op.path) || []
-              const root = (ns === 'model-channels') ? (path[0] === 'groups' ? top : (path[0] === 'providerOrder' ? top : health)) : health
               if (path.length === 0) continue
-              const key = path[0]
-              const rest = path.slice(1)
-              if (rest.length === 0) {
-                if (op.op === 'set') root[key] = op.value
-                else delete root[key]
-              } else if (rest.length === 1) {
-                const child = Object.assign({}, root[key] || {})
-                if (op.op === 'set') child[rest[0]] = op.value
-                else delete child[rest[0]]
-                root[key] = child
-              }
+              // legacy 混合命名空间：groups/providerOrder 属于行顶层，其余视为 health 子键
+              const p = (ns === 'model-channels' && (path[0] === 'groups' || path[0] === 'providerOrder')) ? path : [...prefix, ...path]
+              mapped.push({ op: (op && op.op) || 'set', path: p, value: op && op.value })
             }
-            if (ns === 'model-channels') {
-              return wrap(await remote.settings.update(NS_MCM, { groups: top.groups, providerOrder: top.providerOrder }, expected))
-            }
-            return wrap(await remote.settings.update(NS_MCM, { health }, expected))
+            if (mapped.length === 0) return { result: { ok: true, value: null } }
+            return wrap(await remote.settings.mutate(NS_MCM, mapped, expected))
           },
         },
         credentials: {
@@ -582,18 +566,26 @@ window.__ModuleLoader__.load({
       const pollTest = (nonce, provider, model, attempt = 0) => {
         if (!apiRef) return
         const key = provider + '::' + model
-        // host 侧测试超时 60s，约 55 次 × 1.2s ≈ 66s 后放弃，避免结果被覆盖时无限轮询
-        const giveUp = () => setTestStates((s) => Object.assign({}, s, { [key]: { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 可能未处理该请求（host 半更新后需重启 DSH）' } }))
+        // host 侧测试超时 60s，约 55 次 × 1.2s ≈ 66s 后放弃，避免结果被覆盖时无限轮询。
+        // 0.3.12：放弃时区分「host 没写结果」与「host 还在跑」，不再一律甩锅「未处理/需重启」。
+        const giveUp = (e) => setTestStates((s) => Object.assign({}, s, { [key]: (e && e.status === 'running')
+          ? { status: 'error', code: 'POLL_TIMEOUT_RUNNING', error: '测试仍在执行（约 66 秒未返回结果）：host 已收到请求，可能是渠道慢或上游挂起；稍后可在健康统计里核对' }
+          : { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 未写入结果（可能 host 未重启到新版，或结果写入失败）' } }))
         apiRef.settings.describe({}).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           const d = r && r.value !== undefined ? r.value : r
           const ns = ((d && d.namespaces) || []).find((n) => n && n.ns === 'model-channel-health')
           const tr = (ns && ns.value && ns.value.testResults) || {}
           const e = tr[nonce]
-          if (e && (e.status === 'ok' || e.status === 'error')) {
-            setTestStates((s) => Object.assign({}, s, { [key]: e }))
+          // 终态判定不能只看 status：整树快照回写曾把 status 改回 running 而保留
+          // finishedAt/code/error（0.3.11 事故）。finishedAt 写入后不会被抹掉，把它也当终态，
+          // 并按 ok 归一 status —— 这样「僵尸条目」也能显示真实的上游错误而不是假超时。
+          const terminal = !!(e && (e.status === 'ok' || e.status === 'error' || e.finishedAt))
+          if (terminal) {
+            const norm = (e.status === 'ok' || e.status === 'error') ? e : Object.assign({}, e, { status: e.ok === true ? 'ok' : 'error' })
+            setTestStates((s) => Object.assign({}, s, { [key]: norm }))
           } else if (attempt >= 55) {
-            giveUp()
+            giveUp(e)
           } else {
             setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1200)
           }

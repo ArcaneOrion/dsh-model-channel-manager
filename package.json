@@ -1,6 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -56,7 +56,9 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": ["slots"],
+      "inject": [
+        "slots"
+      ],
       "platform": "web"
     }
   }

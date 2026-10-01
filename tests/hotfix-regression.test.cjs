@@ -35,11 +35,14 @@ test('F03 nonce：安全整数随机 nonce（兼容旧 host number schema）', (
   assert.ok(!/Date\.now\(\) % 1000000000/.test(client), 'client 不应再用时间戳取模');
   assert.ok(/const createNonce = \(\) =>/.test(client), '统一 nonce 工厂应存在');
   assert.ok(/crypto\.getRandomValues/.test(client), '优先用 crypto 随机数，跨标签低碰撞');
-  assert.ok(/return Date\.now\(\) \* 1000 \+ nonceFallbackCounter/.test(client), '无 crypto 时同毫秒计数降级');
+  // 0.3.12：降级路径也必须是安全整数（旧 Date.now()*1000+counter 超出 MAX_SAFE_INTEGER，
+  // 同毫秒可能撞值；strict consume-once 去重下撞值 = 测试被静默丢弃）
+  assert.ok(/Number\.MAX_SAFE_INTEGER/.test(client), '无 crypto 时降级到安全整数随机数');
+  assert.ok(!/Date\.now\(\) \* 1000 \+ nonceFallbackCounter/.test(client), '降级路径不得再用超出安全范围的表达式');
   assert.ok(/const nonce = createNonce\(\)/.test(client), '测试/测速都应使用同一工厂');
-  // host 仍兼容 number/string（旧/新 client 混部窗口）
+  // host 仍兼容 number/string（旧/新 client 混部窗口），0.3.12 起收敛到统一的 nonceKey
   const testSide = /nonceOf = \(v\) => \(typeof v === 'number' \|\| typeof v === 'string'\)/.test(host);
-  const speedSide = /typeof \(req && req\.nonce\) === 'number' \|\| typeof \(req && req\.nonce\) === 'string'/.test(host);
+  const speedSide = /nonceKey\(req && req\.nonce\)/.test(host);
   assert.ok(testSide, 'handleTestRequest 应兼容双类型');
   assert.ok(speedSide, 'speedRequest 消费应兼容双类型');
 });

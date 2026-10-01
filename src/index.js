@@ -38,6 +38,30 @@ export const Config = z.object({
     effortMemory: z.dict(z.string()).default({}).volatile(),
     health: HEALTH_SCHEMA.volatile(),
 }).loose(true);
+// ---------- 任务请求的 consume-once 判定（纯函数，便于回归测试） ----------
+// nonce 规范化为字符串键：number（现行 client 的随机 53-bit 整数）与 string（0.3.2–0.3.8 的 UUID）
+// 都能比较；非法形态返回 null。
+export const nonceKey = (v) => (typeof v === 'number' || typeof v === 'string') ? String(v) : null;
+// schema 默认值 0 表示「从未处理过」，不能当一个真实 nonce 用
+export const settledNonceKey = (v) => {
+    const k = nonceKey(v);
+    return (k === null || k === '0') ? null : k;
+};
+/**
+ * 是否应当消费这个 nonce（唯一入口，测试与测速共用）。
+ * 关键点：只用「严格等值 + 已消费集合」，不做任何数值大小推断——
+ * 旧实现用 Math.max(…) 比较数值大小来判等，而 nonce 是随机 53-bit，
+ * 「上一轮 > 本轮」时（≈50%）guard 失效，同一请求会在每次 volatile-update
+ * 被重新消费（重复上游请求 + 结果条目互相污染）。
+ * hasTerminal 为真（finishedAt / status ok|error）时也视为已消费：结果已落地，
+ * 重放只会得到重复计费与覆盖。
+ */
+export function shouldConsumeNonce({ consumed, key, claimed, settled, hasTerminal }) {
+    if (key === null || key === undefined) return false;
+    if (hasTerminal) return false;
+    if (key === claimed || key === settled) return false;
+    return !consumed.has(key);
+}
 export function apply(ctx, config) {
     // 本行在 profile 中的 entry id 就是 settings 命名空间；缺失时回落到包名。
     const SELF_NS = (ctx.fiber && ctx.fiber.entry && ctx.fiber.entry.options && ctx.fiber.entry.options.id) || 'model-channel-manager';
@@ -950,14 +974,21 @@ export function apply(ctx, config) {
     }
     function handleTestRequest(next) {
         const req = next.testRequest;
-        // nonce 统一为字符串 UUID（0.3.2 起 client 换 randomUUID，防同毫秒碰撞）；
-        // 旧数字 nonce（Date.now()%1e9）仍被接受：typeof 兼容两种，比较用 !==。
+        // nonce 接受 number（现行 client 的随机 53-bit 整数）与 string（0.3.2–0.3.8 的 UUID）
+        // 两种历史形态；去重一律按字符串键严格比较，不再做数值大小推断。
         const nonceOf = (v) => (typeof v === 'number' || typeof v === 'string') ? v : null;
         const reqNonce = nonceOf(req && req.nonce);
-        const lastNum = typeof next.lastTestHandledNonce === 'number' ? next.lastTestHandledNonce : null;
-        const last = lastNum !== null ? Math.max(lastNum, typeof claimedTestNonce === 'number' ? claimedTestNonce : 0) : (claimedTestNonce || null);
-        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || reqNonce === null || reqNonce === last)
+        const reqKey = nonceKey(reqNonce);
+        const claimedKey = nonceKey(claimedTestNonce);
+        const settled = settledNonceKey(next.lastTestHandledNonce);
+        const entry = reqKey !== null ? (next.testResults || {})[reqKey] : null;
+        // 终态判定用 finishedAt（写入后不会被覆盖），不只信 status：
+        // 整树快照回写曾把 status 改回 running 却保留 finishedAt/code/error（0.3.11 事故）。
+        const hasTerminal = !!(entry && (entry.finishedAt || entry.status === 'ok' || entry.status === 'error'));
+        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string'
+            || !shouldConsumeNonce({ consumed: consumedTestNonces, key: reqKey, claimed: claimedKey, settled, hasTerminal }))
             return;
+        markConsumed(consumedTestNonces, reqKey);
         claimedTestNonce = reqNonce;
         // nonce 的落盘推迟到本次测试得出结论之后：只有「真跑过」才算 handled。
         // 启动早于凭据服务就绪时会以 MISSING_CREDENTIAL 失败，那要释放认领重试；
@@ -967,23 +998,28 @@ export function apply(ctx, config) {
                 bus.writeHealth({ lastTestHandledNonce: reqNonce }).catch((e) => console.error('[model-channel-manager] lastTestHandledNonce 写入失败:', e));
             return setResult(entry);
         };
-        // 0.2 的配置写入是「整字段落盘」，不再有 path-ops；结果集按当前值合并后整段写回。
+        // 0.3.12：结果按「单键叶写」落盘（path-ops），不再把整个 testResults 读出来整段写回。
+        // 整段写回的 payload 是调用时刻的快照，落盘晚于并发的终态写时会把该 nonce 的
+        // status 改回 running（深合并保留 finishedAt/code/error）——线上事故的直接成因。
+        // 叶写只动这一个 nonce 的条目，物理上不可能覆盖别人的、也不可能自我回退。
         const setResult = async (entry) => {
             const key = String(reqNonce);
             const value = Object.assign({}, entry, { nonce: reqNonce, provider: req.provider, model: req.model });
-            const cur = healthOf().testResults || {};
             if (bus !== null)
-                await bus.writeHealth({ testResults: Object.assign({}, cur, { [key]: value }) }).catch((e) => console.error('[model-channel-manager] testResults 写入失败:', e));
+                await bus.writeHealthLeaf(['testResults', key], value).catch((e) => console.error('[model-channel-manager] testResults 写入失败:', e));
         };
-        // 修剪低频执行：只在条目数超限时砍到 50（不在每次写入时整包重写）
+        // 修剪低频执行：只在条目数超限时砍到 50。用 unset 叶删（update 的深合并删不掉键）
         const maybePrune = () => {
             const all = healthOf().testResults || {};
             const entries = Object.entries(all);
             if (entries.length <= 50) return;
-            const kept = {};
-            for (const [k, v] of entries.sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0)).slice(0, 50)) kept[k] = v;
-            if (bus !== null)
-                bus.writeHealth({ testResults: kept }).catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
+            const removed = entries
+                .sort((a, b) => ((b[1] && b[1].finishedAt) || 0) - ((a[1] && a[1].finishedAt) || 0))
+                .slice(50)
+                .map(([k]) => k);
+            if (removed.length === 0 || bus === null) return;
+            bus.writeHealthOps(removed.map((k) => ({ op: 'unset', path: ['health', 'testResults', k] })))
+                .catch((e) => console.error('[model-channel-manager] testResults 修剪失败:', e));
         };
         const done = async (r) => {
             try {
@@ -1000,6 +1036,7 @@ export function apply(ctx, config) {
             if (notReady(e)) {
                 // 凭据服务尚未就绪（典型是启动瞬间的重放）：不写成假 error，释放认领并延后重试
                 claimedTestNonce = null;
+                releaseConsumed(consumedTestNonces, reqKey); // 释放后才能靠重放再消费
                 scheduleReplay('test', () => reloadFromConfig(false));
                 return;
             }
@@ -1142,8 +1179,27 @@ export function apply(ctx, config) {
     let runtimeRestored = false;
     // 非持久去重：回写要等当前 HMR 事务结束才落盘，这中间 volatile-update 可能带着同一个 nonce 再来，
     // 内存里先认领，避免同一请求被重复执行（并顺带消掉重复的回写风暴）。
+    //
+    // 0.3.12：改为严格 consume-once（字符串键集合），不再依赖 nonce 的数值单调性。
+    // 旧实现 last = Math.max(上一轮结算值, 本次认领值)，而两个 nonce 都是随机 53-bit：
+    // 「上一轮 > 本轮」时判等直接失效（≈50%），于是测试在每次 loader/volatile-update
+    // （包括宿主自己每 5s 的 digest 回写）都被重新消费——重复上游请求（真实计费）
+    // 且结果条目互相污染。线上物证：同 nonce 一条记录同时带
+    // `code TIMEOUT / 60000ms` 与 `ok:true / text`（单次执行不可能）。
+    // 回归见 tests/task-dedup.test.cjs。
     let claimedTestNonce = null; // string UUID 或旧数字；null = 未认领
     let claimedSpeedNonce = null; // string UUID 或旧数字；null = 未认领
+    const consumedTestNonces = new Set();  // 已消费过的 nonce 字符串键（含本次）
+    const consumedSpeedNonces = new Set();
+    const CONSUMED_NONCE_CAP = 256; // 上限：只用于防重复消费，不需要无限历史
+    const markConsumed = (set, key) => {
+        set.add(key);
+        if (set.size > CONSUMED_NONCE_CAP) {
+            const oldest = set.values().next().value;
+            set.delete(oldest);
+        }
+    };
+    const releaseConsumed = (set, key) => { if (key !== null) set.delete(key); };
     // 启动早于凭据服务就绪：此时重放测试/测速会以 MISSING_CREDENTIAL 失败。
     // 这类错误是「环境还没准备好」而不是「渠道故障」，必须释放认领、延后重试，不能写成假 error。
     const notReady = (e) => {
@@ -1187,23 +1243,26 @@ export function apply(ctx, config) {
                 runtime.delete(id);
         rewireRoutes();
         const req = health.speedRequest;
-        // nonce 兼容字符串 UUID / 旧数字（与 handleTestRequest 同一策略）
-        const speedNonce = (typeof (req && req.nonce) === 'number' || typeof (req && req.nonce) === 'string') ? req.nonce : null;
-        const lastNum = typeof health.lastHandledNonce === 'number' ? health.lastHandledNonce : null;
-        const last = lastNum !== null ? Math.max(lastNum, typeof claimedSpeedNonce === 'number' ? claimedSpeedNonce : 0) : (claimedSpeedNonce || null);
-        if (req && typeof req.group === 'string' && speedNonce !== null && speedNonce !== last) {
-            claimedSpeedNonce = speedNonce;
+        // 与 handleTestRequest 同一策略：nonce 兼容字符串/数字，去重按字符串键严格等值
+        const speedKey = nonceKey(req && req.nonce);
+        const speedClaimed = nonceKey(claimedSpeedNonce);
+        const speedSettled = settledNonceKey(health.lastHandledNonce);
+        if (req && typeof req.group === 'string'
+            && shouldConsumeNonce({ consumed: consumedSpeedNonces, key: speedKey, claimed: speedClaimed, settled: speedSettled, hasTerminal: false })) {
+            markConsumed(consumedSpeedNonces, speedKey);
+            claimedSpeedNonce = req.nonce;
             const cfgRow = pullConfig().groups.find((g) => g.id === req.group);
             // nonce 落盘推迟到本次测速得出结论之后（同 handleTestRequest 的理由）：
             // 提前写会把「没就绪」的重试用自己的持久值挡掉。
             const settleSpeed = () => {
                 if (bus !== null)
-                    bus.writeHealth({ lastHandledNonce: speedNonce }).catch(() => { });
+                    bus.writeHealth({ lastHandledNonce: req.nonce }).catch(() => { });
             };
             if (cfgRow)
                 runSpeedTest(cfgRow).then((r) => {
                     if (r && r.deferred) {
                         claimedSpeedNonce = null;
+                        releaseConsumed(consumedSpeedNonces, speedKey);
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
@@ -1212,6 +1271,7 @@ export function apply(ctx, config) {
                 }).catch((e) => {
                     if (notReady(e)) {
                         claimedSpeedNonce = null;
+                        releaseConsumed(consumedSpeedNonces, speedKey);
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
@@ -1247,17 +1307,25 @@ export function apply(ctx, config) {
             healthWrites = queued.catch(() => { });
             return queued;
         };
+        // 0.2 的 health 子树写入曾用「整树读-改-写」（cur = healthOf(); update({health:{...cur, patch}})）。
+        // 只要内存视图落后于已提交的行（volatile 提交与事件之间有窗口），旧快照就会把新值写回去：
+        // 线上物证是终态写入后 status 又被改回 running（同一 nonce 同时有 finishedAt/error 与 running）。
+        // 0.3.12 起一律「叶写」：patch 里出现的每个顶层键单独 set，不再回灌未见过的值。
+        // 需要只动某个子键时用 writeHealthLeaf（如 testResults.<nonce>）。
         const writeHealth = (patch) => enqueueHealthWrite(async () => {
-            const cur = healthOf();
-            const next = Object.assign({}, cur, patch);
-            return outsideTransaction(() => settings.update(SELF_NS, { health: next }));
+            const ops = Object.keys(patch || {}).map((k) => ({ op: 'set', path: ['health', k], value: patch[k] }));
+            if (ops.length === 0) return;
+            return outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined));
         });
         // path-ops 写入：update 是深合并，空对象清不掉旧键；需要真删除时走 mutate。
         const writeHealthOps = (ops) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined)));
+        // 单叶写入：把 value 精确写到 health.<path...>，不读、不带任何快照
+        const writeHealthLeaf = (path, value) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, [{ op: 'set', path: ['health', ...path], value }], undefined)));
         bus = {
             settings,
             writeHealth,
             writeHealthOps,
+            writeHealthLeaf,
             cfgScope: { get: () => cfgOf() },
             healthScope: { get: () => healthOf() },
         };
