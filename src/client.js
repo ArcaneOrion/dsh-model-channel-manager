@@ -1124,6 +1124,11 @@ window.__ModuleLoader__.load({
       let totalTokIn = 0
       let totalTokOut = 0
       let totalTokCache = 0
+      // allEvents 必须在两个分支前声明：旧 host 兼容路径（digest 缺失）会在
+      // else 块里赋值它（供顶部指标卡用）；若在此处之后才 let 声明，
+      // 赋值撞未声明变量 → ReferenceError 白屏（host 重启首次加载、digest
+      // 尚未生成时正是此路径）。这是 0.3.1 引入双路径时的遗漏。
+      let allEvents = []
 
       if (digestRows !== null) {
         // ---------- digest 投影路径 ----------
@@ -1231,8 +1236,7 @@ window.__ModuleLoader__.load({
       }
 
       // 顶部指标卡：digest 路径用聚合值求和，旧路径用原始事件计数
-      // （allEvents 提升到函数级：旧 host 回落路径的 else 块在此作用域外定义它）
-      let allEvents = []
+      // （allEvents 已在上方分支前声明）
       let totalRequests = 0
       let totalSuccess = 0
       let ttftWeightedSum = 0
