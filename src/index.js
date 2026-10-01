@@ -1177,6 +1177,8 @@ export function apply(ctx, config) {
     // digest：写进 settings health 子树的小投影（client 健康页渲染用）。
     // 聚合上移 host，client 不再拉原始流水全量 describe——settings 里不再出现 records。
     let digestTimer = null;
+    let lastDigestJson = null;   // 上次落盘的 digest 内容（相同则跳过，减少 revision 噪声）
+    let lastDigestWriteAt = 0;
     const DIGEST_INTERVAL = 5000;
     const buildDigest = () => {
         // 与旧 client HealthPanel 聚合口径一致：total/success/ttft/latency/token（计费口径
@@ -1220,7 +1222,16 @@ export function apply(ctx, config) {
     const flushDigest = () => {
         digestTimer = null;
         if (bus !== null) {
-            bus.writeHealth({ digest: buildDigest(), digestAt: Date.now() }).catch(() => { });
+            const digest = buildDigest();
+            // 0.3.14：内容没变就不写。settings 行的 revision 是 raw config 的 JSON 指纹
+            // （dsh-settings describe：revision += raw !== previous.raw），每一次无意义的写
+            // 都会让 client 手里的 revision 过期，表现为保存时的 settings/conflict。
+            // 60s 心跳保证 digestAt 不会永远停住。
+            const json = JSON.stringify(digest);
+            if (json === lastDigestJson && Date.now() - lastDigestWriteAt < 60000) return;
+            lastDigestJson = json;
+            lastDigestWriteAt = Date.now();
+            bus.writeHealth({ digest, digestAt: Date.now() }).catch(() => { });
         }
     };
     const scheduleDigest = () => {

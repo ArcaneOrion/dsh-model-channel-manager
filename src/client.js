@@ -1435,6 +1435,46 @@ window.__ModuleLoader__.load({
         if (r && r.ok === false) throw new Error((r.error && (r.error.message || r.error)) || 'request failed')
         return r && r.value !== undefined ? r.value : r
       }
+      // 冲突判定：宿主以 settings/conflict 拒绝（dsh-settings 的 SettingsConflictError）
+      const isConflict = (err) => !!(err && (err.code === 'settings/conflict' || /conflict/i.test(String(err.message || ''))))
+      // 规范 JSON（对象键排序）——用于「远端是否真的改过我们关心的字段」的比较，
+      // 不受键序影响（providers/groups 的对象键序在落盘与投影之间可能不同）
+      const canonicalJson = (v) => {
+        if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']'
+        if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}'
+        return JSON.stringify(v === undefined ? null : v)
+      }
+      const sameJson = (a, b) => canonicalJson(a) === canonicalJson(b)
+      const readNsDesc = async (ns) => {
+        const resp = await apiRef.settings.describe({})
+        const d = unwrap(resp)
+        return ((d && d.namespaces) || []).find((n) => n && n.ns === ns) || null
+      }
+      // 带 revision 的保存 + 「自噪声冲突」自动重试（0.3.14）：
+      //
+      // 为什么必须这样：本插件的 settings 行（model-channel-manager）同时承载健康投影，
+      // 宿主每 5s 的 digest 叶写都会改动该行的 raw config；而 describe() 的 revision
+      // 正是「raw config 的 JSON 指纹」（dsh-settings：revision += raw !== previous.raw）。
+      // 于是 client 手里那份 revision 在几秒内必然过期，保存被 settings/conflict 拒绝——
+      // 提示里的「其他页面修改」其实是插件自己写的健康数据。
+      //
+      // 策略：① 每次写入前取最新 revision（消除过期）；② 仍冲突时比较远端值与我们加载时
+      // 的基线：没变 = 纯 revision 噪声 → 用新 revision 重试；真的变了 = 真冲突 → 报错。
+      const saveWithRevisionRetry = async ({ ns, baseline, remoteOf, write, conflictMessage, attempts = 3 }) => {
+        let lastError = null
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          const desc = await readNsDesc(ns).catch(() => null)
+          const rev = desc && typeof desc.revision === 'number' ? desc.revision : undefined
+          const r = await write(rev)
+          if (!(r && r.ok === false)) return r
+          lastError = r.error
+          if (!isConflict(r.error)) throw new Error((r.error && (r.error.message || r.error)) || (ns + ' save failed'))
+          const now = await readNsDesc(ns).catch(() => null)
+          if (!sameJson(remoteOf(now), baseline)) throw new Error(conflictMessage)
+          // 远端未变：属于插件自身健康写入造成的 revision 噪声 → 取新 revision 重试
+        }
+        throw new Error(conflictMessage.replace(/，请点「刷新」后重试/, '') + '（已自动重试 ' + attempts + ' 次仍未成功）' + (lastError ? '：' + String(lastError.message || lastError) : ''))
+      }
 
       // 按持久化的 providerOrder 重排 providers 的键序：settings-file 的 patchNode
       // 对 map 键序盲（拖拽纯重排在文件层是零 diff），顺序由 model-channels ns 里的
@@ -1654,33 +1694,43 @@ window.__ModuleLoader__.load({
           for (const k of allKeys) ops.push({ op: 'unset', path: ['providers', k] })
           for (const k of keys) ops.push({ op: 'set', path: ['providers', k], value: cleanProviders[k] })
           if (ops.length === 0) return Promise.resolve()
-          // F05：带 revision 保存——llm-pi-ai 是独立 settings 行，冲突由宿主以
-          // settings/conflict 拒绝；提示里给「刷新后重试」指引而不是静默覆盖
-          return apiRef.settings.mutate({ ns: 'llm-pi-ai', ops, expectedRevision: (state && state.nsRevisions && state.nsRevisions.piAi) || undefined }).then((resp) => {
-            const r = resp && resp.result ? resp.result : resp
-            if (r && r.ok === false) {
-              const conflict = r.error && (r.error.code === 'settings/conflict' || /conflict/i.test(String(r.error.message || '')))
-              throw new Error(conflict ? 'llm-pi-ai 配置已被其他页面修改（版本冲突），请点「刷新」后重试' : ((r.error && (r.error.message || r.error)) || 'llm-pi-ai save failed'))
-            }
-            return r
+          // F05 + 0.3.14：带 revision 保存；冲突若只是宿主侧 revision 噪声（远端 providers
+          // 与我们加载时一致）则自动重试，真的被别处改过才提示「刷新后重试」。
+          return saveWithRevisionRetry({
+            ns: 'llm-pi-ai',
+            baseline: (state && state.providers) || {},
+            remoteOf: (desc) => (desc && desc.value && desc.value.providers) || {},
+            write: (rev) => apiRef.settings.mutate({ ns: 'llm-pi-ai', ops, expectedRevision: rev }).then((resp) => {
+              const r = resp && resp.result ? resp.result : resp
+              return r
+            }),
+            conflictMessage: 'llm-pi-ai 配置已被其他页面修改（版本冲突），请点「刷新」后重试',
           })
         })() : Promise.resolve()
         // 顺序持久化：patchNode 对 map 键序盲，拖拽顺序写进 providerOrder 数组（同一次 update 落盘）；
         // 即使 channelsDraft 为空（无轮询组），只要 draft 非空也要写——这是排序的唯二持久化时机
         const orderPatch = draft ? { providerOrder: Object.keys(cleanProviders) } : {}
-        const p2 = apiRef.settings.update({
-          ns: 'model-channels',
-          expectedRevision: (state && state.nsRevisions && state.nsRevisions.channels) || undefined,
+        const channelsPatch = Object.assign({
           // 命名单一身份：写入时统一 virtualModel.name = 组 id——旧的独立呈现名
           // （如遗留的 group-1）在下一次保存时自动归一，无需迁移
-          patch: Object.assign({ groups: (channelsDraft || []).map((g) => Object.assign({}, g, { virtualModel: Object.assign({}, g.virtualModel, { name: g.id }) })) }, orderPatch)
-        }).then((resp) => {
-          const r = resp && resp.result ? resp.result : resp
-          if (r && r.ok === false) {
-            const conflict = r.error && (r.error.code === 'settings/conflict' || /conflict/i.test(String(r.error.message || '')))
-            throw new Error(conflict ? '轮询组配置已被其他页面修改（版本冲突），请点「刷新」后重试' : ((r.error && (r.error.message || r.error)) || 'model-channels save failed'))
-          }
-          return r
+          groups: (channelsDraft || []).map((g) => Object.assign({}, g, { virtualModel: Object.assign({}, g.virtualModel, { name: g.id }) }))
+        }, orderPatch)
+        // 0.3.14：本行同时承载健康投影，宿主每 5s 的 digest 叶写会不断推高它的 revision
+        // （revision = raw config 的 JSON 指纹）——旧实现用加载时的旧 revision，几乎必然
+        // 撞 settings/conflict，于是出现「部分保存：轮询组配置失败……点击多次才能成功」。
+        // 现在每次写入前取最新 revision；冲突时只有远端 groups/providerOrder 真的变了才报冲突。
+        const p2 = saveWithRevisionRetry({
+          ns: 'model-channels',
+          baseline: { groups: channels || [], providerOrder: (state && state.providerOrder) || [] },
+          remoteOf: (desc) => ({
+            groups: (desc && desc.value && desc.value.groups) || [],
+            providerOrder: (desc && desc.value && desc.value.providerOrder) || [],
+          }),
+          write: (rev) => apiRef.settings.update({ ns: 'model-channels', expectedRevision: rev, patch: channelsPatch }).then((resp) => {
+            const r = resp && resp.result ? resp.result : resp
+            return r
+          }),
+          conflictMessage: '轮询组配置已被其他页面修改（版本冲突），请点「刷新」后重试',
         })
         // F06（审计 C10，0.3.8）：两域用 allSettled 而非 all——半成功不再「整单失败」
         // 掩盖已提交的那半。各自报告，失败域给出明确指引；部分成功时提示里列明

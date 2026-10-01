@@ -187,6 +187,33 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 
 host 侧兜底：`rewireRoutes` 发现配置组数 > 实际路由数时 `console.warn` 列出被丢弃的组 ID（此前是静默丢弃——H08：3 组保存、路由只有 1 条，界面仍显示「已保存」）。允许清空全部组（空列表合法）。
 
+## 保存时的 revision 冲突（0.3.14：自噪声识别 + 自动重试）
+
+**症状**：保存后提示「部分保存：提供商配置 已生效；轮询组配置 失败——轮询组配置已被其他页面修改（版本冲突），请点「刷新」后重试」，且要点多次才成功。
+
+**根因**（dsh-settings 源码事实）：`describe()` 里
+
+```js
+raw = JSON.stringify([fiber.uid, schema.toJSON(), entry.options.config ?? {}])
+revision = previous.revision + Number(previous.raw !== raw)
+```
+
+**revision 就是「该行 raw config 的 JSON 指纹」**。而本插件的 settings 行同时承载健康投影——宿主每 5s 的 digest 叶写、`runtime`、`testResults` 都会改动该行 raw config，revision 因此不断前进。client 加载时记下的 revision 在几秒内必然过期，保存被 `settings/conflict` 拒绝：**提示里的「其他页面」其实是插件自己写的健康数据**。providers 走的是另一个行（`llm-pi-ai`），没有这种自噪声，所以它总是先成功——这正是「部分保存」的原因。
+
+**修法**：
+
+- client：写入前**重新读取 revision**（消除过期）；仍冲突时比较远端值与我们加载时的基线
+  （`groups`+`providerOrder` / `providers`，用键序无关的规范 JSON 比较）——
+  **远端没变 = 自噪声 → 用新 revision 重试（最多 3 次）；远端真的变了 → 才报冲突**。
+  既消除误报，也保留真正的多页面冲突保护（审计 F05 的语义）。
+- host：`digest` 内容未变时不写（60s 心跳保底），从源头减少 revision 噪声。
+
+回归：`tests/revision-conflict.test.cjs`。
+
+> 真正的根治是把健康/任务通道搬出 settings 行（审计建议的 Remote + storageDomain 路线）——
+> 那时本行 revision 只随用户配置变化，连重试都不需要。当前修法在不改通信架构的前提下
+> 同时消除了症状与误报。
+
 ## 密钥写入（凭据引用虚拟化）
 
 - 面板主视图只出现「API Key」输入框：**粘贴或输入后失焦即自动写入** DSH 凭据存储（`~/.dsh/.credentials.yaml`，0600，write-only 读不回），无手动按钮；清空输入框不会删除已存 key。上游 llm-pi-ai 的供应商 profile 只有 `apiKeyEnv` 一个密钥字段（凭据引用名），不存在内联 key 的选项——secrets 不进 settings.yaml、不随 `settings.describe` 下发，是有意的安全设计。
@@ -315,6 +342,8 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 
 31. **超时守卫 dispose 时必须 settle promise（0.3.13，审计 R3）**：`timed()` 的 guard 若在 fiber dispose 时只 `clearTimeout`，promise 永不 reject——`await Promise.race([inner.next(), guard.promise])` 就永久挂住，在飞测试既不结束也不写终态，客户端只能等到 66s 假超时（表现与「host 未处理」一模一样）。**规则：任何挂在 `ctx.effect` 上的定时器，dispose 时不仅要清定时器，还要让等待它的 promise settle**（这里 reject `ABORTED`），否则卸载路径会留下永久悬挂的 await。配套：新进程启动时清扫上次遗留的 `running` 条目（补 `ABORTED` 终态）——进程内在飞任务都有 fiber 生命周期，重启后见到的 running 一定是遗留的。回归：`tests/runtime-hardening.test.cjs`。
 32. **静默失败要有出口（0.3.13，审计 R2）**：loader 的 `_commitVolatile` 在 `resolveConfig` 抛错时只 `logger.warn` 后返回 true——document 已落盘、fiber 引用不更新、**不发 `loader/volatile-update`**。而本插件的任务通道只在 volatile-update 里消费请求，于是请求被彻底忽略、客户端 66s 超时，宿主侧却「什么都没发生」。同理 `.loose(true)` 的 schema 兜底会把整棵 volatile 子树换成空对象而不报错（踩坑 28）。**规则：凡是「静默丢弃用户动作」的路径都要有可见出口**——① 未消费的请求打日志（每 nonce 一次）；② 周期性兜底重试（5s，复用同一消费判定，每 nonce 一次）；③ 关键子树从有到无时告警。回归：`tests/runtime-hardening.test.cjs`。
+
+33. **settings 的 revision 是「raw config 的 JSON 指纹」，会被插件自己的健康写入推高（0.3.14）**：`describe()` 里 `revision += raw !== previous.raw`，`raw = JSON.stringify([fiber.uid, schema.toJSON(), entry.options.config])`。本插件的行同时承载健康投影（digest 每 5s、runtime、testResults），所以 client 手里的 revision 几秒内必然过期，保存被 `settings/conflict` 拒绝，提示却是「已被其他页面修改」——**其实「其他页面」就是插件自己**；providers 在另一个行（llm-pi-ai）没有自噪声，于是表现为「部分保存：提供商成功、轮询组失败，点多次才成功」。两条教训：① **带 revision 的写入必须「写入前重读」**，加载时记下的 revision 只在「该行没有其他写入者」时才有效；② 冲突要**分类**——比较远端值与加载基线（键序无关的规范 JSON），远端没变就是自噪声（重试），真的变了才是冲突（报错）。根治方向是把高频数据搬出该行（Remote/storageDomain）。回归：`tests/revision-conflict.test.cjs`。
 
 ## 0.3.11 修复后的自愈路径（无需手工清库）
 

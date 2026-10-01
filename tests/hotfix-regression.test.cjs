@@ -66,11 +66,20 @@ test('F19 信封：测试/测速路径检查 ok:false', () => {
   assert.ok(/r\.ok === false/.test(speed), 'speedtest 应检查信封');
 });
 
-test('F05 revision：门面透传 + save 两处携带 + 冲突提示', () => {
+test('F05 revision：门面透传 + save 携带最新 revision + 冲突分类重试', () => {
   assert.ok(/args\.expectedRevision !== undefined/.test(client), '门面应透传 expectedRevision');
   assert.ok(/nsRevisions/.test(client), 'state 应记录两行 revision');
-  assert.ok(/expectedRevision: \(state && state\.nsRevisions/.test(client), 'save 应携带 revision');
+  // 0.3.14：不再用加载时那份必然过期的 revision（本行同时承载健康投影，宿主每 5s 的
+  // digest 叶写都会推高它的 revision），改为每次写入前取最新 revision + 自噪声冲突重试
+  assert.ok(/const saveWithRevisionRetry = async/.test(client), '应有带 revision 的保存重试封装');
+  assert.ok(/const desc = await readNsDesc\(ns\)/.test(client), '每次写入前应重新读取 revision');
+  assert.ok(/settings\/conflict/.test(client) && /const isConflict =/.test(client), '应识别宿主冲突码');
+  assert.ok(/if \(!sameJson\(remoteOf\(now\), baseline\)\) throw new Error\(conflictMessage\)/.test(client),
+    '只有远端值真的变了才报冲突（否则视为插件自身健康写入的 revision 噪声并重试）');
   assert.ok(/版本冲突/.test(client), '冲突提示文案应存在');
+  assert.ok(/saveWithRevisionRetry\(\{\s*ns: 'llm-pi-ai'/.test(client), 'providers 保存应走重试封装');
+  assert.ok(/saveWithRevisionRetry\(\{\s*ns: 'model-channels'/.test(client), '轮询组保存应走重试封装');
+  assert.ok(!/expectedRevision: \(state && state\.nsRevisions/.test(client), '不应再用加载时的旧 revision 直接写入');
 });
 
 test('工程：test script + yaml devDependency + 优雅跳过', () => {
