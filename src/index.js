@@ -628,6 +628,10 @@ export function apply(ctx, config) {
         // 推进 rt.currentIndex，两个并发请求都从 first 开始（并发不均分）。
         // 现在：选定时立即占位推进（同步读改写，JS 单线程内原子），失败不回滚
         // （失败反馈走冷却，指针保持前进语义——轮询分布比严格顺序更重要）。
+        // 0.3.15：`cursor` 必须先声明——0.3.5 重构时把原来的 `let cursor = …`
+        // 改成了分支内赋值却没保留声明，ESM 严格模式下每次走虚拟路由都抛
+        // `ReferenceError: cursor is not defined`（本轮运行失败）。
+        let cursor = 0;
         if (strategy === 'round-robin') {
             cursor = rt.currentIndex % order.length;
             rt.currentIndex = (cursor + 1) % order.length; // 本次请求已占用 cursor 槽位

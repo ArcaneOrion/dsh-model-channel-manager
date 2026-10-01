@@ -1,6 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -37,7 +37,8 @@
     "access": "public"
   },
   "devDependencies": {
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "acorn": "^8.18.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

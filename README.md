@@ -306,6 +306,32 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 回归：`tests/timeout-abort.test.cjs`（契约断言 + 挂起流行为级验证——3s 关闭预算内
   完成，不等满 5s 挂起）
 
+## 引擎集成测试（0.3.15：真正跑一遍 apply → adapter → 引擎）
+
+此前所有引擎测试都是**源级断言或逻辑复刻**，抓不到「作用域/引用」类缺陷：0.3.5 的 F13
+重构把 `let cursor = …` 改成两个分支内赋值却丢了声明，ESM 严格模式下每次走虚拟路由都抛
+`ReferenceError: cursor is not defined`（用户看到的「本轮运行失败」），而当时 32 个测试全绿。
+
+`tests/engine-integration.test.cjs` 用最小 Cordis ctx 替身（只实现插件用到的 8 个面，
+`ctx.timeout` 按 `cordis-plugin-timer` 的真实双形态实现）真正执行：
+
+```
+apply(ctx, Config({...}))  →  捕获 llm.registerAdapter 的 adapter
+   →  adapter.stream({provider: 'roundrobin/<组>'})  →  断言真实 llm.stream 调用序列
+```
+
+覆盖：路由分发、round-robin 指针原子预留（F13 并发均分）、单候选重试与 failover 顺序、
+`NO_ADAPTER` 终止块、`prepareCall` 快照路径、effect disposer 可执行（卸载不留悬挂 interval）。
+**验证过它抓得住原 bug**：临时删掉 `let cursor = 0;` → 7 项里 5 项立即失败。
+
+另加静态守卫 `tests/no-undeclared-assignment.test.cjs`：用 acorn 解析两个源文件，
+找出所有「赋值给从未声明标识符」的目标（F18 的 `idx`、这次的 `cursor` 都是这一类）。
+这是文件级 no-undef（比词法作用域宽松，宁可漏报不误报），恰好覆盖最危险的形态。
+
+> 顺带观察（非缺陷）：`speedTest.enabled` 默认开启，所以**组内第一次请求会后台触发一次
+> 全候选测速**（每个候选一次真实请求）。UI 文案是「开启自动测速」，语义一致；不想付这份
+> 额度就在组设置里取消勾选。
+
 ## 踩坑速记（本项目，按严重程度）
 
 1. **settings 服务异步初始化**：host 插件 `ctx.get('settings')` 在 apply 时为 undefined → 整个引擎静默不生效（无报错、无命名空间）。必须 `ctx.inject(['settings'], ...)`。
@@ -344,6 +370,8 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 32. **静默失败要有出口（0.3.13，审计 R2）**：loader 的 `_commitVolatile` 在 `resolveConfig` 抛错时只 `logger.warn` 后返回 true——document 已落盘、fiber 引用不更新、**不发 `loader/volatile-update`**。而本插件的任务通道只在 volatile-update 里消费请求，于是请求被彻底忽略、客户端 66s 超时，宿主侧却「什么都没发生」。同理 `.loose(true)` 的 schema 兜底会把整棵 volatile 子树换成空对象而不报错（踩坑 28）。**规则：凡是「静默丢弃用户动作」的路径都要有可见出口**——① 未消费的请求打日志（每 nonce 一次）；② 周期性兜底重试（5s，复用同一消费判定，每 nonce 一次）；③ 关键子树从有到无时告警。回归：`tests/runtime-hardening.test.cjs`。
 
 33. **settings 的 revision 是「raw config 的 JSON 指纹」，会被插件自己的健康写入推高（0.3.14）**：`describe()` 里 `revision += raw !== previous.raw`，`raw = JSON.stringify([fiber.uid, schema.toJSON(), entry.options.config])`。本插件的行同时承载健康投影（digest 每 5s、runtime、testResults），所以 client 手里的 revision 几秒内必然过期，保存被 `settings/conflict` 拒绝，提示却是「已被其他页面修改」——**其实「其他页面」就是插件自己**；providers 在另一个行（llm-pi-ai）没有自噪声，于是表现为「部分保存：提供商成功、轮询组失败，点多次才成功」。两条教训：① **带 revision 的写入必须「写入前重读」**，加载时记下的 revision 只在「该行没有其他写入者」时才有效；② 冲突要**分类**——比较远端值与加载基线（键序无关的规范 JSON），远端没变就是自噪声（重试），真的变了才是冲突（报错）。根治方向是把高频数据搬出该行（Remote/storageDomain）。回归：`tests/revision-conflict.test.cjs`。
+
+34. **重构时把「声明 + 赋值」拆成分支内赋值，却丢了声明（0.3.15，用户看到的「本轮运行失败 cursor is not defined」）**：F13 把 `let cursor = strategy === 'primary' ? 0 : …` 改成 `if (round-robin) { cursor = …; } else { cursor = …; }` —— 两处赋值都在，**声明没了**。ESM 恒为严格模式，赋值未声明标识符直接抛 `ReferenceError`，于是**每一次走虚拟路由的请求都失败**；更糟的是这个错误只有真正跑到那一行才暴露：注册、目录、模型菜单、源级测试全部正常（32 项全绿）。教训：① **局部变量改写分支结构时，声明必须留在分支之外**（`let x;` + 分支内只赋值）；② **引擎需要「真跑一遍」的集成测试**——源级断言/逻辑复刻挡不住这类缺陷，见 `tests/engine-integration.test.cjs`；③ 加一道静态守卫：acorn 扫「赋值给未声明标识符」（`tests/no-undeclared-assignment.test.cjs`），同一类缺陷的 F18（`idx`）也会被它抓住。
 
 ## 0.3.11 修复后的自愈路径（无需手工清库）
 
