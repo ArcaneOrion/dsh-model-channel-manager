@@ -1,6 +1,6 @@
 {
   "name": "@arcaneorion/dsh-model-channel-manager",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

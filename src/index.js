@@ -1096,21 +1096,32 @@ export function apply(ctx, config) {
         flushDigest();
     }, 'model-channel health digest');
     // settings 存量 records/speedResults → domain 一次性迁移（桶已存在即跳过，domain 权威）。
+    // 清空旧键必须走 path-ops：update 是深合并，`records: {}` 清不掉已有键——
+    // 0.3.8 用合并写「清空」实际没删，旧流水一直留在 profile 里（每 5s describe 都要带着它）。
     const migrateHealthToDomain = async () => {
         if (healthStore === null || bus === null) return;
         const health = healthOf();
-        if (health.healthMigrated === true) return;
-        let ok = false;
-        try {
-            ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
+        const alreadyMigrated = health.healthMigrated === true;
+        const hasRecords = health.records !== undefined && Object.keys(health.records || {}).length > 0;
+        const hasSpeed = health.speedResults !== undefined && Object.keys(health.speedResults || {}).length > 0;
+        if (alreadyMigrated && !hasRecords && !hasSpeed) return; // 已迁移且无残留
+        if (!alreadyMigrated) {
+            let ok = false;
+            try {
+                ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
+            }
+            catch (_e) {
+                ok = false; // 下次启动再试
+            }
+            if (!ok) return; // store 已关闭（卸载竞态）：不写标记，避免标记与数据永久不一致
         }
-        catch (_e) {
-            ok = false; // 下次启动再试
-        }
-        if (!ok) return; // store 已关闭（卸载竞态）：不写标记，避免标记与数据永久不一致
-        // 同一次合并写：迁移标记 + 清空 settings 里的旧存量（否则 writeHealth 的
-        // Object.assign 会把 records/speedResults 永远带下去，profile 膨胀问题未真正解决）
-        bus.writeHealth({ healthMigrated: true, records: {}, speedResults: {} }).catch(() => { });
+        // 真删除旧存量 + 落哨兵（对「已迁移但残留旧键」的旧版本 profile 同样生效）
+        const ops = [];
+        if (hasRecords) ops.push({ op: 'unset', path: ['health', 'records'] });
+        if (hasSpeed) ops.push({ op: 'unset', path: ['health', 'speedResults'] });
+        if (!alreadyMigrated) ops.push({ op: 'set', path: ['health', 'healthMigrated'], value: true });
+        if (ops.length === 0) return;
+        await bus.writeHealthOps(ops).catch((e) => console.warn('[model-channel-manager] legacy health cleanup failed:', e && e.message));
     };
 
     // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
@@ -1218,70 +1229,66 @@ export function apply(ctx, config) {
         // 后写的直接覆盖先写的（实测 lastTestHandledNonce 与 records 就这样丢过）。
         // 所以写入串行化：排队后逐个重新读当前值再合并，不让两次写入互相覆写。
         let healthWrites = Promise.resolve();
-        const writeHealth = (patch) => {
-            const run = async () => {
-                const cur = healthOf();
-                const next = Object.assign({}, cur, patch);
-                return outsideTransaction(() => settings.update(SELF_NS, { health: next }));
-            };
+        const enqueueHealthWrite = (run) => {
             const queued = healthWrites.then(run, run);
             healthWrites = queued.catch(() => { });
             return queued;
         };
+        const writeHealth = (patch) => enqueueHealthWrite(async () => {
+            const cur = healthOf();
+            const next = Object.assign({}, cur, patch);
+            return outsideTransaction(() => settings.update(SELF_NS, { health: next }));
+        });
+        // path-ops 写入：update 是深合并，空对象清不掉旧键；需要真删除时走 mutate。
+        const writeHealthOps = (ops) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined)));
         bus = {
             settings,
             writeHealth,
+            writeHealthOps,
             cfgScope: { get: () => cfgOf() },
             healthScope: { get: () => healthOf() },
         };
-        // healthStore 可用（dsh-base 的 storage 栈在场）时：开 domain → 迁移存量 →
-        // 用 domain 权威数据重建内存镜像 → boot；否则同步走旧路径。
-        // ctx.inject 回调不是 async 函数，domain 初始化用 promise 链表达。
-        // 卸载竞态防护：then 回调先验 fiber 活性，inactive 时回滚 healthStore 并跳过
-        // effect 注册（对 inactive fiber 注册 effect 会抛 INACTIVE_EFFECT，若被吞掉则
-        // domain 永不 close，facility 名字被占 → HMR 重载后 already-open 静默降级）。
-        // boot 也挪进链尾：domain 路径下 reloadFromConfig(true) 异步排队，若 boot 先跑，
-        // state.speedResults 尚为空 → onFirstUse 组每次启动都重测；且 state.config 为空
-        // 时 rewireRoutes 推迟，启动早期虚拟路由短暂不存在。
-        const domainFacility = ctx.get('storageDomain');
+        // 卸载竞态防护：异步链回到插件时先确认 fiber 仍存活（uid 被清除即已卸载）。
         const fiberUid = ctx.fiber && ctx.fiber.uid;
-        const fiberAlive = () => ctx.fiber !== undefined && ctx.fiber.uid === fiberUid && ctx.fiber.state !== 4 /* disposed */;
-        if (domainFacility !== undefined) {
-            const store = new HealthStore(ctx);
-            Promise.resolve()
-                .then(() => store.open())
-                .then(() => {
-                if (!fiberAlive()) {
-                    // 已卸载：回滚赋值，由 closeAll 兜底回收 domain
-                    void store.close().catch(() => { });
-                    return;
-                }
-                healthStore = store;
-                ctx.effect(() => () => { void store.close(); }, 'model-channel health domain close');
-            })
-                .catch((e) => {
-                console.warn('[model-channel-manager] storageDomain open failed, health records stay in-memory only:', e && e.message);
-            })
-                .then(() => (healthStore !== null ? migrateHealthToDomain().catch(() => { }) : null))
-                .then(() => {
-                if (fiberAlive())
-                    reloadFromConfig(true);
-            })
-                .then(() => {
-                if (fiberAlive())
-                    boot();
-            })
-                .catch(() => { }); // 卸载竞态下 reload/boot 内部可能 throw，链尾兜底防 unhandled rejection
-        }
-        else {
-            reloadFromConfig(true);
-            boot();
-        }
+        const fiberAlive = () => ctx.fiber !== undefined && ctx.fiber.uid !== undefined && ctx.fiber.uid === fiberUid;
+        // 启动不等待 domain：先用现有 settings 数据把路由与健康页带起来（旧 records 尚在
+        // settings 时也能立即显示）；domain 就绪后再以它为权威重载。
+        reloadFromConfig(true);
         ctx.on('loader/volatile-update', () => {
             reloadFromConfig(false);
             console.log('[model-channel-manager] config hot-reloaded, routes:', pullConfig().groups.map((g) => g.id).join(', ') || '(none)');
         });
-        // boot 已在 domain ready 链尾（或降级分支）调用，此处不再调
+        boot();
+        scheduleDigest(); // 首屏投影：让健康页不用等下一次真实请求
+        // storageDomain 是可选服务，必须经响应式 inject 取得「已声明依赖」的上下文：
+        // 直接 ctx.get('storageDomain') 只能拿到未注入的裸服务，随后任何属性访问都会被
+        // Cordis 代理拒绝（实测 "cannot get property storageDomain without inject"，
+        // domain 永远打不开、健康流水静默降级为内存）。inject 回调在服务可用时触发；
+        // profile 没有 storage 栈时它不触发，插件保持内存模式，路由与面板不受影响。
+        ctx.inject(['storageDomain'], (dctx) => {
+            const store = new HealthStore(dctx);
+            Promise.resolve()
+                .then(() => store.open())
+                .then(() => {
+                    if (!fiberAlive()) {
+                        void store.close().catch(() => { }); // 已卸载：由 facility closeAll 兜底回收
+                        return;
+                    }
+                    healthStore = store;
+                    ctx.effect(() => () => { void store.close(); }, 'model-channel health domain close');
+                    console.log('[model-channel-manager] health domain ready: model_channel_health');
+                })
+                .catch((e) => {
+                    console.warn('[model-channel-manager] storageDomain open failed, health records stay in-memory only:', e && e.message);
+                })
+                .then(() => (healthStore !== null ? migrateHealthToDomain().catch(() => { }) : null))
+                .then(() => {
+                    if (!fiberAlive()) return;
+                    reloadFromConfig(true); // domain 权威数据覆盖内存镜像
+                    scheduleDigest();       // 立刻把投影刷新到 settings（健康页首屏可读）
+                })
+                .catch(() => { }); // 卸载竞态下 reload 内部可能 throw，链尾兜底防 unhandled rejection
+        });
     });
     // ---------- 全局 LLM 请求健康拦截 (涵盖所有非虚拟路由的真实渠道模型调用) ----------
     ctx.on('llm/stream', async function* (options, next) {
