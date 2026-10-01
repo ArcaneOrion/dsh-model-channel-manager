@@ -11,6 +11,21 @@ window.__ModuleLoader__.load({
     const { createElement: el, useState, useEffect, useRef, useSyncExternalStore } = require('react')
     let apiRef = null
     const savedKeys = {}
+    // 使用随机安全整数 nonce：host 的 lastTestHandledNonce/lastHandledNonce 是 number。
+    // UUID 字符串虽被新 host 接受，但旧 host（滚动升级/未重启窗口）只校验 number，
+    // 会把请求静默忽略，client 最终提示「host 未处理」。随机 53-bit 整数同时避免
+    // Date.now()%1e9 同毫秒碰撞，并保持与旧 host 的 wire schema 兼容。
+    let nonceFallbackCounter = 0
+    const createNonce = () => {
+      if (typeof crypto !== 'undefined' && crypto && typeof crypto.getRandomValues === 'function') {
+        const words = new Uint32Array(2)
+        crypto.getRandomValues(words)
+        const n = (words[0] & 0x1fffff) * 0x100000000 + words[1]
+        return n === 0 ? 1 : n
+      }
+      nonceFallbackCounter = (nonceFallbackCounter + 1) % 1000
+      return Date.now() * 1000 + nonceFallbackCounter
+    }
 
     // dsh 0.2：客户端远程面由 connection.api 改为 ctx.remote；参数改为位置参数，结果统一为
     // RemoteResult。本适配层把两者还原成 0.1 的调用形状（对象入参 + {result:{ok,value}}）。
@@ -594,7 +609,7 @@ window.__ModuleLoader__.load({
         setTestStates((s) => Object.assign({}, s, { [key]: { status: 'running' } }))
         // F03：Date.now()%1e9 同毫秒可碰撞（碰撞 = 两次测试互相认领/覆盖结果），
         // 换 UUID；host 侧 testRequest.nonce 消费方是 !== 比较，字符串/数字都行
-        const nonce = (crypto.randomUUID && crypto.randomUUID()) || (String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10))
+        const nonce = createNonce()
         const prompt = localStorage.getItem('mcm_test_prompt') || '用一句话介绍你自己'
         const maxTokens = Number(localStorage.getItem('mcm_test_max_tokens')) || 256
         apiRef.settings.update({
@@ -976,7 +991,7 @@ window.__ModuleLoader__.load({
       const speedtest = (gid) => {
         if (!apiRef) return
         // F03/F19 同 fireTest：UUID 防碰撞 + 信封检查（ok:false 不再当「已触发」）
-        const nonce = (crypto.randomUUID && crypto.randomUUID()) || (String(Date.now()) + '-' + Math.random().toString(36).slice(2, 10))
+        const nonce = createNonce()
         setSpeedState((s) => Object.assign({}, s, { [gid]: 'running' }))
         apiRef.settings.update({ ns: 'model-channel-health', patch: { speedRequest: { group: gid, nonce } } }).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
@@ -1076,7 +1091,9 @@ window.__ModuleLoader__.load({
     function HealthPanel(props) {
       const health = props.health
       const providers = props._providers || {}
-      const [windowMode, setWindowMode] = useState('30m') // '30m' | '24h' | '7d'
+      // 默认 7d：digest 是窗口聚合，小窗口在长时间无请求时会合法显示 0，
+      // 用户容易误认为「数据丢了」。先默认展示历史，再可切 30m/24h 看实时/近期。
+      const [windowMode, setWindowMode] = useState('7d') // '30m' | '24h' | '7d'
 
       if (!health) return el('div', { className: 'mcm-empty' }, '健康统计数据准备中…')
 

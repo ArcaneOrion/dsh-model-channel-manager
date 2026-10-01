@@ -31,14 +31,21 @@ test('F04 保存门：ready 门 + 按钮禁用', () => {
   assert.ok(/disabled: !ready \|\| saving/.test(client), '保存按钮应禁用');
 });
 
-test('F03 nonce：randomUUID 替换时间戳取模；host 兼容双类型', () => {
+test('F03 nonce：安全整数随机 nonce（兼容旧 host number schema）', () => {
   assert.ok(!/Date\.now\(\) % 1000000000/.test(client), 'client 不应再用时间戳取模');
-  assert.ok(/crypto\.randomUUID/.test(client), 'client 应用 randomUUID');
-  // host：testRequest/speedRequest 两处消费方都接受 number 或 string nonce
+  assert.ok(/const createNonce = \(\) =>/.test(client), '统一 nonce 工厂应存在');
+  assert.ok(/crypto\.getRandomValues/.test(client), '优先用 crypto 随机数，跨标签低碰撞');
+  assert.ok(/return Date\.now\(\) \* 1000 \+ nonceFallbackCounter/.test(client), '无 crypto 时同毫秒计数降级');
+  assert.ok(/const nonce = createNonce\(\)/.test(client), '测试/测速都应使用同一工厂');
+  // host 仍兼容 number/string（旧/新 client 混部窗口）
   const testSide = /nonceOf = \(v\) => \(typeof v === 'number' \|\| typeof v === 'string'\)/.test(host);
   const speedSide = /typeof \(req && req\.nonce\) === 'number' \|\| typeof \(req && req\.nonce\) === 'string'/.test(host);
-  assert.ok(testSide, 'handleTestRequest 应双类型兼容');
-  assert.ok(speedSide, 'speedRequest 消费应双类型兼容');
+  assert.ok(testSide, 'handleTestRequest 应兼容双类型');
+  assert.ok(speedSide, 'speedRequest 消费应兼容双类型');
+});
+
+test('健康页默认 7d：已有历史数据不因 30m 冷窗显示空', () => {
+  assert.ok(/useState\('7d'\)/.test(client), 'HealthPanel 默认窗口应为 7d');
 });
 
 test('F19 信封：测试/测速路径检查 ok:false', () => {

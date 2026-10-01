@@ -95,7 +95,12 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 - **降级**：storageDomain 缺席的 profile 退化为纯内存（不持久化流水），不拒绝启动。
 - **client 兼容**：旧 host（无 digest 字段）自动回落原始 records 路径，升级窗口不断供。
 - **已知近似**：30m/24h 视图按「最近活跃渠道」过滤，数值仍是 7 天累计（UI 已标注）；
-  精确分窗口需 host 出多份 digest，后续增强。
+  精确分窗口需 host 出多份 digest，后续增强。健康页默认 7d，避免近 30m 冷窗让用户
+  误以为历史数据丢失。
+- **混部 nonce 兼容**：测试/测速 nonce 使用随机安全整数（host schema 为 number），
+  避免 UUID client 遇到未重启旧 host 时被旧版 `typeof nonce === 'number'` 静默忽略；
+  新 host 同时兼容旧数字与字符串 nonce。使用 `crypto.getRandomValues`，fallback 为
+  时间戳×1000 + 同毫秒计数。
 
 ## 响应信封（重要）
 
