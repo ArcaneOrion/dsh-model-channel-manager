@@ -39,8 +39,13 @@ test('迁移清理走 path-ops 真删除（update 深合并清不掉旧键）', 
   assert.ok(/settings\.mutate\(SELF_NS, ops, undefined\)/.test(src), 'path-ops 应走 settings.mutate');
   assert.ok(/\{ op: 'unset', path: \['health', 'records'\] \}/.test(src), 'records 应被 unset');
   assert.ok(/\{ op: 'unset', path: \['health', 'speedResults'\] \}/.test(src), 'speedResults 应被 unset');
-  // 已迁移但残留旧键的 profile 也要清理（0.3.8/0.3.9 曾用合并写「清空」而没删掉）
-  assert.ok(/alreadyMigrated && !hasRecords && !hasSpeed/.test(src), '应对残留旧键补清理');
+  // 有存量必须先导入再清理：不能因 marker 已写就跳过导入（0.3.11 事故中 marker
+  // 被误写而数据从未导入，按 marker 跳过再清理 = 直接删掉旧账）
+  assert.ok(/if \(!hasRecords && !hasSpeed\)/.test(src), '无存量应快速返回');
+  const importIdx = src.indexOf('await healthStore.migrateFrom(');
+  const unsetIdx = src.indexOf("{ op: 'unset', path: ['health', 'records'] }");
+  assert.ok(importIdx > 0, '应调用 migrateFrom 导入存量');
+  assert.ok(unsetIdx > importIdx, '清理 unset 必须排在成功导入之后');
 });
 
 test('行为级：HealthStore 用注入上下文打开 domain 并绑定两张表', async (t) => {

@@ -93,9 +93,14 @@ test('HealthStore：迁移幂等（桶已存在即跳过）+ 窗口过期 + 截�
   assert.equal(buckets.get('p1').events.length, 1);
   assert.equal(buckets.get('p1').events[0].inputTokens, 10);
   assert.equal(speedBuckets.get('g1').rows.length, 1);
-  // 二次迁移（桶已存在）不覆盖
+  // 二次迁移（桶已存在）→ 合并去重，而不是整桶跳过：
+  //  (a) 同一笔重复导入不重复计（幂等）
+  await store.migrateFrom({ p1: [fresh] }, {});
+  assert.equal(buckets.get('p1').events.length, 1, '同一笔重复导入应去重');
+  //  (b) 新的一笔并入已有桶——0.3.11 事故里 marker 已被误写、旧账从未导入，
+  //      靠这条合并语义把旧账救回来（整桶跳过会直接丢历史）
   await store.migrateFrom({ p1: [{ ts: now, provider: 'p1', model: 'm1', ok: false }] }, {});
-  assert.equal(buckets.get('p1').events.length, 1, '已有桶应跳过，domain 权威');
+  assert.equal(buckets.get('p1').events.length, 2, '新账应并入已有桶');
   // appendEvent 截断到 300
   for (let i = 0; i < 305; i++) {
     await store.appendEvent('p2', { ts: now - i, provider: 'p2', model: 'm', ok: true });

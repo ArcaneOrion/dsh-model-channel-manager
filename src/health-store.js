@@ -67,6 +67,9 @@ const healthDomainSpec = defineDomain({
   },
 });
 
+/** 事件去重键：同一笔在 settings 与 domain 之间合并时不重复计。 */
+const eventKey = (e) => `${e.ts}|${e.provider}|${e.model}`;
+
 /**
  * HealthStore：封装 domain 读写 + 保留策略 + 聚合。
  * 非 Service（宿主插件自有生命周期），由 apply() 创建并 effect 持有 close。
@@ -102,14 +105,21 @@ export class HealthStore {
     if (domain) await domain.close().catch(() => {});
   }
 
+  /** 把一次事件表写入排入类内写链：并发调用逐个重读当前值，不交错、不互相覆盖。
+   * 返回本次写入的真实结果（失败会 reject，调用方可记录/重试）；链本身用吞错版本续接。
+   */
+  enqueueEvent(run) {
+    const result = this.eventChain.then(run, run);
+    this.eventChain = result.catch(() => { });
+    return result;
+  }
+
   /** 追加一条事件到渠道桶，同时执行窗口过期 + 条数截断。
-   * 并发安全：桶初始化（put）与追加（update）都排队到类内写链，逐个重读当前值，
-   * 并发 appendEvent 不交错、不互相覆盖（等价 KvTable.update 的原子语义；
-   * 桶不存在时 KvTable.update 报 missing-key，故初始化先行）。
+   * 桶不存在时先 put 初始化（KvTable.update 对缺失键报 missing-key）。
    */
   appendEvent(provider, rec) {
     if (this.events === null) return Promise.resolve();
-    this.eventChain = this.eventChain.then(async () => {
+    return this.enqueueEvent(async () => {
       const cutoff = Date.now() - WINDOW_MS;
       const cur = this.events.get(provider);
       if (cur === undefined) {
@@ -119,8 +129,7 @@ export class HealthStore {
       await this.events.update(provider, (c) => ({
         events: [...c.events.filter((e) => e.ts >= cutoff), rec].slice(-PER_KEY_LIMIT),
       }));
-    }).catch(() => { }); // 链不断：失败吞掉（调用方已有 warn），后续追加继续
-    return this.eventChain;
+    });
   }
 
   /** 整组测速结果替换写入。 */
@@ -146,18 +155,35 @@ export class HealthStore {
   }
 
   /**
-   * 存量迁移：settings health 子树的 records/speedResults 一次性搬入 domain。
-   * 迁移以「桶里有数据即跳过」防重放；完成后由调用方写迁移标记。
-   * 并发安全：逐桶判断改走原子链（迁移进行中 recordHealth 并发创建的新桶不会被旧数据覆盖）。
+   * 存量迁移：把 settings health 子树的 records/speedResults 并入 domain。
+   *
+   * 与早期实现的关键差别：**桶已存在时合并去重，而不是整桶跳过**。
+   * 原因是 0.3.11 修掉的 schema 缺陷（nonce 类型漂移 → health 整树被宽松兜底
+   * 清空）期间，迁移标记可能已被误写、而 settings 里的旧流水从未真正导入；
+   * 此时若沿用「桶已存在即跳过」再清理 settings，旧账会被直接删除。
+   * 合并保证不丢数据，且幂等（同 ts+provider+model 视为同一笔）。
+   * 测速结果是「最新快照」语义，仍以 domain 已有行为准。
    */
   async migrateFrom(records, speedResults) {
     if (this.events === null) return false;
     const cutoff = Date.now() - WINDOW_MS;
     for (const [provider, list] of Object.entries(records || {})) {
-      if (!Array.isArray(list) || list.length === 0) continue;
-      if (this.events.get(provider) !== undefined) continue; // 已有桶：domain 是权威，不回搬
-      const events = list.filter((e) => e && e.ts >= cutoff).slice(-PER_KEY_LIMIT);
-      if (events.length > 0) await this.events.put(provider, { events });
+      const incoming = (Array.isArray(list) ? list : [])
+        .filter((e) => e && Number.isFinite(e.ts) && e.ts >= cutoff);
+      if (incoming.length === 0) continue;
+      await this.enqueueEvent(async () => {
+        const existing = (this.events.get(provider) || {}).events || [];
+        const seen = new Set(existing.map(eventKey));
+        const merged = existing.slice();
+        for (const e of incoming) {
+          const k = eventKey(e);
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(e);
+        }
+        merged.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        await this.events.put(provider, { events: merged.slice(-PER_KEY_LIMIT) });
+      });
     }
     for (const [groupId, rows] of Object.entries(speedResults || {})) {
       if (!Array.isArray(rows) || rows.length === 0) continue;

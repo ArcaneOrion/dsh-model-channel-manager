@@ -18,10 +18,14 @@ const HEALTH_SCHEMA = z.object({
     speedResults: z.dict(z.array(z.any())).default({}),
     runtime: z.dict(z.any()).default({}),
     speedRequest: z.any(),
-    lastHandledNonce: z.number().default(0),
+    // nonce 必须容忍 number 与 string 两种历史形态：0.3.2 的 client 写过 UUID 字符串，
+    // 而 schema 当时声明 z.number() → 字符串一旦落盘，**整个 health 子树校验失败**，
+    // 被 .loose(true) 兜底替换成默认值：records/digest 在运行时全部消失、迁移空转。
+    // （0.3.11 线上事故根因；回归见 tests/health-schema-tolerance.test.cjs）
+    lastHandledNonce: z.union([z.number(), z.string()]).default(0),
     testRequest: z.any(),
     testResults: z.dict(z.any()).default({}),
-    lastTestHandledNonce: z.number().default(0),
+    lastTestHandledNonce: z.union([z.number(), z.string()]).default(0),
     legacyMigrated: z.any(),
     healthMigrated: z.any(),
     // 小投影：host 聚合好的健康摘要（client 渲染用），digestAt 为生成时刻
@@ -1104,24 +1108,33 @@ export function apply(ctx, config) {
         const alreadyMigrated = health.healthMigrated === true;
         const hasRecords = health.records !== undefined && Object.keys(health.records || {}).length > 0;
         const hasSpeed = health.speedResults !== undefined && Object.keys(health.speedResults || {}).length > 0;
-        if (alreadyMigrated && !hasRecords && !hasSpeed) return; // 已迁移且无残留
-        if (!alreadyMigrated) {
-            let ok = false;
-            try {
-                ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
+        if (!hasRecords && !hasSpeed) {
+            // 无存量：只补哨兵（幂等）
+            if (!alreadyMigrated) {
+                await bus.writeHealthOps([{ op: 'set', path: ['health', 'healthMigrated'], value: true }])
+                    .catch((e) => console.warn('[model-channel-manager] health marker write failed:', e && e.message));
             }
-            catch (_e) {
-                ok = false; // 下次启动再试
-            }
-            if (!ok) return; // store 已关闭（卸载竞态）：不写标记，避免标记与数据永久不一致
+            return;
         }
-        // 真删除旧存量 + 落哨兵（对「已迁移但残留旧键」的旧版本 profile 同样生效）
+        // 有存量就必须导入（合并幂等）——不能只看 marker：schema 缺陷期间 marker 可能已被
+        // 误写而数据从未导入（0.3.11 线上事故），照 marker 跳过再清理 = 直接删掉旧账。
+        let ok = false;
+        try {
+            ok = await healthStore.migrateFrom(health.records || {}, health.speedResults || {});
+        }
+        catch (e) {
+            console.warn('[model-channel-manager] legacy health import failed (will retry next boot):', e && e.message);
+            return;
+        }
+        if (!ok) return; // store 已关闭（卸载竞态）：不清理，避免标记与数据永久不一致
+        // 导入成功才真删除旧键（path-ops；update 的深合并清不掉）+ 落哨兵
         const ops = [];
         if (hasRecords) ops.push({ op: 'unset', path: ['health', 'records'] });
         if (hasSpeed) ops.push({ op: 'unset', path: ['health', 'speedResults'] });
         if (!alreadyMigrated) ops.push({ op: 'set', path: ['health', 'healthMigrated'], value: true });
         if (ops.length === 0) return;
         await bus.writeHealthOps(ops).catch((e) => console.warn('[model-channel-manager] legacy health cleanup failed:', e && e.message));
+        console.log('[model-channel-manager] legacy health imported into domain and cleared from settings');
     };
 
     // ---------- settings 总线接入（响应式：settings 服务异步初始化，apply 时查询太早） ----------
