@@ -566,11 +566,13 @@ window.__ModuleLoader__.load({
       const pollTest = (nonce, provider, model, attempt = 0) => {
         if (!apiRef) return
         const key = provider + '::' + model
-        // host 侧测试超时 60s，约 55 次 × 1.2s ≈ 66s 后放弃，避免结果被覆盖时无限轮询。
-        // 0.3.12：放弃时区分「host 没写结果」与「host 还在跑」，不再一律甩锅「未处理/需重启」。
-        const giveUp = (e) => setTestStates((s) => Object.assign({}, s, { [key]: (e && e.status === 'running')
-          ? { status: 'error', code: 'POLL_TIMEOUT_RUNNING', error: '测试仍在执行（约 66 秒未返回结果）：host 已收到请求，可能是渠道慢或上游挂起；稍后可在健康统计里核对' }
-          : { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 未写入结果（可能 host 未重启到新版，或结果写入失败）' } }))
+        // host 侧测试超时 45s（0.3.13 从 60s 下调，给终态写入留出余量），
+        // 约 55 次 × 1.2s ≈ 66s 后放弃。放弃时按现场分三种提示，不再一律甩锅「未处理」。
+        const giveUp = (e, settledHere) => setTestStates((s) => Object.assign({}, s, { [key]: settledHere
+          ? { status: 'error', code: 'POLL_TIMEOUT_SETTLED', error: 'host 已完成本次测试但结果条目未能写入（写入失败或被覆盖）：请重试，若反复出现请查看宿主日志' }
+          : (e && e.status === 'running')
+            ? { status: 'error', code: 'POLL_TIMEOUT_RUNNING', error: '测试仍在执行（约 66 秒未返回结果）：host 已收到请求，可能是渠道慢或上游挂起；稍后可在健康统计里核对' }
+            : { status: 'error', code: 'POLL_TIMEOUT', error: '等待测试结果超时：host 未写入结果（可能 host 未重启到新版，或结果写入失败）' } }))
         apiRef.settings.describe({}).then((resp) => {
           const r = resp && resp.result ? resp.result : resp
           const d = r && r.value !== undefined ? r.value : r
@@ -585,7 +587,9 @@ window.__ModuleLoader__.load({
             const norm = (e.status === 'ok' || e.status === 'error') ? e : Object.assign({}, e, { status: e.ok === true ? 'ok' : 'error' })
             setTestStates((s) => Object.assign({}, s, { [key]: norm }))
           } else if (attempt >= 55) {
-            giveUp(e)
+            // host 已结算（lastTestHandledNonce === 自己的 nonce）但结果条目不在 → 写入失败
+            const settled = ns && ns.value ? ns.value.lastTestHandledNonce : undefined
+            giveUp(e, settled !== undefined && settled !== null && String(settled) === String(nonce))
           } else {
             setTimeout(() => pollTest(nonce, provider, model, attempt + 1), 1200)
           }
@@ -1097,7 +1101,12 @@ window.__ModuleLoader__.load({
       // digest 是 7 天全窗口聚合；30m/24h 视图按 lastTs 近似（lastTs 在窗口内才计入），
       // 精细窗口统计属后续增强（需要 host 按窗口出多份 digest）。
       // 旧 host 兼容：无 digest 字段时走原始 records 路径（升级窗口不断供）。
-      const digestRows = Array.isArray(health.digest) ? health.digest : null
+      // #11（审计）：digest 是空数组时不要遮蔽 settings 里仍存在的 records——
+      // 典型场景是 domain 打开成功但迁移失败（host 保留旧流水不清理）或 host 刚重启
+      // 尚未投影。此时回落到 records 路径，页面显示旧流水而不是全 0。
+      const rawRecords = health.records || {}
+      const hasRawRecords = Object.keys(rawRecords).some((k) => Array.isArray(rawRecords[k]) && rawRecords[k].length > 0)
+      const digestRows = (Array.isArray(health.digest) && (health.digest.length > 0 || !hasRawRecords)) ? health.digest : null
       // 按 provider 分组
       const byProvider = new Map()
 

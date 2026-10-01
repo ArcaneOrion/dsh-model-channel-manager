@@ -67,8 +67,17 @@ const healthDomainSpec = defineDomain({
   },
 });
 
-/** 事件去重键：同一笔在 settings 与 domain 之间合并时不重复计。 */
-const eventKey = (e) => `${e.ts}|${e.provider}|${e.model}`;
+/**
+ * 事件去重键：同一笔在 settings 与 domain 之间合并时不重复计。
+ * 0.3.13（审计 #10）：旧键只有 `ts|provider|model`，同一毫秒同渠道的两笔真实请求
+ * 会被当成同一笔合并掉。把判定性字段一起纳入指纹——同毫秒 + 同渠道 + 同结果形态
+ * 的两笔在语义上本就不可区分；真正不同的两笔（成功率/延迟/token 不同）不会再被吞。
+ */
+const eventKey = (e) => [
+  e.ts, e.provider, e.model, e.ok ? 1 : 0, e.code || '',
+  e.ttftMs ?? '', e.latencyMs ?? '',
+  e.inputTokens ?? '', e.outputTokens ?? '', e.cacheReadTokens ?? '', e.cacheWriteTokens ?? '',
+].join('|');
 
 /**
  * HealthStore：封装 domain 读写 + 保留策略 + 聚合。
@@ -98,6 +107,9 @@ export class HealthStore {
   /** effect 用：domain 关闭（写入队列排干后释放）。 */
   async close() {
     if (this.ready === null) return;
+    // 0.3.13（审计 #10）：先排干类内写链再关 domain——旧实现直接 close，
+    // 排队中的 append/迁移写入可能在 domain 关闭后才执行（丢最后一笔）。
+    await this.eventChain.catch(() => {});
     const domain = await this.ready.catch(() => null);
     this.ready = null;
     this.events = null;
@@ -132,10 +144,14 @@ export class HealthStore {
     });
   }
 
-  /** 整组测速结果替换写入。 */
+  /** 整组测速结果替换写入。0.3.13（审计 #10）：也排入同一条写链，
+   * 避免与迁移/追加写入交错（快照语义下后写者胜，交错会写出半新半旧的桶）。 */
   async putSpeedRows(groupId, rows) {
     if (this.speed === null) return;
-    await this.speed.put(groupId, { rows });
+    await this.enqueueEvent(async () => {
+      if (this.speed === null) return;
+      await this.speed.put(groupId, { rows });
+    });
   }
 
   /** 读全部事件桶（迁移/聚合用）。 */
@@ -187,8 +203,11 @@ export class HealthStore {
     }
     for (const [groupId, rows] of Object.entries(speedResults || {})) {
       if (!Array.isArray(rows) || rows.length === 0) continue;
-      if (this.speed.get(groupId) !== undefined) continue;
-      await this.speed.put(groupId, { rows });
+      await this.enqueueEvent(async () => {
+        if (this.speed === null) return;
+        if (this.speed.get(groupId) !== undefined) return; // domain 已有该组结果：以 domain 为准
+        await this.speed.put(groupId, { rows });
+      });
     }
     return true;
   }

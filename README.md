@@ -126,7 +126,7 @@ dsh plugin --profile web add @arcaneorion/dsh-model-channel-manager
 
 - 模型行「⚡测试」→ 弹窗输入自定义问题 + maxTokens → 发送
 - prompt 存 localStorage（`mcm_test_prompt`，pi 同款，全局共用）
-- host 用 `llm.stream({provider, model, messages, maxTokens})` 真实调用（与正式对话同链路）；60s 超时
+- host 用 `llm.stream({provider, model, messages, maxTokens})` 真实调用（与正式对话同链路）；45s 总时限（0.3.13 由 60s 下调，给终态写入留余量）
 - 结果：`status:'ok'`（ttftMs/latencyMs/text）或 `status:'error'`（code/error）
 - 模型行内显示 ⏳→✓/✗ 状态标签（hover 见详情）
 
@@ -231,24 +231,37 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 - 30m/24h 健康视图是近似口径（按最近活跃过滤，数值为 7 天累计，UI 已标注）；精确分窗口
   需 host 出多份 digest
 
-### 0.3.12 审计已确认、尚未修（按严重度）
+### 0.3.13：2026-10-01 审计剩余项（已修）
 
-均为 2026-10-01 只读审计结论（13 项），0.3.12 先修了其中最要命的两条（去重 guard、整树回写）：
+同一份只读审计（13 项）里，0.3.12 修了最要命的两条（去重 guard、整树回写），0.3.13 清掉其余：
 
-- **volatile 提交静默失败仍是放大器**：loader 的 `_commitVolatile` 在 `resolveConfig` 抛错时
-  只 `logger.warn` 后返回——document 已落盘、fiber 引用不更新、**不发 volatile-update**，
-  而宿主只在 volatile-update 里消费请求 → 请求被彻底忽略且无任何可见报错。当前 payload
-  校验通过，属潜在复发路径。建议：宿主加「未结算 nonce」兜底轮询 + 未消费显式日志。
-- **remount/dispose 会打断在飞的测试**：超时守卫挂在 `ctx.effect` 上，dispose 只 `clearTimeout`，
-  promise 永不 reject → `runModelTest` 挂死 → 终态永不写入（旧闭包的排队写入只进
-  `console.error`）。建议：守卫不挂 fiber effect，dispose 时补写 ABORTED 终态。
-- **60s（host）/66s（client）预算错配**：跑满 60s 时终态写入稍晚于 client giveUp。建议 host 收到
-  45s 或 client 放弃前比较 `lastTestHandledNonce` 再补一轮。
-- **health 写不带 `expectedRevision`**（配置域已带）：叶写后危害大幅降低（不同键互不覆盖），
-  但同一叶子仍无冲突检测。
-- 低危：`digest: []` 空数组会遮蔽 settings 里的旧 `records`；`migrateLegacyConfig` 直写未走
-  `outsideTransaction`（在事务内会抛 "cannot be nested" 并被空 catch 吞掉）；health-store 的
-  `eventKey = ts|provider|model` 会把同毫秒同渠道两笔当重复合并。
+- **R3 remount/dispose 打断在飞测试**：`timed()` 守卫不再只在 dispose 时 `clearTimeout`——
+  那样 promise 永不 settle，`await Promise.race([inner.next(), guard.promise])` 直接挂死，
+  在飞测试既不结束也不写终态。现在 dispose 会主动 reject `ABORTED`，调用方走正常失败路径。
+  另外**启动时清扫**：新进程里任何 `status: running` 且无 `finishedAt` 的条目都是上次遗留的，
+  补写 `ABORTED` 终态；`running + finishedAt` 的僵尸条目按 `ok` 归一状态位
+  （纯函数 `selectStaleTestEntries` 导出，回归见 `tests/runtime-hardening.test.cjs`）。
+- **R2 volatile 提交静默失败（放大器）**：请求存在但既未认领也未结算时，
+  ① `handleTestRequest` 显式打日志（每个 nonce 一次，不再静默忽略）；
+  ② 新增 5s 兜底轮询 `sweepPendingTestRequest`，复用同一个消费判定，主动重试一次并留日志；
+  ③ `reloadFromConfig` 检测「health 子树运行时从有到无」并大声告警——这是 0.3.11
+  schema 兜底事故的形态，以前完全无声。
+- **#7 预算错配**：host 测试总时限 60s → 45s（client 轮询上限 ≈66s，旧值只留 6s 余量）；
+  client 放弃时还会比对 `lastTestHandledNonce`，区分第三种情况
+  `POLL_TIMEOUT_SETTLED`（host 已结算但结果条目未写入）。
+- **#6 notReady 退避**：释放认领后设 5s 退避窗口（测试/测速各自），期间任何
+  volatile-update 都不再消费——旧实现释放后会被立刻再消费，并发起多个 45s 上游请求。
+- **#13 迁移直写**：`migrateLegacyConfig` 改走 `bus.writeConfig`（`outsideTransaction` 包裹），
+  不再在 HMR 事务内直写（旧写法会抛 "cannot be nested" 并被空 catch 吞掉，只剩哨兵）。
+- **#11 digest 遮蔽**：`digest: []` 且 settings 仍有 `records` 时（domain 打开成功但迁移失败、
+  或 host 刚重启尚未投影）回落到 records 路径，页面显示旧流水而不是全 0。
+- **#10 health-store**：事件去重键由 `ts|provider|model` 扩成含 ok/code/延迟/token 的指纹
+  （同毫秒同渠道的两笔真实请求不再被当重复合并）；`putSpeedRows` 与 `migrateFrom` 的测速写入
+  并入同一条写链（不与事件追加交错）；`close()` 先排干写链再关 domain（不丢排队中的最后一笔）。
+
+**仍然未修（有意保留）**：health 子树写入不带 `expectedRevision`。叶写后危害已大幅降低
+（不同叶子互不覆盖），同一叶子的并发写本身是「后写者胜」的语义，加 revision 需要调用方
+持有并维护 revision，收益不抵复杂度；配置域（groups/providerOrder）仍然带 revision。
 
 ## 引擎超时与生命周期（0.3.3 重构：审计 F01/F02/F15 已修）
 
@@ -299,6 +312,9 @@ react 经 `require('react')`；样式用 `ctx.effect` 自管理；`dsh.client: {
 
 29. **去重不能依赖 nonce 的数值单调性（0.3.12）**：`last = Math.max(lastTestHandledNonce, claimedNonce)` 看似「取最新」，实则假设了 nonce 单调递增——而 0.3.2 起 nonce 是随机 53-bit，**「上一轮 > 本轮」时（≈50%）判等失效**，同一 testRequest 在每次 `loader/volatile-update`（包括宿主自己每 5s 的 digest 回写触发的那次）都被重新消费。症状是两级：① 上游被真实重复调用（计费）；② 多次执行的结果写进同一条目（线上物证：同 nonce 一条记录同时带 `code TIMEOUT / 60000ms` 与 `ok:true / text/ttftMs`，单次执行不可能）。**规则：去重只做严格等值 + 已消费集合 + 已结算值 + 已有终态，任何「大小推断」都是错的**。释放认领（notReady 重放）时必须同时释放已消费集合，否则重放被自己的去重挡住。回归：`tests/task-dedup.test.cjs`（判定表直接调用生产导出 `shouldConsumeNonce`）。
 30. **整树读-改-写会把并发终态「回灌」成旧值（0.3.12 线上事故）**：health 子树的每次写入都曾是 `cur = healthOf(); update({health:{...cur, patch}})`——payload 是调用时刻的**整树快照**。只要它晚于并发的终态写落盘，`status` 就被改回 `running`；而 `settings.update` 是深合并（只覆盖出现的键、不删键），后写入的 `finishedAt/code/error` 反而被保留 → 条目变成「running + 终态字段」的僵尸，客户端只认 `status==='ok'|'error'` 就永远等不到终态，66s 后误报「host 可能未处理该请求」。**规则：settings 里的共享子树一律叶写**（patch 命中的键逐个 `set`；单键结果用 `writeHealthLeaf(['testResults', nonce], value)`；修剪用 `unset` 而非整字典覆盖），client 侧同样不得「describe 快照 + 整树回写」。另：客户端终态判定要接受 `finishedAt`——状态位可能被写坏，但已经发生的终态字段不会消失。回归：`tests/testresult-fallback.test.cjs`（F4 直接复刻事故时序）。
+
+31. **超时守卫 dispose 时必须 settle promise（0.3.13，审计 R3）**：`timed()` 的 guard 若在 fiber dispose 时只 `clearTimeout`，promise 永不 reject——`await Promise.race([inner.next(), guard.promise])` 就永久挂住，在飞测试既不结束也不写终态，客户端只能等到 66s 假超时（表现与「host 未处理」一模一样）。**规则：任何挂在 `ctx.effect` 上的定时器，dispose 时不仅要清定时器，还要让等待它的 promise settle**（这里 reject `ABORTED`），否则卸载路径会留下永久悬挂的 await。配套：新进程启动时清扫上次遗留的 `running` 条目（补 `ABORTED` 终态）——进程内在飞任务都有 fiber 生命周期，重启后见到的 running 一定是遗留的。回归：`tests/runtime-hardening.test.cjs`。
+32. **静默失败要有出口（0.3.13，审计 R2）**：loader 的 `_commitVolatile` 在 `resolveConfig` 抛错时只 `logger.warn` 后返回 true——document 已落盘、fiber 引用不更新、**不发 `loader/volatile-update`**。而本插件的任务通道只在 volatile-update 里消费请求，于是请求被彻底忽略、客户端 66s 超时，宿主侧却「什么都没发生」。同理 `.loose(true)` 的 schema 兜底会把整棵 volatile 子树换成空对象而不报错（踩坑 28）。**规则：凡是「静默丢弃用户动作」的路径都要有可见出口**——① 未消费的请求打日志（每 nonce 一次）；② 周期性兜底重试（5s，复用同一消费判定，每 nonce 一次）；③ 关键子树从有到无时告警。回归：`tests/runtime-hardening.test.cjs`。
 
 ## 0.3.11 修复后的自愈路径（无需手工清库）
 

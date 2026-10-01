@@ -62,6 +62,24 @@ export function shouldConsumeNonce({ consumed, key, claimed, settled, hasTermina
     if (key === claimed || key === settled) return false;
     return !consumed.has(key);
 }
+/**
+ * 启动清扫的分类（纯函数）：新进程里已存在的测试条目分为两类——
+ *   aborted  : status=running 且没有 finishedAt = 上次进程遗留的在飞任务（重载打断），
+ *              必须补写 ABORTED 终态，否则客户端只会等到 66s 假超时（审计 R3）；
+ *   repaired : status=running 但有 finishedAt（终态字段已在）= status 被并发整树回写
+ *              改坏的僵尸条目，按 ok 归一状态位（审计 #2 的线上物证形态）。
+ */
+export function selectStaleTestEntries(testResults) {
+    const aborted = [];
+    const repaired = [];
+    for (const [key, e] of Object.entries(testResults || {})) {
+        if (!e || typeof e !== 'object') continue;
+        if (e.status !== 'running') continue;
+        if (!e.finishedAt) aborted.push(key);
+        else if (e.ok === true || e.code || e.error) repaired.push(key);
+    }
+    return { aborted, repaired };
+}
 export function apply(ctx, config) {
     // 本行在 profile 中的 entry id 就是 settings 命名空间；缺失时回落到包名。
     const SELF_NS = (ctx.fiber && ctx.fiber.entry && ctx.fiber.entry.options && ctx.fiber.entry.options.id) || 'model-channel-manager';
@@ -109,14 +127,25 @@ export function apply(ctx, config) {
         return g;
     };
     // ---------- 可取消超时（避免 Promise.race 留下孤儿定时器） ----------
+    // 0.3.13（审计 R3）：guard 不能只在 dispose 时 clearTimeout。
+    // dispose（= fiber 卸载/重载）时若只清定时器，promise 永不 settle，
+    // `await Promise.race([inner.next(), guard.promise])` 就永远挂住：
+    // 在飞测试既不结束也不写终态，客户端 66s 后得到假超时。
+    // 现在 dispose 会主动 reject（ABORTED），调用方走正常失败路径。
     const timed = (ms, makeError) => {
         let rejectFn;
+        let settled = false;
+        let timer = null;
         const promise = new Promise((_, reject) => { rejectFn = reject; });
-        const dispose = ctx.effect(() => {
-            const timer = setTimeout(() => rejectFn(makeError()), ms);
-            return () => clearTimeout(timer);
+        const fire = (err) => { if (settled) return; settled = true; rejectFn(err); };
+        ctx.effect(() => {
+            timer = setTimeout(() => fire(makeError()), ms);
+            return () => {
+                if (timer !== null) clearTimeout(timer);
+                fire({ code: 'ABORTED', message: 'plugin reloaded while this attempt was in flight' });
+            };
         }, 'model-channel timeout guard');
-        return { promise, dispose };
+        return { promise, dispose: () => { if (timer !== null) clearTimeout(timer); settled = true; } };
     };
     // ---------- 配置归一化（与动态原型逐行一致） ----------
     function normalizeConfig(raw) {
@@ -894,9 +923,11 @@ export function apply(ctx, config) {
     // ---------- 单模型真实请求测试（client 经 settings 总线下发，走 DSH 真实 llm.stream 链路） ----------
     async function runModelTest(provider, model, prompt, maxTokens) {
         const llm = ctx.llm;
-        // F15（与 measureCandidate 同一模式）：总时限 60s（旧行为每 chunk 重置 guard，
+        // F15（与 measureCandidate 同一模式）：总时限 45s（旧行为每 chunk 重置 guard，
         // 持续输出的请求永不超时而 client 已放弃）+ 超时 abort 上游 + 统一 finally 关闭。
-        const MODEL_TEST_TOTAL_MS = 60000;
+        // 0.3.13：60s → 45s。client 轮询上限约 66s，60s 的 host 预算只留 6s 余量给
+        // 「终态写入 + 下一次 describe」，跑满就会撞上假超时（审计 #7）。
+        const MODEL_TEST_TOTAL_MS = 45000;
         const controller = new AbortController();
         const deadline = Date.now() + MODEL_TEST_TOTAL_MS;
         const inner = llm.stream({ provider, model, messages: [{ role: 'user', content: [{ type: 'text', text: prompt || '你好' }] }], maxTokens: maxTokens || 512, sessionId: 'mcm-modeltest-' + Date.now(), signal: controller.signal });
@@ -972,6 +1003,55 @@ export function apply(ctx, config) {
             await closeInner();
         }
     }
+    // 启动清扫（审计 R3）：新进程里任何「status running 但没有 finishedAt」的测试条目
+    // 必然是上一次进程遗留的（进程内在飞任务都有 fiber 生命周期，重载会打断它们，
+    // 旧闭包的收尾写入往往以 "Configuration entry is no longer available" 失败）。
+    // 补写 ABORTED 终态，客户端就不必等到 66s 假超时。
+    // 同时修复「running + finishedAt」的僵尸条目（status 被并发整树回写改坏），
+    // 按 ok 归一状态位。
+    const sweepStaleTestResults = () => {
+        if (bus === null) return;
+        const all = healthOf().testResults || {};
+        const { aborted, repaired } = selectStaleTestEntries(all);
+        for (const key of aborted) {
+            bus.writeHealthLeaf(['testResults', key], Object.assign({}, all[key], {
+                status: 'error', code: 'ABORTED',
+                error: 'host 在测试执行期间重启/重载，结果未写入；请重试',
+                finishedAt: Date.now(),
+            })).catch((err) => console.warn('[model-channel-manager] stale test result sweep failed:', err && err.message));
+        }
+        for (const key of repaired) {
+            bus.writeHealthLeaf(['testResults', key], Object.assign({}, all[key], { status: all[key].ok === true ? 'ok' : 'error' }))
+                .catch((err) => console.warn('[model-channel-manager] zombie test result repair failed:', err && err.message));
+        }
+        if (aborted.length > 0 || repaired.length > 0)
+            console.log('[model-channel-manager] test results swept after restart: aborted =', aborted.length, ', repaired =', repaired.length);
+    };
+    // 兜底重试（审计 R2）：testRequest 存在、却既没被认领也没结算 —— 典型是 loader 的
+    // volatile 提交被静默拒绝（document 落盘、fiber 引用不更新、不发 volatile-update），
+    // 请求会被彻底忽略。这里每个 nonce 主动重试一次并留下日志，不再无声失败。
+    const sweepPendingTestRequest = () => {
+        if (bus === null) return;
+        const health = healthOf();
+        const req = health.testRequest;
+        const key = nonceKey(req && req.nonce);
+        if (key === null) return;
+        const entry = (health.testResults || {})[key];
+        const hasTerminal = !!(entry && (entry.finishedAt || entry.status === 'ok' || entry.status === 'error'));
+        // 复用与消费路径同一个（已被测试覆盖的）判定：返回 true = 这个请求还没被消费
+        const needsSweep = shouldConsumeNonce({
+            consumed: consumedTestNonces,
+            key,
+            claimed: nonceKey(claimedTestNonce),
+            settled: settledNonceKey(health.lastTestHandledNonce),
+            hasTerminal,
+        });
+        if (!needsSweep || pendingSweepAttempted.has(key)) return;
+        markConsumed(pendingSweepAttempted, key);
+        console.warn('[model-channel-manager] testRequest nonce', key,
+            '既未结算也未消费——疑似 volatile 提交被静默拒绝，主动重试一次（若仍无结果，请看宿主 stdout 的 loader 警告）');
+        reloadFromConfig(false);
+    };
     function handleTestRequest(next) {
         const req = next.testRequest;
         // nonce 接受 number（现行 client 的随机 53-bit 整数）与 string（0.3.2–0.3.8 的 UUID）
@@ -985,9 +1065,26 @@ export function apply(ctx, config) {
         // 终态判定用 finishedAt（写入后不会被覆盖），不只信 status：
         // 整树快照回写曾把 status 改回 running 却保留 finishedAt/code/error（0.3.11 事故）。
         const hasTerminal = !!(entry && (entry.finishedAt || entry.status === 'ok' || entry.status === 'error'));
-        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string'
-            || !shouldConsumeNonce({ consumed: consumedTestNonces, key: reqKey, claimed: claimedKey, settled, hasTerminal }))
+        if (!req || typeof req.provider !== 'string' || typeof req.model !== 'string' || reqKey === null) {
+            // 字段非法：显式记一次，别再静默吞掉（审计 R2）
+            if (req && reqKey !== null && !warnedTestNonces.has(reqKey)) {
+                markConsumed(warnedTestNonces, reqKey);
+                console.warn('[model-channel-manager] testRequest 字段非法，已忽略（需要 provider/model/nonce）:', JSON.stringify(req).slice(0, 200));
+            }
             return;
+        }
+        if (Date.now() < testBackoffUntil) return; // 退避窗口内不消费（等重放）
+        if (!shouldConsumeNonce({ consumed: consumedTestNonces, key: reqKey, claimed: claimedKey, settled, hasTerminal })) {
+            // 未消费的显式解释：请求存在但既没被认领、也没终态 → 多半是 volatile 提交被
+            // loader 静默拒绝（document 已落盘、fiber 引用不更新、不发 volatile-update，
+            // 审计 R2），此时请求会被彻底忽略且没有任何可见报错。
+            if (!hasTerminal && reqKey !== claimedKey && !warnedTestNonces.has(reqKey)) {
+                markConsumed(warnedTestNonces, reqKey);
+                console.warn('[model-channel-manager] testRequest 未被消费: nonce', reqKey,
+                    '（已结算或已消费命中）——若本次测试始终没有结果，检查宿主 stdout 是否有 loader 的 "volatile config update failed"');
+            }
+            return;
+        }
         markConsumed(consumedTestNonces, reqKey);
         claimedTestNonce = reqNonce;
         // nonce 的落盘推迟到本次测试得出结论之后：只有「真跑过」才算 handled。
@@ -1037,6 +1134,8 @@ export function apply(ctx, config) {
                 // 凭据服务尚未就绪（典型是启动瞬间的重放）：不写成假 error，释放认领并延后重试
                 claimedTestNonce = null;
                 releaseConsumed(consumedTestNonces, reqKey); // 释放后才能靠重放再消费
+                releaseConsumed(warnedTestNonces, reqKey);
+                testBackoffUntil = Date.now() + 5000;       // 退避窗口：期间任何 volatile-update 都不再消费
                 scheduleReplay('test', () => reloadFromConfig(false));
                 return;
             }
@@ -1189,9 +1288,16 @@ export function apply(ctx, config) {
     // 回归见 tests/task-dedup.test.cjs。
     let claimedTestNonce = null; // string UUID 或旧数字；null = 未认领
     let claimedSpeedNonce = null; // string UUID 或旧数字；null = 未认领
+    let lastHealthKeyCount = -1;  // health 子树键数（用于探测「被兜底清空」，审计 R2/#4）
     const consumedTestNonces = new Set();  // 已消费过的 nonce 字符串键（含本次）
     const consumedSpeedNonces = new Set();
+    const warnedTestNonces = new Set();    // 每个 nonce 只提醒一次（防日志刷屏）
+    const pendingSweepAttempted = new Set(); // 兜底重试每个 nonce 只做一次
     const CONSUMED_NONCE_CAP = 256; // 上限：只用于防重复消费，不需要无限历史
+    // notReady（凭据服务未就绪）释放认领后的退避窗口：期间不再消费，等 scheduleReplay 到点。
+    // 否则释放后任何一次 volatile-update 都会立刻再消费，并发起多个 60s 上游请求（审计 #6）。
+    let testBackoffUntil = 0;
+    let speedBackoffUntil = 0;
     const markConsumed = (set, key) => {
         set.add(key);
         if (set.size > CONSUMED_NONCE_CAP) {
@@ -1223,6 +1329,13 @@ export function apply(ctx, config) {
         const cfg = cfgOf();
         state.config = clone(cfg) || { groups: [] };
         const health = healthOf();
+        // 意外清空告警（审计 R2/#4）：health 子树本来有内容，运行时却变成空对象 =
+        // schema 校验失败被 .loose(true) 兜底（0.3.11 事故形态），必须大声报出来。
+        const healthKeys = Object.keys(health || {}).length;
+        if (healthKeys === 0 && lastHealthKeyCount > 0) {
+            console.warn('[model-channel-manager] health 子树在运行时变空（上一轮有 ' + lastHealthKeyCount + ' 个键）——极可能是 schema 校验失败被 .loose(true) 静默兜底，请检查最近一次写入的字段类型');
+        }
+        lastHealthKeyCount = healthKeys;
         state.records = healthStore !== null
             ? clone(healthStore.allEventBuckets())
             : clone(health.records || {});
@@ -1247,6 +1360,7 @@ export function apply(ctx, config) {
         const speedKey = nonceKey(req && req.nonce);
         const speedClaimed = nonceKey(claimedSpeedNonce);
         const speedSettled = settledNonceKey(health.lastHandledNonce);
+        if (req && typeof req.group === 'string' && Date.now() < speedBackoffUntil) return;
         if (req && typeof req.group === 'string'
             && shouldConsumeNonce({ consumed: consumedSpeedNonces, key: speedKey, claimed: speedClaimed, settled: speedSettled, hasTerminal: false })) {
             markConsumed(consumedSpeedNonces, speedKey);
@@ -1263,6 +1377,7 @@ export function apply(ctx, config) {
                     if (r && r.deferred) {
                         claimedSpeedNonce = null;
                         releaseConsumed(consumedSpeedNonces, speedKey);
+                        speedBackoffUntil = Date.now() + 5000; // 退避：别让 volatile-update 立刻再消费
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
@@ -1272,6 +1387,7 @@ export function apply(ctx, config) {
                     if (notReady(e)) {
                         claimedSpeedNonce = null;
                         releaseConsumed(consumedSpeedNonces, speedKey);
+                        speedBackoffUntil = Date.now() + 5000; // 退避：同上
                         scheduleReplay('speed', () => reloadFromConfig(false));
                         return;
                     }
@@ -1321,11 +1437,16 @@ export function apply(ctx, config) {
         const writeHealthOps = (ops) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, ops, undefined)));
         // 单叶写入：把 value 精确写到 health.<path...>，不读、不带任何快照
         const writeHealthLeaf = (path, value) => enqueueHealthWrite(async () => outsideTransaction(() => settings.mutate(SELF_NS, [{ op: 'set', path: ['health', ...path], value }], undefined)));
+        // 行级配置写入（groups 等）：也必须切出 HMR 事务——migrateLegacyConfig 可能在
+        // loader 回调链里被调用，事务内直写会抛 "HMR transactions cannot be nested"
+        // 并被空 catch 吞掉，只剩哨兵、旧配置永久不迁（审计 #13）。
+        const writeConfig = (patch) => enqueueHealthWrite(async () => outsideTransaction(() => settings.update(SELF_NS, patch, undefined)));
         bus = {
             settings,
             writeHealth,
             writeHealthOps,
             writeHealthLeaf,
+            writeConfig,
             cfgScope: { get: () => cfgOf() },
             healthScope: { get: () => healthOf() },
         };
@@ -1334,6 +1455,8 @@ export function apply(ctx, config) {
         const fiberAlive = () => ctx.fiber !== undefined && ctx.fiber.uid !== undefined && ctx.fiber.uid === fiberUid;
         // 启动不等待 domain：先用现有 settings 数据把路由与健康页带起来（旧 records 尚在
         // settings 时也能立即显示）；domain 就绪后再以它为权威重载。
+        // 清扫必须在首次消费 testRequest 之前：新进程里已存在的 running 条目都是上次遗留的。
+        sweepStaleTestResults();
         reloadFromConfig(true);
         ctx.on('loader/volatile-update', () => {
             reloadFromConfig(false);
@@ -1341,6 +1464,11 @@ export function apply(ctx, config) {
         });
         boot();
         scheduleDigest(); // 首屏投影：让健康页不用等下一次真实请求
+        // 未消费请求的兜底轮询（审计 R2）：每 5s 看一眼 testRequest 是否被静默丢弃
+        ctx.effect(() => {
+            const timer = setInterval(() => { try { sweepPendingTestRequest(); } catch (_e) { } }, 5000);
+            return () => clearInterval(timer);
+        }, 'model-channel pending-request sweep');
         // storageDomain 是可选服务，必须经响应式 inject 取得「已声明依赖」的上下文：
         // 直接 ctx.get('storageDomain') 只能拿到未注入的裸服务，随后任何属性访问都会被
         // Cordis 代理拒绝（实测 "cannot get property storageDomain without inject"，
@@ -1479,7 +1607,7 @@ export function apply(ctx, config) {
                         return;
                     }
                     if (migrated.groups.length > 0) {
-                        await bus.settings.update(SELF_NS, { groups: migrated.groups });
+                        await bus.writeConfig({ groups: migrated.groups });
                         state.config = { groups: migrated.groups };
                         console.log('[model-channel-manager] migrated legacy config from workspace .channel-manager/config.json');
                     }
